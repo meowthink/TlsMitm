@@ -1,0 +1,24 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+out/
+*.user
+.vs/
+.idea/
+
+# Captured traffic. A decrypted FTP/IMAP/POP3 login appears in these files verbatim, so they are
+# secret-bearing, not just evidence.
+captures/
+*.pcap
+*.pcapng
+
+# Runtime output
+*.log
+
+# Recovered CA private keys and anything derived from them
+*.pfx
+*.p12
+*.key
+
+# Scratch
+_attic/
