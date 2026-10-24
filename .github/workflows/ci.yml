@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # starttlsprobe drives the proxy, which signs its leaves with the Fiddler-shaped root it is told
+      # to look for, so a clean runner has to be given one first. CurrentUser\Root is a consent-gated
+      # store on hosted Windows runners, so the fixture uses the elevated LocalMachine stores. The
+      # timeout remains a guard against any future interactive certificate-store path.
+      - name: Install a throwaway Fiddler-shaped root
+        timeout-minutes: 3
+        run: pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./tests/make-test-root.ps1
+
+      # Debug is what the local runs use, so this step checks the binaries developers actually test.
+      # Builds every project, then runs the 27 starttlsprobe modes in four grouped processes, the ECH
+      # state-machine check and the ClientHello parser test. chainprobe is built but not run: it needs
+      # real endpoints.
+      - name: Offline suites
+        # CurrentUser\Root is consent-gated on hosted runners, so the fixture is machine-wide. This
+        # test-only switch selects it without changing production RootCa discovery; the rootcheck mode
+        # runs RootCa itself and fails if the two routes ever pick different roots.
+        env:
+          TLSMITM_CI_ROOT_STORE: LocalMachine
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./tests/run-offline.ps1
+
+      - name: Publish a self-contained build
+        run: dotnet publish TlsMitm -c Debug -r win-x64 --self-contained -o out/publish
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tlsmitm-win-x64
+          path: out/publish

@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/tests/">
+    <Project Path="tests/chainprobe/chainprobe.csproj" />
+    <Project Path="tests/echcheck/echcheck.csproj" />
+    <Project Path="tests/starttlsprobe/starttlsprobe.csproj" />
+  </Folder>
+  <Project Path="TlsMitm/TlsMitm.csproj" />
+</Solution>

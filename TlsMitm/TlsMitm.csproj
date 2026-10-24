@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="windivert\x64\WinDivert.dll" LogicalName="TlsMitm.windivert.x64.WinDivert.dll" />
+    <EmbeddedResource Include="windivert\x64\WinDivert64.sys" LogicalName="TlsMitm.windivert.x64.WinDivert64.sys" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="openssl\libssl-3-x64.dll" LogicalName="TlsMitm.openssl.libssl-3-x64.dll" />
+    <EmbeddedResource Include="openssl\libcrypto-3-x64.dll" LogicalName="TlsMitm.openssl.libcrypto-3-x64.dll" />
+    <None Update="openssl\LICENSE.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <!-- The two embedded binaries are distributed under LGPL-3.0, which requires the license text
+         to travel with them. -->
+    <None Update="windivert\COPYING">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="windivert\COPYING.LESSER">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="emsign_certs\intermediates\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="emsign_certs\chain\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,18 @@
+# Line endings. Without this file every clone decides by its own core.autocrlf, so a checkout on another
+# machine is not the tree that was measured here. The binaries and the files consumed outside Windows are
+# pinned below. The sources are deliberately left undeclared: running the renormalize over the whole tree
+# rewrote no blob at all, because the index already holds each of them as LF, so a repo-wide text rule
+# would only decide checkouts - and which endings a checkout needs is a per-clone answer so far.
+
+# Copied into the output directory and loaded by the OS. A line-ending conversion corrupts them, and a merge
+# of one is not something anyone can resolve by hand.
+TlsMitm/openssl/*.dll binary
+TlsMitm/windivert/x64/*.dll binary
+TlsMitm/windivert/x64/*.sys binary
+
+# Run under bash, where a line's trailing CR ends up inside the last word the shell reads from it.
+*.sh text eol=lf
+
+# Base64 between armour lines. OpenSSL and a Windows store import both take either ending; LF is what the
+# issuing publication publishes them as.
+*.pem text eol=lf
