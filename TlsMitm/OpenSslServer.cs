@@ -211,8 +211,13 @@ public sealed class OpenSslServerStream : Stream
     private IntPtr _ssl;
     private IntPtr _rbio;
     private IntPtr _wbio;
-    private readonly byte[] _io = new byte[16384];
-    private bool _disposed;
+    // One buffer per direction, and a lock of its own for the inbound one: FillInAsync reads the
+    // transport outside the SSL lock because that read waits on the client, so a drain running under
+    // the lock would otherwise scribble over the bytes that read is filling.
+    private readonly byte[] _in = new byte[16384];
+    private readonly byte[] _out = new byte[16384];
+    private readonly SemaphoreSlim _readLock = new(1, 1);
+    private volatile bool _disposed;
 
     public string NegotiatedProtocol { get; private set; } = "";
 
@@ -370,6 +375,9 @@ public sealed class OpenSslServerStream : Stream
             switch (err)
             {
                 case OpenSsl.SSL_ERROR_WANT_READ:
+                    // Measured with a strict Node client against a chain it rejects: the hello is
+                    // followed by nothing and the socket reaches EOF here. So this exit does not
+                    // distinguish a certificate rejection from a client that gave up on the attempt.
                     if (!await FillInAsync(ct)) throw new IOException("client closed during the handshake");
                     continue;
                 case OpenSsl.SSL_ERROR_WANT_WRITE:
@@ -395,6 +403,7 @@ public sealed class OpenSslServerStream : Stream
         await _lock.WaitAsync(ct);
         try
         {
+            ThrowIfDisposed();
             if (OpenSsl.BIO_write(_rbio, array, array.Length) != array.Length)
                 throw new IOException($"BIO_write: {OpenSsl.LastError()}");
         }
@@ -404,32 +413,52 @@ public sealed class OpenSslServerStream : Stream
         }
     }
 
+    private void ThrowIfDisposed()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(OpenSslServerStream));
+    }
+
     private async Task<bool> FillInAsync(CancellationToken ct)
     {
-        var n = await _transport.ReadAsync(_io, ct);
-        if (n <= 0) return false;
-        await _lock.WaitAsync(ct);
+        // SSL_read and SSL_write can each ask for input, so two pumps may reach this at once. Reads
+        // have to be exclusive: two of them into one buffer mixes bytes from different records and
+        // hands OpenSSL a stream it cannot parse.
+        await _readLock.WaitAsync(ct);
         try
         {
-            if (OpenSsl.BIO_write(_rbio, _io, n) != n)
-                throw new IOException($"BIO_write: {OpenSsl.LastError()}");
+            var n = await _transport.ReadAsync(_in, ct);
+            if (n <= 0) return false;
+            await _lock.WaitAsync(ct);
+            try
+            {
+                // Dispose can run between the transport read and this lock (it frees the SSL object
+                // and the BIOs it owns), so the pointer is only trusted under the lock.
+                ThrowIfDisposed();
+                if (OpenSsl.BIO_write(_rbio, _in, n) != n)
+                    throw new IOException($"BIO_write: {OpenSsl.LastError()}");
+            }
+            finally
+            {
+                _lock.Release();
+            }
+            return true;
         }
         finally
         {
-            _lock.Release();
+            _readLock.Release();
         }
-        return true;
     }
 
     private async Task DrainLockedAsync(CancellationToken ct)
     {
         while (true)
         {
+            ThrowIfDisposed();
             var pending = OpenSsl.BIO_ctrl(_wbio, OpenSsl.BIO_CTRL_PENDING, 0, IntPtr.Zero);
             if (pending <= 0) break;
-            var n = OpenSsl.BIO_read(_wbio, _io, (int)Math.Min(pending, _io.Length));
+            var n = OpenSsl.BIO_read(_wbio, _out, (int)Math.Min(pending, _out.Length));
             if (n <= 0) break;
-            await _transport.WriteAsync(_io.AsMemory(0, n), ct);
+            await _transport.WriteAsync(_out.AsMemory(0, n), ct);
         }
         await _transport.FlushAsync(ct);
     }
@@ -444,6 +473,7 @@ public sealed class OpenSslServerStream : Stream
             await _lock.WaitAsync(ct);
             try
             {
+                ThrowIfDisposed();
                 var r = OpenSsl.SSL_read(_ssl, scratch, scratch.Length);
                 if (r > 0)
                 {
@@ -477,6 +507,7 @@ public sealed class OpenSslServerStream : Stream
             await _lock.WaitAsync(ct);
             try
             {
+                ThrowIfDisposed();
                 var chunk = buffer[offset..].ToArray();
                 var r = OpenSsl.SSL_write(_ssl, chunk, chunk.Length);
                 if (r > 0)
@@ -513,6 +544,7 @@ public sealed class OpenSslServerStream : Stream
             await _lock.WaitAsync(cts.Token);
             try
             {
+                ThrowIfDisposed();
                 OpenSsl.SSL_shutdown(_ssl);
                 await DrainLockedAsync(cts.Token);
             }
@@ -557,12 +589,26 @@ public sealed class OpenSslServerStream : Stream
 
     protected override void Dispose(bool disposing)
     {
-        if (_disposed) return;
+        // The relay closes this stream as soon as its own direction ends, while the other pump can
+        // still be inside SSL_read or parked in FillInAsync. SSL_free also frees the two BIOs, so the
+        // free happens under the lock that guards every libssl call and clears the pointers with it;
+        // the flag is what stops a call that has not started yet from touching the freed SSL.
         _disposed = true;
+        _lock.Wait();
+        try
+        {
+            if (_ssl != IntPtr.Zero)
+            {
+                OpenSsl.SSL_free(_ssl);
+                _ssl = _rbio = _wbio = IntPtr.Zero;
+            }
+            if (_ctx != IntPtr.Zero) { OpenSsl.SSL_CTX_free(_ctx); _ctx = IntPtr.Zero; }
+        }
+        finally
+        {
+            _lock.Release();
+        }
 
-        // SSL_free releases the BIOs it owns; the context is ours alone (one per connection).
-        if (_ssl != IntPtr.Zero) { OpenSsl.SSL_free(_ssl); _ssl = IntPtr.Zero; }
-        if (_ctx != IntPtr.Zero) { OpenSsl.SSL_CTX_free(_ctx); _ctx = IntPtr.Zero; }
         if (disposing) _transport.Dispose();
         base.Dispose(disposing);
     }

@@ -78,7 +78,7 @@ async Task<int> RunModeAsync(string mode)
         // receive different chains. The first leg is optional because current clients may reject the
         // legacy eMSign root before completing the handshake.
         var acceptCount = mode == "auto" ? 2
-            : mode is "grease" or "rootcheck" ? 0 : 1;
+            : mode is "grease" or "rootcheck" or "handshake-abort" ? 0 : 1;
         for (var i = 0; i < acceptCount; i++)
         {
         using var accepted = await listener.AcceptTcpClientAsync();
@@ -126,7 +126,7 @@ async Task<int> RunModeAsync(string mode)
     using var crlService = CrlService.Start(rootForClient);
     // emSign mode is the one that proves the libssl client leg: the leaf must be issued by a CA that
     // Node/Electron trust natively, and only a client outside the Windows trust store can judge that.
-    var emSignCas = mode is "emsign" or "auto" ? LoadEmSignCas() : new List<EmSignCa>();
+    var emSignCas = mode is "emsign" or "auto" or "handshake-abort" ? LoadEmSignCas() : new List<EmSignCa>();
     var certEngine = new CertEngine(rootForClient, emSignCas,
         mode == "auto" ? CertEngineMode.Auto
             : emSignCas.Count > 0 ? CertEngineMode.EmSignOnly : CertEngineMode.FiddlerOnly, crlService);
@@ -176,6 +176,19 @@ async Task<int> RunModeAsync(string mode)
                 await ClientFiddlerAsync(tcp.GetStream(), "probe.test", notes)
                     .WaitAsync(TimeSpan.FromSeconds(20));
             }
+        }
+        else if (mode == "handshake-abort")
+        {
+            // A client that refuses the flight is the one session no relay pcap covers - it ends before
+            // "MITM established" - so the handshake capture has to be what makes a rejection diagnosable.
+            // The client here is a Node/Electron one pointed at a CA list that cannot contain our anchor,
+            // which makes the refusal a property of the fixture rather than of this machine's stores.
+            var foreignCaPem = Path.Combine(Path.GetTempPath(), $"probe-foreign-ca-{Environment.ProcessId}.pem");
+            File.WriteAllText(foreignCaPem,
+                $"-----BEGIN CERTIFICATE-----\n{Convert.ToBase64String(upstreamCert.RawData, Base64FormattingOptions.InsertLineBreaks)}\n-----END CERTIFICATE-----\n");
+            await RunAbortClientAsync(proxyPort, foreignCaPem, notes, failures)
+                .WaitAsync(TimeSpan.FromSeconds(30));
+            await CheckAbortedCaptureAsync(capturesBefore, upstreamPort, notes, failures);
         }
         else if (mode == "grease")
         {
@@ -1152,8 +1165,33 @@ async Task<int> RunModeAsync(string mode)
     {
         using var ssl = new SslStream(s, false);
         await ssl.AuthenticateAsServerAsync(cert);
-        await ExpectAsync(ssl, "GET");
+        await ExpectRequestHeadAsync(ssl);
         await SendAsync(ssl, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    }
+
+    // A real HTTP server answers only after the blank line that ends the header block, so waiting for it
+    // is what catches a relay that withholds the tail of the request. Measured: the FTP control sniffer
+    // held the last two bytes of every bodyless GET, and a tolerant fake upstream hid it for weeks.
+    static async Task ExpectRequestHeadAsync(Stream s)
+    {
+        var buf = new byte[1024];
+        var got = 0;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        try
+        {
+            while (true)
+            {
+                if (got >= 4 && Encoding.ASCII.GetString(buf, got - 4, 4) == "\r\n\r\n") return;
+                var n = await s.ReadAsync(buf.AsMemory(got), cts.Token);
+                if (n == 0) throw new IOException($"request ended after {got} bytes without its blank line");
+                got += n;
+                if (got == buf.Length) throw new IOException("request head outgrew the probe buffer");
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw new IOException($"request head never completed: {got} bytes, no blank line");
+        }
     }
 
     // The emSign client exits the moment the body arrives, so this leg can be aborted mid-write; whether
@@ -1418,8 +1456,11 @@ async Task<int> RunModeAsync(string mode)
         return record.ToArray();
     }
 
-    static async Task RunEmsignClientAsync(int proxyPort, List<string> notes, List<string> failures)
+    static async Task<(string Stdout, string Stderr, string ClientName)?> RunNodeClientAsync(
+        string scriptName, string jsSource, string args, List<string> failures)
     {
+        // Electron is preferred when it is installed: it is the TLS stack the live clients run, and its
+        // Node side is reached with ELECTRON_RUN_AS_NODE.
         var electron = Environment.GetEnvironmentVariable("TLSMITM_ELECTRON")
             ?? @"C:\Users\meowthink\AppData\Local\Programs\Qoder CN\Qoder CN.exe";
         var node = Environment.GetEnvironmentVariable("TLSMITM_NODE");
@@ -1427,8 +1468,142 @@ async Task<int> RunModeAsync(string mode)
         var executable = node ?? (useElectron ? electron : "node");
         var clientName = useElectron ? "electron" : "node";
 
-        var script = Path.Combine(Path.GetTempPath(), $"emsign-client-{Environment.ProcessId}.js");
-        File.WriteAllText(script, """
+        var script = Path.Combine(Path.GetTempPath(), $"{scriptName}-{Environment.ProcessId}.js");
+        File.WriteAllText(script, jsSource);
+
+        var psi = new ProcessStartInfo(executable, $"\"{script}\" {args}")
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        if (useElectron)
+            psi.Environment["ELECTRON_RUN_AS_NODE"] = "1";
+
+        Process process;
+        try
+        {
+            process = Process.Start(psi)
+                ?? throw new InvalidOperationException($"could not start {clientName} client");
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            failures.Add($"{clientName} client not found (set TLSMITM_NODE or TLSMITM_ELECTRON)");
+            return null;
+        }
+
+        using (process)
+        {
+            var stdout = await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+            return (stdout, stderr, clientName);
+        }
+    }
+
+    // The refusal has to be a property of the fixture, not of this machine: a client given a `ca` list
+    // replaces the bundled roots, so no store, no Node version and no root program can make it accept.
+    static async Task RunAbortClientAsync(int proxyPort, string caPemPath, List<string> notes, List<string> failures)
+    {
+        var js = """
+            const tls = require('tls');
+            const fs = require('fs');
+            const port = parseInt(process.argv[2], 10);
+            const ca = fs.readFileSync(process.argv[3], 'utf8');
+            const s = tls.connect({ host: '127.0.0.1', port, servername: 'probe.test', ca,
+                                    rejectUnauthorized: true }, () => {
+              console.log(JSON.stringify({ completed: true, authorized: s.authorized }));
+              s.destroy();
+            });
+            s.on('error', e => { console.log(JSON.stringify({ error: e.code || e.message })); process.exit(0); });
+            setTimeout(() => { console.log(JSON.stringify({ error: 'timeout' })); process.exit(2); }, 12000);
+            """;
+
+        var run = await RunNodeClientAsync("abort-client", js, $"{proxyPort} \"{caPemPath}\"", failures);
+        if (run == null) return;
+        var (stdout, stderr, clientName) = run.Value;
+        foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            notes.Add($"{clientName}: {line.Trim()}");
+
+        if (stdout.Contains("\"completed\":true"))
+            failures.Add($"handshake-abort: {clientName} finished a handshake its own CA list cannot verify: {stderr.Trim()}");
+        else if (stdout.Contains("\"error\":\"timeout\"") || stdout.Length == 0)
+            failures.Add($"handshake-abort: {clientName} neither refused nor completed: {stdout.Trim()} {stderr.Trim()}");
+        else
+            notes.Add($"handshake-abort: {clientName} refused the flight with {stdout.Trim()}");
+    }
+
+    static async Task CheckAbortedCaptureAsync(string[] before, int upstreamPort,
+        List<string> notes, List<string> failures)
+    {
+        string? path = null;
+        for (var i = 0; i < 50 && path == null; i++)
+        {
+            path = Directory.Exists("captures")
+                ? Directory.GetFiles("captures").FirstOrDefault(f => !before.Contains(f)
+                      && f.EndsWith("_aborted.pcap", StringComparison.Ordinal) && new FileInfo(f).Length > 0)
+                : null;
+            if (path == null) await Task.Delay(100);
+        }
+        if (path == null)
+        {
+            failures.Add("handshake-abort: the aborted client leg wrote no *_aborted.pcap");
+            return;
+        }
+
+        // pcap framing: a 24-byte global header, then a 16-byte record header (inclusion length at
+        // offset 8) and the frame this writer builds - 14 Ethernet, 20 or 40 IP, 20 TCP. The frame's
+        // source port tells which peer sent it, so a one-sided recording cannot pass for an exchange.
+        var bytes = await File.ReadAllBytesAsync(path);
+        var frames = new List<(bool FromServer, byte[] Payload)>();
+        for (var off = 24; off + 16 <= bytes.Length; off += 16)
+        {
+            var incl = (int)BitConverter.ToUInt32(bytes.AsSpan(off + 8, 4));
+            if (incl < 55 || off + 16 + incl > bytes.Length) break;
+            var frame = bytes.AsSpan(off + 16, incl);
+            var ipLen = frame[12] == 0x86 && frame[13] == 0xDD ? 40 : 20;
+            var tcp = 14 + ipLen;
+            frames.Add((((frame[tcp] << 8) | frame[tcp + 1]) == upstreamPort, frame[(tcp + 20)..].ToArray()));
+            off += incl;   // the next record header follows this frame, not these 16 bytes
+        }
+
+        if (frames.Count < 2)
+        {
+            failures.Add($"handshake-abort: capture {Path.GetFileName(path)} holds {frames.Count} frame(s), " +
+                "so only one side of the handshake was recorded");
+            return;
+        }
+
+        // A TLS record is content type, version, length, then the handshake message type: 0x16 0x01 is
+        // a ClientHello and 0x16 0x02 the ServerHello it was answered with.
+        if (frames[0].FromServer || frames[0].Payload.Length < 6
+            || frames[0].Payload[0] != 0x16 || frames[0].Payload[5] != 0x01)
+        {
+            failures.Add("handshake-abort: the first frame is not the client's ClientHello");
+            return;
+        }
+        if (!System.Text.Encoding.ASCII.GetString(frames[0].Payload).Contains("probe.test"))
+        {
+            failures.Add("handshake-abort: the recorded ClientHello carries no SNI, so it is not this session's");
+            return;
+        }
+        var serverHello = frames.FirstOrDefault(f => f.FromServer && f.Payload.Length >= 6
+            && f.Payload[0] == 0x16 && f.Payload[5] == 0x02);
+        if (serverHello.Payload == null)
+        {
+            failures.Add("handshake-abort: no ServerHello frame - the flight the client refused was not recorded");
+            return;
+        }
+
+        // What the file cannot show is the certificate list itself: under TLS 1.3 everything after the
+        // ServerHello is encrypted, and the capture holds the bytes the peers exchanged, not the keys.
+        notes.Add($"handshake-abort: {Path.GetFileName(path)} holds the ClientHello (with SNI) and the " +
+            $"{serverHello.Payload.Length}-byte flight the client refused");
+    }
+
+    static async Task RunEmsignClientAsync(int proxyPort, List<string> notes, List<string> failures)
+    {
+        var script = """
             const tls = require('tls');
             const port = parseInt(process.argv[2], 10);
             const host = process.argv[3] || 'probe.test';
@@ -1453,69 +1628,45 @@ async Task<int> RunModeAsync(string mode)
             s.on('data', d => { buf += d.toString(); if (buf.includes('200 OK')) { console.log(JSON.stringify({ body: 'ok' })); s.end(); process.exit(0); } });
             s.on('error', e => { console.log(JSON.stringify({ error: e.code || e.message })); process.exit(1); });
             setTimeout(() => { console.log(JSON.stringify({ error: 'timeout' })); process.exit(2); }, 12000);
-            """);
+            """;
 
-        var psi = new ProcessStartInfo(executable, $"\"{script}\" {proxyPort} probe.test")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false
-        };
-        if (useElectron)
-            psi.Environment["ELECTRON_RUN_AS_NODE"] = "1";
+        var run = await RunNodeClientAsync("emsign-client", script, $"{proxyPort} probe.test", failures);
+        if (run == null) return;
+        var (stdout, stderr, clientName) = run.Value;
+        foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            notes.Add($"{clientName}: {line.Trim()}");
 
-        Process process;
-        try
+        // What this mode exists to prove is which chain the proxy handed a Node/Electron PID. The
+        // verdict that PID's own store reaches on top of it is environment-dependent - this machine's
+        // Electron accepts, a current Node reports the legacy eMSign roots as revoked - so the verdict
+        // cannot carry the test: serving the Fiddler chain by mistake makes the store say "issuer not
+        // found", which would otherwise read as the same expected rejection. So the presented chain is
+        // checked first, and the relay has to complete either way.
+        var servedEmSignChain = stdout.Contains("EM DV TLS CA") || stdout.Contains("EM OV TLS CA")
+            || stdout.Contains("EM EV TLS CA");
+        if (!servedEmSignChain)
         {
-            process = Process.Start(psi)
-                ?? throw new InvalidOperationException($"could not start {clientName} client");
+            failures.Add($"emsign: {clientName} was not served an emSign chain (per-PID selection or " +
+                $"the chain build is broken): {stdout.Trim()} {stderr.Trim()}");
         }
-        catch (System.ComponentModel.Win32Exception)
+        else if (!stdout.Contains("\"body\":\"ok\""))
         {
-            failures.Add($"{clientName} client not found (set TLSMITM_NODE or TLSMITM_ELECTRON)");
-            return;
+            failures.Add($"emsign: {clientName} never received the relayed body: {stdout.Trim()} {stderr.Trim()}");
         }
-
-        using (process)
+        else if (stdout.Contains("\"authorized\":true"))
         {
-            var stdout = await process.StandardOutput.ReadToEndAsync();
-            var stderr = await process.StandardError.ReadToEndAsync();
-            await process.WaitForExitAsync();
-            foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-                notes.Add($"{clientName}: {line.Trim()}");
-
-            // What this mode exists to prove is which chain the proxy handed a Node/Electron PID. The
-            // verdict that PID's own store reaches on top of it is environment-dependent - this machine's
-            // Electron accepts, a current Node reports the legacy eMSign roots as revoked - so the verdict
-            // cannot carry the test: serving the Fiddler chain by mistake makes the store say "issuer not
-            // found", which would otherwise read as the same expected rejection. So the presented chain is
-            // checked first, and the relay has to complete either way.
-            var servedEmSignChain = stdout.Contains("EM DV TLS CA") || stdout.Contains("EM OV TLS CA")
-                || stdout.Contains("EM EV TLS CA");
-            if (!servedEmSignChain)
-            {
-                failures.Add($"emsign: {clientName} was not served an emSign chain (per-PID selection or " +
-                    $"the chain build is broken): {stdout.Trim()} {stderr.Trim()}");
-            }
-            else if (!stdout.Contains("\"body\":\"ok\""))
-            {
-                failures.Add($"emsign: {clientName} never received the relayed body: {stdout.Trim()} {stderr.Trim()}");
-            }
-            else if (stdout.Contains("\"authorized\":true"))
-            {
-                notes.Add($"emsign: {clientName} accepted the emSign chain and the HTTP relay completed");
-            }
-            else if (stdout.Contains("\"error\":\"CERT_REVOKED\"") ||
-                     stdout.Contains("\"error\":\"UNABLE_TO_GET_ISSUER_CERT_LOCALLY\"") ||
-                     stdout.Contains("\"error\":\"UNABLE_TO_VERIFY_LEAF_SIGNATURE\""))
-            {
-                notes.Add($"emsign: {clientName}'s store rejects the legacy eMSign roots as expected; the chain " +
-                    "it was served is the emSign one and the relay completed anyway");
-            }
-            else
-            {
-                failures.Add($"{clientName} failed unexpectedly: {stdout.Trim()} {stderr.Trim()}");
-            }
+            notes.Add($"emsign: {clientName} accepted the emSign chain and the HTTP relay completed");
+        }
+        else if (stdout.Contains("\"error\":\"CERT_REVOKED\"") ||
+                 stdout.Contains("\"error\":\"UNABLE_TO_GET_ISSUER_CERT_LOCALLY\"") ||
+                 stdout.Contains("\"error\":\"UNABLE_TO_VERIFY_LEAF_SIGNATURE\""))
+        {
+            notes.Add($"emsign: {clientName}'s store rejects the legacy eMSign roots as expected; the chain " +
+                "it was served is the emSign one and the relay completed anyway");
+        }
+        else
+        {
+            failures.Add($"{clientName} failed unexpectedly: {stdout.Trim()} {stderr.Trim()}");
         }
     }
 

@@ -181,7 +181,16 @@ sealed class TeeWriter : TextWriter
 
     public override void Write(char value) { _console.Write(value); _file.Write(value); }
     public override void Write(string? value) { _console.Write(value); _file.Write(value); }
-    public override void WriteLine(string? value) { _console.WriteLine(value); _file.WriteLine(value); }
+
+    // A clock is what turns a list of resets into a story: only the spacing between a hello and its
+    // abort says whether the client retried immediately or held the socket open first.
+    public override void WriteLine(string? value)
+    {
+        var line = $"{DateTime.Now:HH:mm:ss.fff} {value}";
+        _console.WriteLine(line);
+        _file.WriteLine(line);
+    }
+
     public override void WriteLine() { _console.WriteLine(); _file.WriteLine(); }
     public override void Flush() { _console.Flush(); _file.Flush(); }
 }

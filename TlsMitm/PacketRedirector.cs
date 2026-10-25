@@ -33,6 +33,7 @@ public class PacketRedirector : IRedirector, IDisposable
     private long _reverseMiss;
     private long _forwardMiss;
     private long _v6NotTcp;
+    private int _disposed;
 
     public unsafe PacketRedirector(int relayPort)
     {
@@ -460,6 +461,9 @@ public class PacketRedirector : IRedirector, IDisposable
 
     public void Dispose()
     {
+        // Program.cs disposes this explicitly and then again through `using var`; the second pass
+        // would Cancel a disposed CTS and free the same native buffers twice.
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _cts.Cancel();
         _divert.Shutdown();
         _runTask?.Wait(TimeSpan.FromSeconds(2));

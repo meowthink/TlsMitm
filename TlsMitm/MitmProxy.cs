@@ -202,7 +202,7 @@ public class MitmProxy
             : null;
 
         await MitmAsync(client, stream, rawBytes, serverStream, host, clientHello?.Alpn, origIp, origPort,
-            ResolveTrust(identity, clientHello), ct, terminationWorked);
+            ResolveTrust(identity, clientHello), identity.Pid, ct, terminationWorked);
     }
 
     private string ResolveTlsHost(ClientHelloInfo? hello, TcpClient client, IPAddress origIp, int origPort)
@@ -233,12 +233,15 @@ public class MitmProxy
 
     private async Task MitmAsync(
         TcpClient client, Stream rawClientStream, byte[] replayedHello, Stream serverStream, string host,
-        IReadOnlyList<string>? offeredAlpn, IPAddress origIp, int origPort, ClientTrust trust,
+        IReadOnlyList<string>? offeredAlpn, IPAddress origIp, int origPort, ClientTrust trust, int pid,
         CancellationToken ct, Action? onClientData = null)
     {
         var issued = _certEngine.GetCert(host, trust);
-        Console.WriteLine($"[Proxy] Leaf issued by '{issued.Leaf.Issuer}'" +
-            (issued.Chain == null ? "" : $" + {issued.Chain.Count} chain certs"));
+        // One line per connection carrying what a live log needs to attribute a reset: which process
+        // asked, which chain its hello settled, and which issuer answered.
+        Console.WriteLine($"[Proxy] Leaf for {host} (pid {pid}, " +
+            $"{(issued.Chain == null ? "Fiddler" : $"emSign + {issued.Chain.Count} chain certs")})" +
+            $" from '{issued.Leaf.Issuer}'");
 
         var sslServer = new SslStream(serverStream, false,
             (_, cert, chain, errs) => AcceptUpstreamCertificate(host, cert, chain, errs));
@@ -267,7 +270,21 @@ public class MitmProxy
             serverProtocol = upstream.Protocol;
         }
 
-        var clientStream = new PrefixedStream(replayedHello, rawClientStream);
+        // The redirector swapped the flow, so the accepted socket's local side is the client's own
+        // address and its remote side is the server; the remote port is the client's ephemeral port.
+        var clientEp = client.Client.LocalEndPoint as IPEndPoint;
+        var clientIp = clientEp == null ? IPAddress.Loopback : Unmap(clientEp.Address);
+        var clientPort = (ushort)((client.Client.RemoteEndPoint as IPEndPoint)?.Port ?? 0);
+        var serverPortUshort = (ushort)origPort;
+
+        // Both engines read and write the client through here, so one wrapper records the whole
+        // handshake whichever of them answers. The hello itself is not seen by the wrapper: the
+        // caller consumed it before this stream existed, so it is handed to the capture directly.
+        var capture = new HandshakeCapture();
+        capture.Record(replayedHello, fromClient: true);
+        var capturingClient = new CapturingStream(rawClientStream, capture);
+
+        var clientStream = new PrefixedStream(replayedHello, capturingClient);
         Stream sslClient;
         if (issued.Chain != null)
         {
@@ -277,7 +294,7 @@ public class MitmProxy
             try
             {
                 sslClient = await OpenSslServerStream.AcceptAsync(
-                    rawClientStream, replayedHello, issued.Leaf, issued.Chain,
+                    capturingClient, replayedHello, issued.Leaf, issued.Chain,
                     serverProtocol == default ? null : serverProtocol.ToString(), ct);
                 Console.WriteLine($"[Proxy] Client TLS established for {host} via OpenSSL, ALPN: " +
                     $"'{((OpenSslServerStream)sslClient).NegotiatedProtocol}'");
@@ -285,6 +302,7 @@ public class MitmProxy
             catch (Exception ex)
             {
                 Console.WriteLine($"[Proxy] Client TLS failed for {host} (OpenSSL): {ex.Message}");
+                capture.SaveAborted(host, clientIp, clientPort, origIp, serverPortUshort);
                 return;
             }
         }
@@ -310,9 +328,11 @@ public class MitmProxy
             catch (Exception ex)
             {
                 Console.WriteLine($"[Proxy] Client TLS failed for {host}: {ex.Message}");
+                capture.SaveAborted(host, clientIp, clientPort, origIp, serverPortUshort);
                 return;
             }
         }
+        capture.Stop();
 
         if (!upstreamFirst)
         {
@@ -330,13 +350,6 @@ public class MitmProxy
         Directory.CreateDirectory("captures");
         using var pcap = new PcapWriter(pcapPath);
         Console.WriteLine($"[Proxy] Saving to {pcapPath}");
-        
-        // The redirector swapped the flow, so the accepted socket's local side is the client's own
-        // address and its remote side is the server; the remote port is the client's ephemeral port.
-        var clientEp = client.Client.LocalEndPoint as IPEndPoint;
-        var clientIp = clientEp == null ? IPAddress.Loopback : Unmap(clientEp.Address);
-        var clientPort = (ushort)((client.Client.RemoteEndPoint as IPEndPoint)?.Port ?? 0);
-        var serverPortUshort = (ushort)origPort;
 
         // The control session's own plaintext is what names its data endpoints, in both directions:
         // 227/229 for passive mode, PORT/EPRT for active mode.
@@ -510,7 +523,7 @@ public class MitmProxy
         // A STARTTLS upgrade negotiates no application protocol, so no ALPN is offered to either
         // peer; the client never asked for one.
         await MitmAsync(client, clientRaw, rawBytes, serverRaw, host, null, origIp, origPort,
-            ResolveTrust(identity, clientHello), ct);
+            ResolveTrust(identity, clientHello), identity.Pid, ct);
     }
 
     /// <summary>
@@ -1065,6 +1078,68 @@ public class MitmProxy
         {
             Console.WriteLine($"[Proxy] Blind relay error for {host}: {ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Passes traffic through to the client while offering it to a <see cref="HandshakeCapture"/>.
+    /// It never owns the inner stream: the connection outlives the handshake it was installed for.
+    /// </summary>
+    private sealed class CapturingStream : Stream
+    {
+        private readonly Stream _inner;
+        private readonly HandshakeCapture _capture;
+
+        public CapturingStream(Stream inner, HandshakeCapture capture)
+        {
+            _inner = inner;
+            _capture = capture;
+        }
+
+        public override bool CanRead => _inner.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => _inner.CanWrite;
+        public override long Length => _inner.Length;
+        public override long Position { get => _inner.Position; set => _inner.Position = value; }
+
+        public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+        public override void Write(byte[] buffer, int offset, int count) => Write(buffer.AsSpan(offset, count));
+
+        public override int Read(Span<byte> buffer)
+        {
+            var n = _inner.Read(buffer);
+            if (n > 0) _capture.Record(buffer[..n], fromClient: true);
+            return n;
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            var n = await _inner.ReadAsync(buffer, ct);
+            if (n > 0) _capture.Record(buffer.Span[..n], fromClient: true);
+            return n;
+        }
+
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            _capture.Record(buffer, fromClient: false);
+            _inner.Write(buffer);
+        }
+
+        public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+        {
+            _capture.Record(buffer.AsSpan(offset, count), fromClient: false);
+            await _inner.WriteAsync(buffer, offset, count, ct);
+        }
+
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            _capture.Record(buffer.Span, fromClient: false);
+            await _inner.WriteAsync(buffer, ct);
+        }
+
+        public override void Flush() => _inner.Flush();
+        public override Task FlushAsync(CancellationToken cancellationToken) => _inner.FlushAsync(cancellationToken);
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
     }
 
     private class PrefixedStream : Stream

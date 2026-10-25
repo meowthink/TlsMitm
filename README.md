@@ -123,10 +123,11 @@ No admin and no WinDivert: the real `MitmProxy` is driven through `FakeRedirecto
 a loopback conversation the harness judges itself. Stop a live `TlsMitm` first — it intercepts the
 suite's own loopback traffic and turns passing modes into false failures.
 
-* `starttlsprobe` — 27 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP and
+* `starttlsprobe` — 28 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP and
   XMPP's dialect deliberately left alone, FTPS passive/active/clear, ALPN, IPv6, implicit TLS without
   SNI, emSign and per-process chains, 0-RTT, the ECH hello terminated and relayed blind, close_notify
-  via a strict Schannel client, and `rootcheck`, which compares the root the suite signs with against
+  via a strict Schannel client, a Node client that refuses the flight and must leave its handshake in an
+  `*_aborted.pcap`, and `rootcheck`, which compares the root the suite signs with against
   the one `RootCa` finds on its own. The emSign modes use Electron when `TLSMITM_ELECTRON` or the
   default Qoder install is available, then fall back to Node; `TLSMITM_NODE` overrides the Node
   executable.
@@ -138,7 +139,8 @@ suite's own loopback traffic and turns passing modes into false failures.
 * `no-sni-test.ps1` — the ClientHello parser and the leaf SAN type, by reflection (needs `pwsh`;
   Windows PowerShell cannot reflect over a net10.0 assembly).
 
-`tests/chainprobe` is a live check of the served chain (admin, real clients, real endpoints).
+`tests/chainprobe` serves our real chains on loopback to strict clients and records the verdicts; its
+README has the modes.
 `tools/` holds the remaining manual probes: `ftps-upstream-probe.ps1`, `probe.ps1`,
 `read-proc-env.ps1`.
 
