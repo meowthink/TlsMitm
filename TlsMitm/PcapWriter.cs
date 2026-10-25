@@ -275,3 +275,73 @@ public class PcapWriter : IDisposable
         Console.WriteLine($"[PCAP] Wrote {_packetCount} packets");
     }
 }
+
+/// <summary>
+/// Holds one client leg's handshake bytes until the handshake settles. A client that refuses the
+/// flight otherwise leaves no record at all: a relay pcap is only opened after "MITM established",
+/// so the hello, the chain that was rejected and any alert record are gone by the time the log line
+/// is written. Recording stops as soon as the handshake succeeds, so relayed payload never piles up
+/// here as well.
+/// </summary>
+public sealed class HandshakeCapture
+{
+    // A hello is a couple of kilobytes and a flight with a four-certificate chain stays under
+    // 16 KiB; anything beyond that is application data arriving early, and this buffer has no
+    // business holding it.
+    private const int MaxBytes = 64 * 1024;
+
+    private readonly List<(byte[] Data, bool FromClient)> _chunks = new();
+    private int _total;
+    private bool _settled;
+
+    public void Record(ReadOnlySpan<byte> data, bool fromClient)
+    {
+        if (_settled || data.Length == 0 || _total >= MaxBytes) return;
+        _chunks.Add((data.ToArray(), fromClient));
+        _total += data.Length;
+    }
+
+    /// <summary>The handshake made it; the bytes are no longer evidence and the relay takes over.</summary>
+    public void Stop()
+    {
+        _settled = true;
+        _chunks.Clear();
+        _total = 0;
+    }
+
+    /// <summary>
+    /// Writes what was recorded as a capture of the aborted handshake. Each chunk keeps its own
+    /// direction, so a reader sees the flow the two peers saw rather than one endless sender, and the
+    /// hello, the flight and anything the client sent back line up in order.
+    /// </summary>
+    public void SaveAborted(string host, IPAddress clientIp, ushort clientPort,
+        IPAddress serverIp, ushort serverPort)
+    {
+        if (_settled || _chunks.Count == 0) return;
+        _settled = true;
+
+        var safeHost = string.Join("_", host.Split(Path.GetInvalidFileNameChars()));
+        var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        var connectionId = Guid.NewGuid().ToString("N").Substring(0, 8);
+        var pcapPath = $"captures/{safeHost}_{timestamp}_{connectionId}_aborted.pcap";
+        var recorded = _total;
+
+        try
+        {
+            Directory.CreateDirectory("captures");
+            using var pcap = new PcapWriter(pcapPath);
+            foreach (var (data, fromClient) in _chunks)
+                pcap.WritePacket(data, fromClient,
+                    fromClient ? clientIp : serverIp, fromClient ? serverIp : clientIp,
+                    fromClient ? clientPort : serverPort, fromClient ? serverPort : clientPort);
+            Console.WriteLine($"[Proxy] Aborted handshake for {host} saved to {pcapPath} ({recorded} bytes)");
+        }
+        catch (Exception ex)
+        {
+            // The handshake failure itself is already on the log; losing its evidence must not add a
+            // second exception to the connection that is dying anyway.
+            Console.WriteLine($"[Proxy] Handshake capture for {host} could not be saved: {ex.Message}");
+        }
+        _chunks.Clear();
+    }
+}

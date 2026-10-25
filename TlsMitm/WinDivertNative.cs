@@ -331,7 +331,10 @@ public static unsafe class WinDivertPInvoke
                 }
             }
 
-            byte* pBestRoute = stackalloc byte[103];
+            // netioapi.h defines MIB_IPFORWARD_ROW2 at 104 octets, and GetBestRoute2 writes the whole
+            // row, so the buffer has to be that size: one octet short means every forwarded SYN (v4 and
+            // v6 alike) writes past the allocation.
+            byte* pBestRoute = stackalloc byte[104];
             SockAddr bestSrc = default;
             int errorCode = GetBestRoute2(IntPtr.Zero, ifIdx, &srcSock, ref dstSock, 0, pBestRoute, ref bestSrc);
 

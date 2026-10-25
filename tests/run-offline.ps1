@@ -18,7 +18,7 @@ $groups = @(
     ,@('smtp', 'smtpsplit', 'imap', 'pop3', 'ftp', 'nntp', 'xmpp', 'reject')
     ,@('ftps-pasv', 'ftps-epsv', 'ftps-active', 'ftps-active-split', 'ftps-active-clear')
     ,@('plain', 'implicit', 'implicit-ip', 'ipv6', 'early-data', 'https-close', 'alpn-fallback', 'alpn-h2')
-    ,@('ech-relay', 'ech-downgrade', 'emsign', 'auto', 'grease', 'rootcheck')
+    ,@('ech-relay', 'ech-downgrade', 'emsign', 'auto', 'handshake-abort', 'grease', 'rootcheck')
 )
 
 $failed = New-Object System.Collections.Generic.List[string]

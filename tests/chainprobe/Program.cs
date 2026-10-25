@@ -31,6 +31,16 @@ if (mode == "fiddler")
     return;
 }
 
+// Serves the real emSign leaf over the libssl leg (the one MitmProxy uses for an emSign chain), with
+// a chosen amount of the chain on the wire, so a strict Node/Electron client names the verify error
+// for each shape: emserve <certsDir> <port> [full|no-anchor|no-intermediate|leaf] [caIndex]
+if (mode == "emserve")
+{
+    await ServeEmSignShapeAsync(args[1], int.Parse(args[2]),
+        args.Length > 3 ? args[3] : "full", args.Length > 4 ? int.Parse(args[4]) : 0);
+    return;
+}
+
 var outDir = Path.Combine(AppContext.BaseDirectory, "out");
 Directory.CreateDirectory(outDir);
 
@@ -172,6 +182,89 @@ async Task ServeOnceAsync(SslStreamCertificateContext sctx, X509Certificate2 fal
         Console.WriteLine($"  server handshake FAILED: {ex.GetType().Name}: {ex.Message}");
     }
     finally { ssl.Dispose(); }
+}
+
+async Task ServeEmSignShapeAsync(string certsDir, int port, string shape, int caIndex)
+{
+    var chainPaths = Directory.GetFiles(Path.Combine(certsDir, "chain")).ToArray();
+    var cas = new List<EmSignCa>();
+    foreach (var path in Directory.GetFiles(Path.Combine(certsDir, "intermediates")))
+    {
+        using var probe = X509CertificateLoader.LoadCertificate(File.ReadAllBytes(path));
+        var cn = probe.GetNameInfo(X509NameType.SimpleName, false);
+        var known = EmSignCa.KnownIntermediates.Where(k => k.Name == cn).ToArray();
+        if (known.Length == 0) continue;
+        cas.Add(EmSignCa.LoadFromPem(cn, known[0].Scalar, path, chainPaths));
+    }
+
+    // A single-element list pins which CA signs, so the wire shape is reproducible per run.
+    var engine = new CertEngine(cas[caIndex].CertificateWithKey, new() { cas[caIndex] },
+        CertEngineMode.EmSignOnly);
+    var issued = engine.GetCert("emsign-test.example");
+    var noAnchor = new X509Certificate2Collection();
+    var noIntermediate = new X509Certificate2Collection();
+    foreach (var c in issued.Chain!)
+    {
+        if (c.Subject != c.Issuer) noAnchor.Add(c);
+        if (c.Subject != issued.Leaf.Issuer) noIntermediate.Add(c);
+    }
+
+    var wire = shape switch
+    {
+        "full" => issued.Chain,
+        "no-anchor" => noAnchor,
+        "no-intermediate" => noIntermediate,
+        "leaf" => null,
+        _ => throw new ArgumentException($"unknown shape {shape}")
+    };
+
+    Console.WriteLine($"leaf:   {issued.Leaf.Subject}");
+    Console.WriteLine($"issuer: {issued.Leaf.Issuer}");
+    Console.WriteLine($"on wire: {(wire == null ? "leaf only" : string.Join(" | ", wire.Select(c => c.Subject)))}");
+
+    var listener = new TcpListener(IPAddress.Loopback, port);
+    listener.Start();
+    Console.WriteLine($"PORT={port} shape={shape} (ctrl-C to stop)");
+    Console.Out.Flush();
+
+    while (true)
+    {
+        using var client = await listener.AcceptTcpClientAsync();
+        OpenSslServerStream? ssl = null;
+        try
+        {
+            // MitmProxy has already consumed the ClientHello when it hands the socket over, so the
+            // probe reads exactly one record first and replays it; otherwise that hello would be
+            // counted as the client's reply.
+            var transport = client.GetStream();
+            var hello = await ReadOneRecordAsync(transport);
+            ssl = await OpenSslServerStream.AcceptAsync(transport, hello,
+                issued.Leaf, wire, alpn: null, CancellationToken.None);
+            Console.WriteLine($"  peer ACCEPTED, alpn='{ssl.NegotiatedProtocol}'");
+            await ssl.WriteAsync(Encoding.ASCII.GetBytes(
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"),
+                CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  peer REJECTED the wire shape: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            ssl?.Dispose();
+            client.Dispose();
+        }
+    }
+
+    static async Task<byte[]> ReadOneRecordAsync(NetworkStream stream)
+    {
+        var header = new byte[5];
+        await stream.ReadExactlyAsync(header);
+        var record = new byte[5 + ((header[3] << 8) | header[4])];
+        header.CopyTo(record, 0);
+        await stream.ReadExactlyAsync(record.AsMemory(5, record.Length - 5));
+        return record;
+    }
 }
 
 async Task ServeFiddlerLeafAsync(string host, int port, string variant)

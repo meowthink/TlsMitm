@@ -304,7 +304,13 @@ internal sealed class FtpControlSniffer
                 continue;
             }
 
-            // The chunk ends inside a line's first bytes, so the verb cannot be read off it yet.
+            // The chunk ends inside a line's first bytes, so the verb cannot be read off it yet -
+            // but only a tail that could still become one of the four verbs is worth withholding.
+            // Anything else has already been ruled out, and holding it strands a peer that has
+            // nothing more to send: an HTTP request ends with a blank line, which arrives as a
+            // two-byte tail right after the last header's newline.
+            if (!IsVerbPrefix(data.Slice(pos, remaining))) return Finish(data, ref copied);
+
             Rebuild(data.Length);
             FlushRegion(data, ref copied, pos);
             data.Slice(pos, remaining).CopyTo(_held);
@@ -466,10 +472,27 @@ internal sealed class FtpControlSniffer
             : $"{prefix}{port >> 8},{port & 0xFF}{term}");
     }
 
-    private static bool IsVerbHead(ReadOnlySpan<byte> head) =>
-        head[VerbLen - 1] == (byte)' '
-        && (Matches(head.Slice(0, 4), "PORT") || Matches(head.Slice(0, 4), "EPRT")
-            || Matches(head.Slice(0, 4), "PROT") || Matches(head.Slice(0, 4), "PBSZ"));
+    private static readonly string[] Verbs = { "PORT", "EPRT", "PROT", "PBSZ" };
+
+    private static bool IsVerbHead(ReadOnlySpan<byte> head)
+    {
+        if (head[VerbLen - 1] != (byte)' ') return false;
+        foreach (var verb in Verbs)
+            if (Matches(head.Slice(0, 4), verb)) return true;
+        return false;
+    }
+
+    private static bool IsVerbPrefix(ReadOnlySpan<byte> tail)
+    {
+        foreach (var verb in Verbs)
+        {
+            var match = true;
+            for (var i = 0; i < tail.Length && match; i++)
+                match = (tail[i] | 0x20) == (verb[i] | 0x20);
+            if (match) return true;
+        }
+        return false;
+    }
 
     // Setting bit 0x20 folds both an ASCII letter and the literals below onto their lower case, so
     // the comparison holds for PORT and port alike.

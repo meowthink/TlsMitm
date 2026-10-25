@@ -9,6 +9,7 @@ public class QuicBlocker : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private Task? _runTask;
     private long _blockedCount;
+    private int _disposed;
     private readonly IntPtr _pPacket;
     private readonly IntPtr _pAddr;
 
@@ -115,6 +116,8 @@ public class QuicBlocker : IDisposable
 
     public void Dispose()
     {
+        // Same double-dispose path as PacketRedirector: explicit call in Program.cs plus `using var`.
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _cts.Cancel();
         _divert.Shutdown();
         _runTask?.Wait(TimeSpan.FromSeconds(2));
