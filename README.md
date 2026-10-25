@@ -41,7 +41,8 @@ per-client chain selection, a local CRL, and plain pcap output.
 ## What it decrypts
 
 Detection reads bytes, never ports: a connection whose first byte is `0x16` is implicit TLS whatever
-port it uses, and a server-first text protocol is scanned for the upgrade command. The protocol names
+port it uses, a server-first text protocol is scanned for the upgrade command, and a client-first
+session is named by its own first octet — `0x30` for LDAP's BER, `<` for XMPP's XML. The protocol names
 below are what the mechanism covers; no port table is consulted.
 
 | protocol | how the upgrade is granted | result |
@@ -53,13 +54,14 @@ below are what the mechanism covers; no port table is consulted.
 | FTP | `AUTH TLS` → `234` (RFC 4217 §4.2), data channels per §7 | upgraded in place |
 | NNTP | `STARTTLS` → `382` (RFC 4642 §2.2) | upgraded in place |
 | LDAP | BER `ExtendedRequest` `1.3.6.1.4.1.1466.20037` → `ExtendedResponse` success (RFC 4511 §4.14) | upgraded in place |
-| XMPP | `<starttls/>` → `<proceed/>` (RFC 6120 §5.4.2) | blind pass-through |
+| XMPP | `<starttls/>` → `<proceed/>` (RFC 6120 §5.4.2, boundary at the `>` per §5.4.2.3) | upgraded in place |
 | any other TCP | — | relayed as it comes, not captured |
 
-A grant this proxy does not act on is not a broken session: the two sockets keep carrying bytes, so
+A session this proxy cannot read is not a broken one either: the two sockets keep carrying bytes, so
 client and real server finish the handshake between themselves, and the plaintext simply stays inside
-the packets instead of coming out of them. `xmpp` is the offline mode that holds the proxy to that
-behaviour; `reject` holds it to a server that really refuses.
+the packets instead of coming out of them. `ldap-bad` and `xmpp-bad` are the offline modes that hold the
+proxy to that behaviour; `reject`, `ldap-decline` and `xmpp-decline` hold it to a server that really
+refuses.
 
 ## Which chain, for which client
 
@@ -140,8 +142,9 @@ No admin and no WinDivert: the real `MitmProxy` is driven through `FakeRedirecto
 a loopback conversation the harness judges itself. Stop a live `TlsMitm` first — it intercepts the
 suite's own loopback traffic and turns passing modes into false failures.
 
-* `starttlsprobe` — 33 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP/LDAP
-  and XMPP's dialect deliberately left alone, FTPS passive/active/clear, ALPN, IPv6, implicit TLS without
+* `starttlsprobe` — 37 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP and the
+  two element dialects, LDAP's BER and XMPP's XML, each with its split-write, refusal and unreadable-stream
+  cases, XMPP's nameless-hello leaf verdict, FTPS passive/active/clear, ALPN, IPv6, implicit TLS without
   SNI, emSign and per-process chains, 0-RTT, the ECH hello terminated and relayed blind, close_notify
   via a strict Schannel client, a Node client that refuses the flight and must leave its handshake in an
   `*_aborted.pcap`, an upstream that refuses the composed hello and must leave the session to a blind

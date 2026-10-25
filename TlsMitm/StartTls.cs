@@ -14,15 +14,19 @@ internal enum StartTlsOutcome
 /// reply, as each protocol defines them: SMTP "STARTTLS" answered by 220 (RFC 3207 §4), IMAP
 /// "&lt;tag&gt; STARTTLS" answered by a tagged OK (RFC 9051 §6.2.1), POP3 "STLS" answered by +OK
 /// (RFC 2595 §4), FTP "AUTH TLS" answered by 234 (RFC 4217 §4.2), NNTP "STARTTLS" answered by 382
-/// (RFC 4642 §2.2). LDAP has no line to read: its StartTLS is an extended operation in BER, so a
-/// session whose first client octet is a SEQUENCE tag is handed to <see cref="LdapScanner"/>
-/// (RFC 4511 §4.14) and the line scanner never sees it.
+/// (RFC 4642 §2.2). Two dialects have no line to read. LDAP's StartTLS is an extended operation in BER,
+/// so a session whose first client octet is a SEQUENCE tag is handed to <see cref="LdapScanner"/>
+/// (RFC 4511 §4.14). XMPP's is an element inside an open XML stream, so a session whose first client
+/// octet is the '&lt;' that opens the stream negotiation is handed to <see cref="XmppScanner"/>
+/// (RFC 6120 §4.2, §5.4.2). Neither ever reaches the line scanner.
 /// The client pump stops reading once the command is forwarded. In all of these protocols the handshake
 /// begins only after the success reply: RFC 3207 §4 requires the client to start negotiating before
 /// issuing any other command, RFC 9051 §6.2.1 and RFC 2595 §4 both say the negotiation starts
 /// "immediately after the CRLF at the end of" the tagged OK / +OK, RFC 4217 §4.2 makes 234 the
-/// reply that grants AUTH TLS, RFC 4642 §2.2 makes 382 the reply that grants TLS negotiation, and
-/// RFC 4511 §4.14.1 forbids the LDAP client any further PDU until the response arrives.
+/// reply that grants AUTH TLS, RFC 4642 §2.2 makes 382 the reply that grants TLS negotiation,
+/// RFC 4511 §4.14.1 forbids the LDAP client any further PDU until the response arrives, and
+/// RFC 6120 §5.4.3.1 rule 1 forbids either XMPP entity "any further XML data until the TLS
+/// negotiation is complete".
 /// No read is therefore in flight when both sockets are handed to SslStream.
 /// </summary>
 internal sealed class StartTlsSession
@@ -44,6 +48,8 @@ internal sealed class StartTlsSession
 
     private LdapScanner? _ldapClient;
     private LdapScanner? _ldapServer;
+    private XmppScanner? _xmppClient;
+    private XmppScanner? _xmppServer;
     private bool _dialectDecided;
 
     public bool AwaitingReply => _awaitingReply;
@@ -85,9 +91,29 @@ internal sealed class StartTlsSession
                 _ldapClient = new LdapScanner(clientSide: true);
                 _ldapServer = new LdapScanner(clientSide: false);
             }
+            // XMPP is the same case with a different first octet. The client speaks first here too, and its
+            // octet is the '<' that opens either the initial stream header or the '<?xml' prolog RFC 6120
+            // §4.2 shows ahead of it. These scanners are per direction because §5.4.1 has the server send
+            // a <starttls/> of its own, in the stream features that precede the client's command.
+            else if (data[0] == (byte)'<')
+            {
+                _xmppClient = new XmppScanner(clientSide: true);
+                _xmppServer = new XmppScanner(clientSide: false);
+            }
         }
 
-        return _ldapClient == null ? ScanClientLines(data) : ScanClientLdap(data);
+        if (_ldapClient != null) return ScanClientLdap(data);
+        return _xmppClient != null ? ScanClientXmpp(data) : ScanClientLines(data);
+    }
+
+    private int ScanClientXmpp(ReadOnlySpan<byte> data)
+    {
+        var end = _xmppClient!.Scan(data, out var mark);
+        if (mark != XmppMark.Command) return data.Length;
+
+        _awaitingReply = true;
+        ClientRemainder = data[end..].ToArray();
+        return end;
     }
 
     private int ScanClientLdap(ReadOnlySpan<byte> data)
@@ -187,13 +213,16 @@ internal sealed class StartTlsSession
     /// after the final reply line lead the upstream TLS stream, on rejection everything is forwarded
     /// and the plaintext session resumes. SMTP and FTP allow a multi-line reply (RFC 5321 §4.2.1,
     /// RFC 959 §4.2), so only the last line of one decides.
-    /// The line dialects are only readable once a command is pending, so they are skipped until then.
-    /// LDAP is read from its first octet instead: a BER walker that joins the stream late cannot tell
-    /// where one message ends, and losing that boundary loses the messageID the grant is matched by.
+    /// The line dialects are only readable once a command is pending, so they are skipped until then, and
+    /// so is XMPP's: its grant is recognised by the element itself, so nothing is lost by joining the
+    /// stream at the command. LDAP is read from its first octet instead: a BER walker that joins the
+    /// stream late cannot tell where one message ends, and losing that boundary loses the messageID the
+    /// grant is matched by.
     /// </summary>
     public int ScanServer(ReadOnlySpan<byte> data)
     {
         if (_ldapServer != null) return ScanServerLdap(data);
+        if (_xmppServer != null) return _awaitingReply ? ScanServerXmpp(data) : data.Length;
         return _awaitingReply ? ScanServerLines(data) : data.Length;
     }
 
@@ -213,6 +242,27 @@ internal sealed class StartTlsSession
             return data.Length;
         }
 
+        ServerRemainder = data[end..].ToArray();
+        Complete(StartTlsOutcome.Upgrade);
+        return end;
+    }
+
+    private int ScanServerXmpp(ReadOnlySpan<byte> data)
+    {
+        var end = _xmppServer!.Scan(data, out var mark);
+        if (mark is not (XmppMark.Granted or XmppMark.Declined)) return data.Length;
+
+        // RFC 6120 §5.4.2.2: on the failure case the server returns <failure/>, closes the XML stream and
+        // terminates the TCP connection, and nothing about that is an upgrade. The whole chunk belongs to
+        // the plaintext session, so all of it is relayed and the tunnel carries on.
+        if (mark == XmppMark.Declined)
+        {
+            Complete(StartTlsOutcome.Reject);
+            return data.Length;
+        }
+
+        // §5.4.2.3 puts the beginning of the TLS negotiation after the closing '>' of <proceed/>, which is
+        // where this count ends the plaintext session; the octets behind it lead the upstream handshake.
         ServerRemainder = data[end..].ToArray();
         Complete(StartTlsOutcome.Upgrade);
         return end;

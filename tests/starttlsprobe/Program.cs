@@ -91,7 +91,11 @@ async Task<int> RunModeAsync(string mode)
             case "pop3": await ServePop3Async(stream, upstreamCert); break;
             case "ftp": await ServeFtpAsync(stream, upstreamCert); break;
             case "nntp": await ServeNntpAsync(stream, upstreamCert); break;
-            case "xmpp": await ServeXmppAsync(stream, upstreamCert); break;
+            case "xmpp":
+            case "xmpp-nosni": await ServeXmppAsync(stream, upstreamCert, split: false); break;
+            case "xmpp-split": await ServeXmppAsync(stream, upstreamCert, split: true); break;
+            case "xmpp-decline": await ServeXmppDeclineAsync(stream); break;
+            case "xmpp-bad": await ServeXmppBadAsync(stream); break;
             case "ldap": await ServeLdapAsync(stream, upstreamCert); break;
             case "ldap-decline": await ServeLdapDeclineAsync(stream); break;
             case "ldap-bad": await ServeLdapBadAsync(stream); break;
@@ -277,7 +281,11 @@ async Task<int> RunModeAsync(string mode)
             case "pop3": await ClientPop3Async(s, notes); break;
             case "ftp": await ClientFtpAsync(s, notes); break;
             case "nntp": await ClientNntpAsync(s, notes); break;
-            case "xmpp": await ClientXmppAsync(s, notes); break;
+            case "xmpp": await ClientXmppAsync(s, notes, split: false); break;
+            case "xmpp-nosni": await ClientXmppNoSniAsync(s, notes, failures); break;
+            case "xmpp-split": await ClientXmppAsync(s, notes, split: true); break;
+            case "xmpp-decline": await ClientXmppDeclineAsync(s, notes); break;
+            case "xmpp-bad": await ClientXmppBadAsync(s, notes); break;
             case "ldap": await ClientLdapAsync(s, notes, failures); break;
             case "ldap-decline": await ClientLdapDeclineAsync(s, notes); break;
             case "ldap-bad": await ClientLdapBadAsync(s, notes); break;
@@ -376,20 +384,6 @@ async Task<int> RunModeAsync(string mode)
         await SendAsync(ssl, "CAPABILITY\r\n");
         await ExpectAsync(ssl, "101");
         notes.Add("nntp: 382 upgraded in place");
-    }
-
-    static async Task ClientXmppAsync(NetworkStream s, List<string> notes)
-    {
-        await ExpectAsync(s, "<?xml");
-        await SendAsync(s, "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>\r\n");
-        await ExpectAsync(s, "<proceed");
-
-        // acceptAny because nothing is terminated on this leg: the certificate in view is the fake
-        // upstream's own self-signed one, not a leaf the proxy signed.
-        var ssl = await UpgradeAsync(s, "probe.test", notes, acceptAny: true);
-        await SendAsync(ssl, "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='ANONYMOUS'/>\r\n");
-        await ExpectAsync(ssl, "<success");
-        notes.Add("xmpp: the relay left the XML dialect alone and carried the TLS handshake through untouched");
     }
 
     // LDAP's StartTLS is an extended operation, not a line (RFC 4511 §4.14). A whoami operation
@@ -613,18 +607,30 @@ async Task<int> RunModeAsync(string mode)
         return Array.Empty<string>();
     }
 
-    static async Task<SslStream> UpgradeWithoutSniAsync(Stream raw, List<string> notes)
+    static IEnumerable<string> IpNames(X509Certificate2 cert)
+    {
+        foreach (var ext in cert.Extensions)
+        {
+            if (ext is not X509SubjectAlternativeNameExtension san) continue;
+            var names = new List<string>();
+            foreach (var address in san.EnumerateIPAddresses()) names.Add(address.ToString());
+            return names;
+        }
+        return Array.Empty<string>();
+    }
+
+    static async Task<SslStream> UpgradeWithoutSniAsync(Stream raw, List<string> notes, string label = "data")
     {
         var ssl = new SslStream(raw, false, (_, cert, _, errors) =>
         {
             // The name is not what this mode measures; the leaf's own SAN is, so accept any policy
             // verdict here and assert the identity from the certificate after the handshake.
-            notes.Add($"data handshake leaf='{cert?.Subject}' policyErrors={errors}");
+            notes.Add($"{label} handshake leaf='{cert?.Subject}' policyErrors={errors}");
             return true;
         });
         // No target name means no server_name extension: exactly what the proxy cannot read off the wire.
         await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions { TargetHost = "" });
-        notes.Add($"data TLS={ssl.SslProtocol} alpn='{ssl.NegotiatedApplicationProtocol}'");
+        notes.Add($"{label} TLS={ssl.SslProtocol} alpn='{ssl.NegotiatedApplicationProtocol}'");
         return ssl;
     }
 
@@ -873,18 +879,189 @@ async Task<int> RunModeAsync(string mode)
     }
 
     // XMPP's upgrade is an XML element on both sides (<starttls/> answered by <proceed/>, RFC 6120
-    // §5.4.2), which this classifier does not read, so the session has to survive as a blind relay - the
-    // handshake and everything after it reach the real server untouched.
-    static async Task ServeXmppAsync(NetworkStream s, X509Certificate2 cert)
+    // §5.4.2.1, §5.4.2.3), so this is an in-place upgrade like the line dialects: the proxy terminates the
+    // client leg with a leaf from the local root and the upstream keeps its own certificate behind the
+    // grant. Every read here is byte-exact because §5.4.2.3 puts the start of the TLS negotiation after
+    // the closing '>' of <proceed/> - a line-oriented read would swallow the handshake bytes behind it.
+    // `split` writes one element in two pieces, which is what the scanner's cross-chunk carry is for.
+    static async Task ServeXmppAsync(NetworkStream s, X509Certificate2 cert, bool split)
     {
-        await SendAsync(s, "<?xml version='1.0'?><stream:stream from='probe.test' xmlns='jabber:client' version='1.0'>\r\n");
-        await ExpectAsync(s, "<starttls");
-        await SendAsync(s, "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>\r\n");
+        await ExpectBytesAsync(s, XmppClientHeader(), "initial stream header");
+        await SendBytesAsync(s, XmppServerHeader());
+        await SendBytesAsync(s, XmppFeatures());
+        await ExpectBytesAsync(s, XmppStartTls(), "starttls command");
+        await SendSplitAsync(s, XmppProceed(), split);
 
         using var ssl = new SslStream(s, false);
         await ssl.AuthenticateAsServerAsync(cert);
-        await ExpectAsync(ssl, "<auth");
-        await SendAsync(ssl, "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>\r\n");
+
+        // RFC 6120 §5.4.3.3 rule 3: the initiating entity MUST send a new initial stream header over the
+        // encrypted connection, so the SASL exchange is only ever seen on the encrypted leg.
+        await ExpectBytesAsync(ssl, XmppClientHeader(), "post-TLS stream header");
+        await SendBytesAsync(ssl, XmppServerHeader());
+        await SendBytesAsync(ssl, XmppSaslFeatures());
+        await ExpectBytesAsync(ssl, XmppAuth(), "SASL auth");
+        await SendBytesAsync(ssl, XmppSuccess());
+    }
+
+    static async Task ClientXmppAsync(NetworkStream s, List<string> notes, bool split)
+    {
+        await SendBytesAsync(s, XmppClientHeader());
+        await ExpectBytesAsync(s, XmppServerHeader(), "response stream header");
+        // The advertisement is a <starttls/> of this same namespace sent by the server (§5.4.1), which is
+        // why the grant is looked for by its own tag and not by the command's.
+        await ExpectBytesAsync(s, XmppFeatures(), "STARTTLS advertisement");
+
+        await SendSplitAsync(s, XmppStartTls(), split);
+        await ExpectBytesAsync(s, XmppProceed(), "proceed");
+
+        var ssl = await UpgradeAsync(s, "probe.test", notes);
+        await SendBytesAsync(ssl, XmppClientHeader());
+        await ExpectBytesAsync(ssl, XmppServerHeader(), "post-TLS response header");
+        await ExpectBytesAsync(ssl, XmppSaslFeatures(), "post-TLS SASL features");
+        await SendBytesAsync(ssl, XmppAuth());
+        await ExpectBytesAsync(ssl, XmppSuccess(), "SASL success");
+        notes.Add(split
+            ? "xmpp-split: a command and a grant each split across two writes still upgraded in place"
+            : "xmpp: <starttls/> upgraded in place at the '>' that ends <proceed/>");
+    }
+
+    // The refusal half: RFC 6120 §5.4.2.2 has the server return <failure/>, close the XML stream and
+    // terminate the TCP connection, and §5.4.3.2 rules out a TLS-layer failure ever looking like this, so
+    // a relay that keeps carrying these octets as plaintext is the only conformant outcome.
+    static async Task ServeXmppDeclineAsync(NetworkStream s)
+    {
+        await ExpectBytesAsync(s, XmppClientHeader(), "initial stream header");
+        await SendBytesAsync(s, XmppServerHeader());
+        await SendBytesAsync(s, XmppFeatures());
+        await ExpectBytesAsync(s, XmppStartTls(), "starttls command");
+        await SendBytesAsync(s, XmppFailure());
+        await SendBytesAsync(s, XmppStreamClose());
+    }
+
+    static async Task ClientXmppDeclineAsync(NetworkStream s, List<string> notes)
+    {
+        await SendBytesAsync(s, XmppClientHeader());
+        await ExpectBytesAsync(s, XmppServerHeader(), "response stream header");
+        await ExpectBytesAsync(s, XmppFeatures(), "STARTTLS advertisement");
+        await SendBytesAsync(s, XmppStartTls());
+        await ExpectBytesAsync(s, XmppFailure(), "failure");
+        await ExpectBytesAsync(s, XmppStreamClose(), "stream close");
+
+        // Reading past the close is the proof no upgrade was attempted: a proxy that had read this as a
+        // grant would have handed these two elements to its own handshake instead of relaying them.
+        if (await s.ReadAsync(new byte[1]) != 0)
+            throw new InvalidOperationException("xmpp-decline: bytes arrived after the stream closed");
+        notes.Add("xmpp-decline: <failure/> was relayed and the stream ended without a TLS layer");
+    }
+
+    // The gate XMPP detection hangs on is the client's first octet, so a stream of XML that never issues
+    // the RFC's command has to survive as an untouched relay. An element named starttls but qualified by
+    // no TLS namespace is not that command (§5.4.2.1), and arming on it would park the client pump waiting
+    // for a readiness reply that no server intends to send - the pong below can only arrive if it didn't.
+    static async Task ServeXmppBadAsync(NetworkStream s)
+    {
+        await ExpectBytesAsync(s, XmppClientHeader(), "initial stream header");
+        await SendBytesAsync(s, XmppServerHeader());
+        await SendBytesAsync(s, XmppOtherFeatures());
+        await ExpectBytesAsync(s, XmppUnqualifiedStartTls(), "unqualified starttls");
+        await ExpectBytesAsync(s, XmppPing(), "ping");
+        await SendBytesAsync(s, XmppPong());
+    }
+
+    static async Task ClientXmppBadAsync(NetworkStream s, List<string> notes)
+    {
+        await SendBytesAsync(s, XmppClientHeader());
+        await ExpectBytesAsync(s, XmppServerHeader(), "response stream header");
+        await ExpectBytesAsync(s, XmppOtherFeatures(), "stream features");
+        await SendBytesAsync(s, XmppUnqualifiedStartTls());
+        await SendBytesAsync(s, XmppPing());
+        await ExpectBytesAsync(s, XmppPong(), "pong");
+        notes.Add("xmpp-bad: a starttls element without the TLS namespace stayed an ordinary stanza");
+    }
+
+    // The verdict on a nameless XMPP hello. RFC 6120 §5.4.3.1 rule 4 lets the server choose its
+    // certificate from the 'to' domainpart of the initial stream header, "functionally equivalent to the
+    // Server Name Indication", and §13.7.2.1 makes that same domainpart the source of the client's
+    // reference identifiers - so to='im.probe.test' is the name the leaf has to carry. A conformant
+    // client may still send no server_name: §3.2.1 step 5 uses the address from the A/AAAA lookup of the
+    // SRV target, and RFC 6066 §3 forbids a literal address in server_name. This mode is that client; it
+    // pins the name the proxy hands it today (the destination address, which only matches an iP-ID per
+    // RFC 9525 §6.2) and so fails on purpose once the leaf is named from 'to'.
+    static async Task ClientXmppNoSniAsync(NetworkStream s, List<string> notes, List<string> failures)
+    {
+        await SendBytesAsync(s, XmppClientHeader());
+        await ExpectBytesAsync(s, XmppServerHeader(), "response stream header");
+        await ExpectBytesAsync(s, XmppFeatures(), "STARTTLS advertisement");
+        await SendBytesAsync(s, XmppStartTls());
+        await ExpectBytesAsync(s, XmppProceed(), "proceed");
+
+        // An empty TargetHost is no server_name extension and nothing else the proxy could read a name
+        // from. Any policy verdict is accepted here - the leaf's own SAN is the verdict - and the
+        // post-TLS restart is carried through so a failure can only be the name, never the upgrade.
+        var ssl = await UpgradeWithoutSniAsync(s, notes, "xmpp-nosni");
+        await SendBytesAsync(ssl, XmppClientHeader());
+        await ExpectBytesAsync(ssl, XmppServerHeader(), "post-TLS response header");
+        await ExpectBytesAsync(ssl, XmppSaslFeatures(), "post-TLS SASL features");
+        await SendBytesAsync(ssl, XmppAuth());
+        await ExpectBytesAsync(ssl, XmppSuccess(), "SASL success");
+
+        var leaf = ssl.RemoteCertificate as X509Certificate2;
+        var dns = (leaf is null ? Array.Empty<string>() : DnsNames(leaf)).ToArray();
+        var ips = (leaf is null ? Array.Empty<string>() : IpNames(leaf)).ToArray();
+        notes.Add($"xmpp-nosni: leaf subject='{leaf?.Subject}' SAN dns=[{string.Join(",", dns)}] ip=[{string.Join(",", ips)}]");
+        if (dns.Length != 0)
+            failures.Add($"xmpp-nosni: the leaf carries DNS name(s) [{string.Join(",", dns)}] although the hello sent no server_name");
+        if (!ips.Contains(IPAddress.Loopback.ToString()))
+            failures.Add($"xmpp-nosni: the leaf's address SAN is [{string.Join(",", ips)}], not the destination it was dialled as");
+        notes.Add("xmpp-nosni: a nameless hello was named by the destination address alone, which cannot match to='im.probe.test' (RFC 6120 §13.7.2.1) - the upgrade and the post-TLS restart work, but a client verifying the 'to' domainpart rejects");
+    }
+
+    // --- XMPP fixtures. The two stream headers carry the attributes RFC 6120 §4.7.2 and §4.7.3 require
+    //     of a client stream, and the id belongs to the receiving entity's response header only.
+    static byte[] XmppClientHeader() => Encoding.ASCII.GetBytes(
+        "<stream:stream from='probe.test' to='im.probe.test' version='1.0'" +
+        " xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>");
+
+    static byte[] XmppServerHeader() => Encoding.ASCII.GetBytes(
+        "<stream:stream from='im.probe.test' id='probe-stream-1' to='probe.test' version='1.0'" +
+        " xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>");
+
+    static byte[] XmppStartTls() => "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>"u8.ToArray();
+    static byte[] XmppProceed() => "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>"u8.ToArray();
+    static byte[] XmppFailure() => "<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>"u8.ToArray();
+    static byte[] XmppStreamClose() => "</stream:stream>"u8.ToArray();
+
+    // §5.4.1: an entity that supports TLS MUST advertise it, and §5.4.2 makes <required/> mark the
+    // negotiation as mandatory-to-negotiate.
+    static byte[] XmppFeatures() => Encoding.ASCII.GetBytes(
+        "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls>" +
+        "</stream:features>");
+
+    static byte[] XmppSaslFeatures() => Encoding.ASCII.GetBytes(
+        "<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>ANONYMOUS" +
+        "</mechanism></mechanisms></stream:features>");
+
+    // A server with no TLS support advertises something else instead, which §5.4.1 permits.
+    static byte[] XmppOtherFeatures() =>
+        "<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></stream:features>"u8.ToArray();
+
+    static byte[] XmppUnqualifiedStartTls() => "<starttls/>"u8.ToArray();
+    static byte[] XmppPing() => "<ping xmlns='urn:xmpp:ping'/>"u8.ToArray();
+    static byte[] XmppPong() => "<pong xmlns='urn:xmpp:ping'/>"u8.ToArray();
+    static byte[] XmppAuth() =>
+        "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='ANONYMOUS'/>"u8.ToArray();
+    static byte[] XmppSuccess() => "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>"u8.ToArray();
+
+    static async Task SendSplitAsync(Stream s, byte[] bytes, bool split)
+    {
+        if (!split) { await SendBytesAsync(s, bytes); return; }
+        // Cut inside the tag name, so neither the element's name nor its closing '>' is ever whole in one
+        // chunk and both halves of the exchange have to be reassembled across the boundary.
+        var at = 6;
+        await SendBytesAsync(s, bytes[..at]);
+        await Task.Delay(150);
+        await SendBytesAsync(s, bytes[at..]);
     }
 
     // The LDAP grant path. whoami is answered first with a success ExtendedResponse of its own, so the
