@@ -35,7 +35,9 @@ public class CertEngine
     private readonly List<EmSignCa> _emSignCas;
     private readonly CertEngineMode _mode;
     private readonly CrlService? _crl;
-    private readonly ConcurrentDictionary<string, IssuedCert> _cache = new(StringComparer.OrdinalIgnoreCase);
+    // Lazy turns a duplicate factory run into a shared one: GetOrAdd is allowed to run its factory for
+    // the same key concurrently, and each extra run would generate an RSA key nobody keeps.
+    private readonly ConcurrentDictionary<string, Lazy<IssuedCert>> _cache = new(StringComparer.OrdinalIgnoreCase);
     private int _nextCaIndex;
 
     public CertEngine(X509Certificate2 fiddlerRoot, List<EmSignCa>? emSignCas = null,
@@ -67,10 +69,12 @@ public class CertEngine
         // Auto serves two leaf families for the same hostname, so the trust has to be part of the key;
         // the fixed modes never change issuer per client.
         if (_mode != CertEngineMode.Auto)
-            return _cache.GetOrAdd(hostname, h => GenerateLeafCert(h, ClientTrust.WindowsStore));
+            return _cache.GetOrAdd(hostname,
+                h => new Lazy<IssuedCert>(() => GenerateLeafCert(h, ClientTrust.WindowsStore))).Value;
 
         var prefix = trust == ClientTrust.NodeBundled && _emSignCas.Count > 0 ? "emsign|" : "fiddler|";
-        return _cache.GetOrAdd(prefix + hostname, _ => GenerateLeafCert(hostname, trust));
+        return _cache.GetOrAdd(prefix + hostname,
+            _ => new Lazy<IssuedCert>(() => GenerateLeafCert(hostname, trust))).Value;
     }
 
     private IssuedCert GenerateLeafCert(string hostname, ClientTrust trust)

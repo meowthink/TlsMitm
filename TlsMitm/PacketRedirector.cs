@@ -11,8 +11,17 @@ namespace TlsMitm;
 public interface IRedirector
 {
     (IPAddress ip, int port)? LookupOriginalDest(IPAddress clientIp, int clientPort, IPAddress serverIp);
+
+    // A listening socket this process owns (the CRL endpoint): its port is stable for the whole run,
+    // so the port alone names the traffic to leave alone.
     void RegisterExemption(int sourcePort);
     void UnregisterExemption(int sourcePort);
+
+    // One outbound connection this process opened to reach a real server. Its source port is an
+    // ephemeral one the OS handed out, so the port alone would also exempt whatever connection gets
+    // that port next; the destination is part of the identity of the flow being exempted.
+    void RegisterFlowExemption(int sourcePort, IPAddress destination, int destinationPort);
+    void UnregisterFlowExemption(int sourcePort, IPAddress destination, int destinationPort);
 
     // Requests aimed at a loopback listener this process owns (the CRL endpoint) are answered locally.
     void RegisterLocalService(int dstPort);
@@ -22,9 +31,12 @@ public class PacketRedirector : IRedirector, IDisposable
 {
     private readonly WinDivertHandle _divert;
     private readonly int _relayPort;
+    private readonly ProcessFilter? _filter;
     private readonly ConcurrentDictionary<V4Key, ConnInfo> _v4Conns = new();
     private readonly ConcurrentDictionary<V6Key, ConnInfo> _v6Conns = new();
     private readonly ConcurrentDictionary<int, byte> _exemptPorts = new();
+    private readonly ConcurrentDictionary<V4ExemptKey, byte> _v4ExemptFlows = new();
+    private readonly ConcurrentDictionary<V6ExemptKey, byte> _v6ExemptFlows = new();
     private readonly ConcurrentDictionary<int, byte> _localServicePorts = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly IntPtr _pPacket;
@@ -35,9 +47,10 @@ public class PacketRedirector : IRedirector, IDisposable
     private long _v6NotTcp;
     private int _disposed;
 
-    public unsafe PacketRedirector(int relayPort)
+    public unsafe PacketRedirector(int relayPort, ProcessFilter? filter = null)
     {
         _relayPort = relayPort;
+        _filter = filter;
         _divert = new WinDivertHandle("outbound and tcp and not impostor");
         _pPacket = Marshal.AllocHGlobal(MTU_MAX);
         _pAddr = Marshal.AllocHGlobal(ADDR_SIZE);
@@ -45,6 +58,8 @@ public class PacketRedirector : IRedirector, IDisposable
         new Span<byte>((void*)_pAddr, ADDR_SIZE).Clear();
         Console.WriteLine($"[Redirector] Filter: outbound and tcp and not impostor");
         Console.WriteLine($"[Redirector] Relay port: {_relayPort}");
+        if (filter is { IsActive: true })
+            Console.WriteLine($"[Redirector] Scope: {filter.Describe()}; other flows are relayed by the OS");
     }
 
     public (IPAddress ip, int port)? LookupOriginalDest(IPAddress clientIp, int clientPort, IPAddress serverIp)
@@ -81,6 +96,37 @@ public class PacketRedirector : IRedirector, IDisposable
     {
         if (_exemptPorts.TryRemove(sourcePort, out _))
             Console.WriteLine($"[Redirector] EXEMPT -{sourcePort} ({_exemptPorts.Count} held)");
+    }
+
+    public void RegisterFlowExemption(int sourcePort, IPAddress destination, int destinationPort)
+    {
+        if (destination.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            var (hi, lo) = RawV6(destination);
+            _v6ExemptFlows[new V6ExemptKey((ushort)sourcePort, hi, lo, (ushort)destinationPort)] = 1;
+        }
+        else
+        {
+            _v4ExemptFlows[new V4ExemptKey((ushort)sourcePort, RawV4(destination), (ushort)destinationPort)] = 1;
+        }
+        Console.WriteLine($"[Redirector] EXEMPT flow +{sourcePort} -> {destination}:{destinationPort}");
+    }
+
+    public void UnregisterFlowExemption(int sourcePort, IPAddress destination, int destinationPort)
+    {
+        var removed = destination.AddressFamily == AddressFamily.InterNetworkV6
+            ? RemoveV6(sourcePort, destination, destinationPort)
+            : _v4ExemptFlows.TryRemove(
+                new V4ExemptKey((ushort)sourcePort, RawV4(destination), (ushort)destinationPort), out _);
+        if (removed)
+            Console.WriteLine($"[Redirector] EXEMPT flow -{sourcePort} -> {destination}:{destinationPort}");
+    }
+
+    private bool RemoveV6(int sourcePort, IPAddress destination, int destinationPort)
+    {
+        var (hi, lo) = RawV6(destination);
+        return _v6ExemptFlows.TryRemove(
+            new V6ExemptKey((ushort)sourcePort, hi, lo, (ushort)destinationPort), out _);
     }
 
     public void RegisterLocalService(int dstPort)
@@ -160,12 +206,22 @@ public class PacketRedirector : IRedirector, IDisposable
         }
     }
 
+    private unsafe bool IsV6FlowExempt(int srcPort, NativeIpv6Header* ip6, int dstPort)
+    {
+        if (_v6ExemptFlows.IsEmpty) return false;
+        var bytes = new byte[16];
+        for (var i = 0; i < 16; i++) bytes[i] = ip6->DestinationAddress[i];
+        var (hi, lo) = RawV6(new IPAddress(bytes));
+        return _v6ExemptFlows.ContainsKey(new V6ExemptKey((ushort)srcPort, hi, lo, (ushort)dstPort));
+    }
+
     private unsafe void ProcessV4(int recvLen, NativeIpv4Header* ip4, NativeTcpHeader* tcp)
     {
         var srcPort = NetToHost(tcp->SrcPort);
         var dstPort = NetToHost(tcp->DstPort);
 
-        if (_exemptPorts.ContainsKey(srcPort))
+        if (_exemptPorts.ContainsKey(srcPort)
+            || _v4ExemptFlows.ContainsKey(new V4ExemptKey((ushort)srcPort, ip4->DstAddr, (ushort)dstPort)))
         {
             _divert.Send((void*)_pPacket, recvLen, null, (Address*)_pAddr);
             return;
@@ -200,8 +256,19 @@ public class PacketRedirector : IRedirector, IDisposable
 
         if (isSyn)
         {
-            _v4Conns[key] = new ConnInfo(new IPAddress(dstAddr), dstPort);
-            Console.WriteLine($"[Redirector] NEW v4 {new IPAddress(srcAddr)}:{srcPort} -> {new IPAddress(dstAddr)}:{dstPort}");
+            var clientIp = new IPAddress(srcAddr);
+            var destination = new IPAddress(dstAddr);
+            if (_filter is { IsActive: true } filter && !filter.Allows(clientIp, srcPort, out var identity))
+            {
+                // The scope decision has to be made here, not in the proxy: by the time a socket is
+                // accepted the packet has already been swapped and the client is talking to us.
+                _v4Conns[key] = new ConnInfo(destination, dstPort) { Bypassed = true };
+                Console.WriteLine($"[Redirector] SCOPE pass v4 {clientIp}:{srcPort} -> {destination}:{dstPort} ({identity.Label})");
+                _divert.Send((void*)_pPacket, recvLen, null, (Address*)_pAddr);
+                return;
+            }
+            _v4Conns[key] = new ConnInfo(destination, dstPort);
+            Console.WriteLine($"[Redirector] NEW v4 {clientIp}:{srcPort} -> {destination}:{dstPort}");
         }
 
         if (!_v4Conns.TryGetValue(key, out var entry))
@@ -209,6 +276,13 @@ public class PacketRedirector : IRedirector, IDisposable
             var fwdMiss = Interlocked.Increment(ref _forwardMiss);
             if (fwdMiss <= 30)
                 Console.WriteLine($"[Redirector] Fwd v4 MISS key={srcPort} {new IPAddress(srcAddr)}:{srcPort} -> {new IPAddress(dstAddr)}:{dstPort} flags={tcp->Flags}");
+            _divert.Send((void*)_pPacket, recvLen, null, (Address*)_pAddr);
+            return;
+        }
+
+        if (entry.Bypassed)
+        {
+            entry.LastSeen = DateTime.UtcNow;
             _divert.Send((void*)_pPacket, recvLen, null, (Address*)_pAddr);
             return;
         }
@@ -283,7 +357,7 @@ public class PacketRedirector : IRedirector, IDisposable
         var srcPort = NetToHost(tcp->SrcPort);
         var dstPort = NetToHost(tcp->DstPort);
 
-        if (_exemptPorts.ContainsKey(srcPort))
+        if (_exemptPorts.ContainsKey(srcPort) || IsV6FlowExempt(srcPort, ip6, dstPort))
         {
             _divert.Send((void*)_pPacket, recvLen, null, (Address*)_pAddr);
             return;
@@ -325,6 +399,13 @@ public class PacketRedirector : IRedirector, IDisposable
 
         if (isSyn)
         {
+            if (_filter is { IsActive: true } filter && !filter.Allows(srcAddr, srcPort, out var identity))
+            {
+                _v6Conns[key] = new ConnInfo(dstAddr, dstPort) { Bypassed = true };
+                Console.WriteLine($"[Redirector] SCOPE pass v6 {srcAddr}:{srcPort} -> {dstAddr}:{dstPort} ({identity.Label})");
+                _divert.Send((void*)_pPacket, recvLen, null, (Address*)_pAddr);
+                return;
+            }
             _v6Conns[key] = new ConnInfo(dstAddr, dstPort);
             Console.WriteLine($"[Redirector] NEW v6 {srcAddr}:{srcPort} -> {dstAddr}:{dstPort}");
         }
@@ -334,6 +415,13 @@ public class PacketRedirector : IRedirector, IDisposable
             var v6Miss = Interlocked.Increment(ref _forwardMiss);
             if (v6Miss <= 30)
                 Console.WriteLine($"[Redirector] Fwd v6 MISS key={srcPort} {srcAddr}:{srcPort} -> {dstAddr}:{dstPort} flags={tcp->Flags}");
+            _divert.Send((void*)_pPacket, recvLen, null, (Address*)_pAddr);
+            return;
+        }
+
+        if (entry.Bypassed)
+        {
+            entry.LastSeen = DateTime.UtcNow;
             _divert.Send((void*)_pPacket, recvLen, null, (Address*)_pAddr);
             return;
         }
@@ -459,10 +547,14 @@ public class PacketRedirector : IRedirector, IDisposable
 
     private readonly record struct V6Key(ulong SrcHi, ulong SrcLo, ushort SrcPort, ulong DstHi, ulong DstLo);
 
+    private readonly record struct V4ExemptKey(ushort SrcPort, uint DstIp, ushort DstPort);
+
+    private readonly record struct V6ExemptKey(ushort SrcPort, ulong DstHi, ulong DstLo, ushort DstPort);
+
     public void Dispose()
     {
-        // Program.cs disposes this explicitly and then again through `using var`; the second pass
-        // would Cancel a disposed CTS and free the same native buffers twice.
+        // `using var` is the only caller today, but exiting during shutdown raced a second pass here
+        // once: the guard costs one interlocked op and makes any future explicit call safe.
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _cts.Cancel();
         _divert.Shutdown();
@@ -480,6 +572,10 @@ public class PacketRedirector : IRedirector, IDisposable
         public DateTime LastSeen = DateTime.UtcNow;
         public int RevCount;
         public bool Closing;
+
+        // A flow the process scope excluded: no swap happened and none may, but the entry still keeps
+        // the packet from being reported as a forwarding miss for the rest of its life.
+        public bool Bypassed;
 
         public ConnInfo(IPAddress origDstAddr, int origDstPort)
         {

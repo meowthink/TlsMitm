@@ -78,7 +78,8 @@ async Task<int> RunModeAsync(string mode)
         // receive different chains. The first leg is optional because current clients may reject the
         // legacy eMSign root before completing the handshake.
         var acceptCount = mode == "auto" ? 2
-            : mode is "grease" or "rootcheck" or "handshake-abort" ? 0 : 1;
+            : mode == "mtls-refused" ? 2
+            : mode is "grease" or "rootcheck" or "handshake-abort" or "filter" ? 0 : 1;
         for (var i = 0; i < acceptCount; i++)
         {
         using var accepted = await listener.AcceptTcpClientAsync();
@@ -118,6 +119,12 @@ async Task<int> RunModeAsync(string mode)
             case "alpn-h2": await ServeImplicitH2Async(stream, upstreamCert); break;
             case "smtpsplit": await ServeSmtpSplitAsync(stream, upstreamCert); break;
             case "https-close": await ServeHttpsCloseAsync(stream, upstreamCert, serverNotes); break;
+            // The first connection refuses the hello the proxy composed; the second is a normal
+            // server, which is where the client's own hello has to arrive instead.
+            case "mtls-refused":
+                if (i == 0) await ServeRefuseHandshakeAsync(stream, serverNotes);
+                else await ServeImplicitAsync(stream, upstreamCert);
+                break;
             default: throw new ArgumentException($"unknown mode '{mode}'");
         }
         }
@@ -201,6 +208,13 @@ async Task<int> RunModeAsync(string mode)
         else if (mode == "rootcheck")
         {
             CheckRootSelection(rootForClient, notes, failures);
+            CheckGeneratedRoot(notes, failures);
+        }
+        else if (mode == "filter")
+        {
+            // Scoping is decided in the redirector before any socket exists, so it is judged here
+            // without traffic: only the decision table needs to be right, not a handshake.
+            CheckProcessFilter(notes, failures);
         }
         else if (mode is "ech-relay" or "ech-downgrade")
         {
@@ -282,6 +296,7 @@ async Task<int> RunModeAsync(string mode)
             case "alpn-fallback": await ClientAlpnAsync(s, "probe.test", notes); break;
             case "alpn-h2": await ClientAlpnH2Async(s, "probe.test", notes); break;
             case "smtpsplit": await ClientSmtpSplitAsync(s, notes); break;
+            case "mtls-refused": await ClientAfterRefusalAsync(s, "probe.test", notes, failures); break;
             default: throw new ArgumentException($"unknown mode '{mode}'");
         }
     }
@@ -664,6 +679,49 @@ async Task<int> RunModeAsync(string mode)
         if (read != 2 || Encoding.ASCII.GetString(body) != "ok")
             throw new InvalidOperationException($"unexpected body ({read} bytes)");
         notes.Add($"implicit({host}): TLS MITM and relay OK");
+    }
+
+    // The upstream refuses the hello this proxy composed. A refusal can be about something the proxy
+    // cannot reproduce (a demanded client certificate, a fingerprint in the raw bytes), so the session
+    // has to survive it: the client's own hello is replayed to a second upstream connection. Only the
+    // upstream's certificate proves that happened - a leaf from our root would mean the proxy
+    // terminated a session the server had already refused.
+    static async Task ClientAfterRefusalAsync(NetworkStream s, string host, List<string> notes,
+        List<string> failures)
+    {
+        X509Certificate2? seen = null;
+        using var ssl = new SslStream(s, false, (_, cert, _, _) =>
+        {
+            seen = cert as X509Certificate2;
+            return true;
+        });
+        // ALPN is what forces the upstream leg first; without it the proxy answers the client before
+        // it has seen the refusal, and the untranslated hello no longer exists to replay.
+        await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+        {
+            TargetHost = host,
+            ApplicationProtocols = new List<SslApplicationProtocol>
+            {
+                SslApplicationProtocol.Http2,
+                SslApplicationProtocol.Http11
+            }
+        });
+
+        notes.Add($"mtls-refused: client TLS={ssl.SslProtocol} alpn='{ssl.NegotiatedApplicationProtocol}' " +
+            $"leaf='{seen?.Subject}'");
+        if (seen?.Subject.Contains("probe-upstream") != true)
+            failures.Add($"mtls-refused: the client was handed '{seen?.Subject}', so the refused session " +
+                "was terminated instead of relayed end to end");
+
+        await SendAsync(ssl, $"GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        await ExpectAsync(ssl, "HTTP/1.1 200");
+        await ReadLineAsync(ssl);
+        await ReadLineAsync(ssl);
+        var body = new byte[2];
+        if (await ssl.ReadAsync(body) != 2 || Encoding.ASCII.GetString(body) != "ok")
+            failures.Add("mtls-refused: the replayed hello's relay never delivered the body");
+        else
+            notes.Add("mtls-refused: the second upstream connection carried the client's own hello");
     }
 
     // The browser-shaped case: the client prefers h2, the server supports no ALPN at all. Telling the
@@ -1352,6 +1410,23 @@ async Task<int> RunModeAsync(string mode)
         await SendAsync(ssl, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     }
 
+    // Reads the whole ClientHello record, then refuses it the way a server that wants a client
+    // certificate does: a fatal alert, description 40 (handshake_failure, RFC 8446 §6.2), and close.
+    // The size is worth printing: it is the only evidence that a hello arrived instead of the proxy
+    // giving up before sending one.
+    static async Task ServeRefuseHandshakeAsync(NetworkStream s, List<string> notes)
+    {
+        var header = new byte[5];
+        await s.ReadExactlyAsync(header);
+        var bodyLength = (header[3] << 8) | header[4];
+        if (header[0] != 0x16 || bodyLength <= 0 || bodyLength > 0x4000)
+            throw new IOException($"expected a ClientHello record, got type {header[0]} length {bodyLength}");
+        await s.ReadExactlyAsync(new byte[bodyLength]);
+        notes.Add($"mtls-refused: fake upstream read a {5 + bodyLength}-byte ClientHello and refused it");
+        await s.WriteAsync(new byte[] { 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 });
+        await s.FlushAsync();
+    }
+
     // A real HTTP server answers only after the blank line that ends the header block, so waiting for it
     // is what catches a relay that withholds the tail of the request. Measured: the FTP control sniffer
     // held the last two bytes of every bodyless GET, and a tolerant fake upstream hid it for weeks.
@@ -1580,7 +1655,7 @@ async Task<int> RunModeAsync(string mode)
         if (sn != "probe.test") failures.Add($"grease: SNI was not parsed (got '{sn}')");
         if (!alpn.Contains("http/1.1")) failures.Add("grease: ALPN was not parsed");
 
-        var ambiguous = new ClientIdentity(ClientTrust.NodeBundled, 1, "test", true);
+        var ambiguous = new ClientIdentity(ClientTrust.NodeBundled, 1, "test", true, "code.exe");
         var decided = (ClientTrust)resolve.Invoke(null, new object?[] { ambiguous, chromium })!;
         var kept = (ClientTrust)resolve.Invoke(null, new object?[] { ambiguous, node })!;
         if (decided != ClientTrust.WindowsStore)
@@ -1738,39 +1813,55 @@ async Task<int> RunModeAsync(string mode)
         // offset 8) and the frame this writer builds - 14 Ethernet, 20 or 40 IP, 20 TCP. The frame's
         // source port tells which peer sent it, so a one-sided recording cannot pass for an exchange.
         var bytes = await File.ReadAllBytesAsync(path);
-        var frames = new List<(bool FromServer, byte[] Payload)>();
+        var frames = new List<(bool FromServer, byte[] Payload, byte Flags)>();
         for (var off = 24; off + 16 <= bytes.Length; off += 16)
         {
             var incl = (int)BitConverter.ToUInt32(bytes.AsSpan(off + 8, 4));
             if (incl < 55 || off + 16 + incl > bytes.Length) break;
             var frame = bytes.AsSpan(off + 16, incl);
-            var ipLen = frame[12] == 0x86 && frame[13] == 0xDD ? 40 : 20;
+            var ipv6 = frame[12] == 0x86 && frame[13] == 0xDD;
+            var ipLen = ipv6 ? 40 : 20;
             var tcp = 14 + ipLen;
-            frames.Add((((frame[tcp] << 8) | frame[tcp + 1]) == upstreamPort, frame[(tcp + 20)..].ToArray()));
+            // The IP length fields bound the TCP payload: an Ethernet frame under 60 bytes is padded,
+            // and that padding is outside the IP datagram.
+            var ipTotal = ipv6 ? (frame[18] << 8) | frame[19] : (frame[16] << 8) | frame[17];
+            var payloadLength = Math.Max(0, ipTotal - (tcp - 14) - 20);
+            frames.Add((((frame[tcp] << 8) | frame[tcp + 1]) == upstreamPort,
+                frame.Slice(tcp + 20, payloadLength).ToArray(), frame[tcp + 13]));
             off += incl;   // the next record header follows this frame, not these 16 bytes
         }
 
-        if (frames.Count < 2)
+        // The file opens with the writer's synthesized three-way handshake, so the TLS records start
+        // after it. A capture whose first frame is a bare SYN from the client is what Wireshark needs
+        // to read the file as one connection rather than a fragment out of the middle.
+        var data = frames.Where(f => f.Payload.Length > 0).ToList();
+        if (frames.Count == 0 || frames[0].FromServer || frames[0].Flags != 0x02
+            || frames[0].Payload.Length != 0)
         {
-            failures.Add($"handshake-abort: capture {Path.GetFileName(path)} holds {frames.Count} frame(s), " +
+            failures.Add("handshake-abort: the capture does not open with the client's SYN");
+            return;
+        }
+        if (data.Count < 2)
+        {
+            failures.Add($"handshake-abort: capture {Path.GetFileName(path)} holds {data.Count} data frame(s), " +
                 "so only one side of the handshake was recorded");
             return;
         }
 
         // A TLS record is content type, version, length, then the handshake message type: 0x16 0x01 is
         // a ClientHello and 0x16 0x02 the ServerHello it was answered with.
-        if (frames[0].FromServer || frames[0].Payload.Length < 6
-            || frames[0].Payload[0] != 0x16 || frames[0].Payload[5] != 0x01)
+        if (data[0].FromServer || data[0].Payload.Length < 6
+            || data[0].Payload[0] != 0x16 || data[0].Payload[5] != 0x01)
         {
-            failures.Add("handshake-abort: the first frame is not the client's ClientHello");
+            failures.Add("handshake-abort: the first data frame is not the client's ClientHello");
             return;
         }
-        if (!System.Text.Encoding.ASCII.GetString(frames[0].Payload).Contains("probe.test"))
+        if (!System.Text.Encoding.ASCII.GetString(data[0].Payload).Contains("probe.test"))
         {
             failures.Add("handshake-abort: the recorded ClientHello carries no SNI, so it is not this session's");
             return;
         }
-        var serverHello = frames.FirstOrDefault(f => f.FromServer && f.Payload.Length >= 6
+        var serverHello = data.FirstOrDefault(f => f.FromServer && f.Payload.Length >= 6
             && f.Payload[0] == 0x16 && f.Payload[5] == 0x02);
         if (serverHello.Payload == null)
         {
@@ -1927,9 +2018,9 @@ async Task<int> RunModeAsync(string mode)
         return der[i + 1 + length];
     }
 
-    // With the machine-store opt-in set, CI otherwise signs with a certificate the product's own
-    // discovery would never reach. This mode calls RootCa anyway and prints which root it returned, so
-    // the log carries the comparison instead of leaving it to the workflow comment.
+    // The suite can sign with a root the product would have to discover on its own (CI's machine store,
+    // or a root the user installed by hand), so this mode calls RootCa and prints which root it returned.
+    // A disagreement means every leaf in the log was signed by something the product would not use.
     static void CheckRootSelection(X509Certificate2 harnessRoot, List<string> notes, List<string> failures)
     {
         var keyUsage = harnessRoot.Extensions.OfType<X509KeyUsageExtension>()
@@ -1956,7 +2047,7 @@ async Task<int> RunModeAsync(string mode)
 
         if (productRoot == null)
         {
-            notes.Add($"rootcheck: RootCa's CurrentUser\\Root enumeration returned no usable root " +
+            notes.Add($"rootcheck: RootCa's Root/My discovery found no usable root " +
                 $"({enumerationFailure}), so this job certifies the machine fixture only");
             return;
         }
@@ -1969,6 +2060,132 @@ async Task<int> RunModeAsync(string mode)
         }
 
         notes.Add($"rootcheck: RootCa and the harness both picked {productRoot.Thumbprint}");
+    }
+
+    // The shape --init-ca has to produce, judged by the same DER the PowerShell fixture asserts: a root
+    // looser than the measured Fiddler root would certify chains the real one refuses, and a root that
+    // cannot sign would only fail later, on the first client handshake.
+    static void CheckGeneratedRoot(List<string> notes, List<string> failures)
+    {
+        using var root = RootCa.CreateRootCertificate();
+        var basic = root.Extensions.OfType<X509BasicConstraintsExtension>().FirstOrDefault();
+        var keyUsage = root.Extensions.OfType<X509KeyUsageExtension>()
+            .Select(e => e.KeyUsages)
+            .Aggregate(new X509KeyUsageFlags(), (all, flags) => all | flags);
+        var eku = root.Extensions.OfType<X509EnhancedKeyUsageExtension>()
+            .SelectMany(e => e.EnhancedKeyUsages.Cast<Oid>())
+            .Select(o => o.Value)
+            .ToList();
+
+        notes.Add($"rootcheck: --init-ca root CA={basic?.CertificateAuthority} pathLen={PathLengthOf(root)} " +
+            $"keyUsage={keyUsage} eku=[{string.Join(",", eku)}]");
+        if (basic is not { CertificateAuthority: true })
+            failures.Add("rootcheck: --init-ca generated root does not carry basicConstraints CA=TRUE");
+        var pathLen = PathLengthOf(root);
+        if (pathLen != 0)
+            failures.Add($"rootcheck: --init-ca generated root has pathLen {pathLen}, not 0");
+        if ((keyUsage & (X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign)) !=
+            (X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign))
+            failures.Add($"rootcheck: --init-ca generated root keyUsage {keyUsage} lacks keyCertSign|cRLSign");
+        if (!eku.Contains("1.3.6.1.5.5.7.3.1"))
+            failures.Add($"rootcheck: --init-ca generated root has no serverAuth EKU ([{string.Join(",", eku)}])");
+
+        var issued = new CertEngine(root).GetCert("probe.test");
+        using var chain = new X509Chain();
+        chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+        chain.ChainPolicy.CustomTrustStore.Add(root);
+        chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+        if (chain.Build(issued.Leaf))
+            notes.Add($"rootcheck: a leaf from the generated root ({issued.Leaf.Subject}) chains back to it");
+        else
+            failures.Add("rootcheck: a leaf from the generated root does not chain to it: " +
+                string.Join("; ", chain.ChainStatus.Select(s => s.Status.ToString())));
+    }
+
+    // Process scoping is a decision table, so it is judged by driving it: each selector has to keep
+    // the flows it names on its own key, drop the rest, and an exclusion has to win over an include.
+    static void CheckProcessFilter(List<string> notes, List<string> failures)
+    {
+        var alice = new ClientIdentity(ClientTrust.WindowsStore, 4000, "chrome.exe [4000]", false, "chrome.exe");
+        var bob = new ClientIdentity(ClientTrust.WindowsStore, 4001, "node.exe [4001]", false, "node.exe");
+        var unowned = new ClientIdentity(ClientTrust.WindowsStore, 0, "unknown", false, "");
+
+        // The redirector resolves by flow; the probe resolves by the same port so a case reads as the
+        // flow it means.
+        ClientIdentity Identify(IPAddress address, int port) => port switch
+        {
+            4000 => alice,
+            4001 => bob,
+            _ => unowned
+        };
+
+        var loopback = IPAddress.Loopback;
+        void Expect(string what, ProcessFilter filter, int port, bool expected)
+        {
+            var allowed = filter.Allows(loopback, port, out var identity);
+            notes.Add($"filter: {what} port {port} ({identity.Label}) -> {(allowed ? "capture" : "pass")}");
+            if (allowed != expected)
+                failures.Add($"filter: {what} should {(expected ? "capture" : "pass")} port {port}, " +
+                    $"but it {(allowed ? "captured" : "passed")} it");
+        }
+
+        ProcessFilter Filter(int[] pids, string[] images, int[] excludedPids, string[] excludedImages) =>
+            new(pids, images, excludedPids, excludedImages, Identify);
+
+        var byPid = Filter(new[] { 4000 }, Array.Empty<string>(), Array.Empty<int>(), Array.Empty<string>());
+        Expect("--pid 4000", byPid, 4000, true);
+        Expect("--pid 4000", byPid, 4001, false);
+        Expect("--pid 4000 (unowned)", byPid, 5000, false);
+
+        var byImage = Filter(Array.Empty<int>(), new[] { "chrome" }, Array.Empty<int>(), Array.Empty<string>());
+        Expect("--process chrome", byImage, 4000, true);
+        Expect("--process chrome", byImage, 4001, false);
+        Expect("--process chrome (unowned)", byImage, 5000, false);
+
+        var excludePid = Filter(Array.Empty<int>(), Array.Empty<string>(), new[] { 4000 }, Array.Empty<string>());
+        Expect("--exclude-pid 4000", excludePid, 4000, false);
+        Expect("--exclude-pid 4000", excludePid, 4001, true);
+        Expect("--exclude-pid 4000 (unowned)", excludePid, 5000, true);
+
+        var excludeImage = Filter(Array.Empty<int>(), Array.Empty<string>(), Array.Empty<int>(), new[] { "chrome" });
+        Expect("--exclude-process chrome", excludeImage, 4000, false);
+        Expect("--exclude-process chrome", excludeImage, 4001, true);
+        Expect("--exclude-process chrome (unowned)", excludeImage, 5000, true);
+        Expect("--exclude-process Chrome.exe", Filter(
+            Array.Empty<int>(), Array.Empty<string>(), Array.Empty<int>(), new[] { "Chrome.exe" }), 4000, false);
+
+        // Either include key can name a flow: the two lists are one whitelist, not an intersection.
+        var includeBoth = Filter(new[] { 4000 }, new[] { "node" }, Array.Empty<int>(), Array.Empty<string>());
+        Expect("--pid 4000 --process node", includeBoth, 4000, true);
+        Expect("--pid 4000 --process node", includeBoth, 4001, true);
+        Expect("--pid 4000 --process node (unowned)", includeBoth, 5000, false);
+
+        // An exclusion wins over an include even when the two name the process through different keys:
+        // "capture chrome but not pid 4000" must not capture pid 4000.
+        var crossKeys = Filter(new[] { 4000 }, new[] { "chrome" }, new[] { 4000 }, Array.Empty<string>());
+        Expect("--pid 4000 --process chrome --exclude-pid 4000", crossKeys, 4000, false);
+        Expect("--pid 4000 --process chrome --exclude-pid 4000", crossKeys, 4001, false);
+
+        var otherKey = Filter(new[] { 4000 }, Array.Empty<string>(), new[] { 4001 }, new[] { "node" });
+        Expect("--pid 4000 --exclude-pid 4001 --exclude-process node", otherKey, 4000, true);
+        Expect("--pid 4000 --exclude-pid 4001 --exclude-process node", otherKey, 4001, false);
+
+        // Rule 3 of ProcessFilter: an inactive filter never consults the table at all, so a machine with
+        // no scoping flags behaves exactly as before and cannot lose a flow to a lookup failure.
+        var looked = 0;
+        var inactive = new ProcessFilter(Array.Empty<int>(), Array.Empty<string>(),
+            Array.Empty<int>(), Array.Empty<string>(), (_, _) =>
+        {
+            looked++;
+            return unowned;
+        });
+        if (!inactive.IsActive)
+            notes.Add("filter: no flags -> inactive");
+        else
+            failures.Add("filter: a filter with no pids and no exclusions reported itself active");
+        Expect("no flags", inactive, 5000, true);
+        if (looked != 0)
+            failures.Add($"filter: an inactive filter ran {looked} process lookups");
     }
 }
 
@@ -1990,6 +2207,10 @@ sealed class FakeRedirector : IRedirector
     public void RegisterExemption(int sourcePort) { }
 
     public void UnregisterExemption(int sourcePort) { }
+
+    public void RegisterFlowExemption(int sourcePort, IPAddress destination, int destinationPort) { }
+
+    public void UnregisterFlowExemption(int sourcePort, IPAddress destination, int destinationPort) { }
 
     public void RegisterLocalService(int dstPort) { }
 }

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 
@@ -10,6 +11,11 @@ public class PcapWriter : IDisposable
     private readonly object _gate = new();
     private uint _packetCount;
 
+    // The wall clock anchors the file; Stopwatch carries the spacing between records.
+    private readonly long _wallClockMicros;
+    private readonly long _startTimestamp;
+    private bool _opened;
+
     // Next sequence number of each direction. Wireshark reassembles a stream off these, so repeating
     // one constant turns every frame after the first into a "suspected retransmission" and leaves the
     // payload undissected.
@@ -21,6 +27,8 @@ public class PcapWriter : IDisposable
         _stream = new FileStream(filePath, FileMode.Create, FileAccess.Write);
         _writer = new BinaryWriter(_stream);
         _packetCount = 0;
+        _wallClockMicros = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000;
+        _startTimestamp = Stopwatch.GetTimestamp();
 
         WriteGlobalHeader();
     }
@@ -51,6 +59,8 @@ public class PcapWriter : IDisposable
 
     private void WritePacketCore(byte[] packetData, bool isOutbound, IPAddress srcIp, IPAddress dstIp, ushort srcPort, ushort dstPort)
     {
+        OpenFlow(isOutbound, srcIp, dstIp, srcPort, dstPort);
+
         // Neither IPv4's total-length field (RFC 791 §3.1) nor IPv6's payload-length field (RFC 8200
         // §3) can express more than 65535 octets, so a longer relay chunk has to become several
         // segments instead of wrapping the field and leaving the rest of the flow undissectable. The
@@ -68,14 +78,29 @@ public class PcapWriter : IDisposable
         while (offset < packetData.Length);
     }
 
+    /// <summary>
+    /// Prepends the three-way opening to the file. A capture that begins mid-stream leaves Wireshark
+    /// unable to tell the start of a connection from a piece out of its middle, so the three segments
+    /// are synthesized for this file's two endpoints with ISN 0 - which keeps the first data byte at
+    /// sequence 1. No FIN is written: where the relay stopped is not where the session ended.
+    /// </summary>
+    private void OpenFlow(bool isOutbound, IPAddress srcIp, IPAddress dstIp, ushort srcPort, ushort dstPort)
+    {
+        if (_opened) return;
+        _opened = true;
+
+        var clientIp = isOutbound ? srcIp : dstIp;
+        var serverIp = isOutbound ? dstIp : srcIp;
+        var clientPort = isOutbound ? srcPort : dstPort;
+        var serverPort = isOutbound ? dstPort : srcPort;
+
+        WriteSegment(Array.Empty<byte>(), clientIp, serverIp, clientPort, serverPort, 0, 0, 0x02);
+        WriteSegment(Array.Empty<byte>(), serverIp, clientIp, serverPort, clientPort, 0, 1, 0x12);
+        WriteSegment(Array.Empty<byte>(), clientIp, serverIp, clientPort, serverPort, 1, 1, 0x10);
+    }
+
     private void WriteRecord(byte[] payload, bool isOutbound, IPAddress srcIp, IPAddress dstIp, ushort srcPort, ushort dstPort)
     {
-        // Wall-clock time, not time since this file was opened: a capture whose timestamps start at
-        // 1970 cannot be lined up with the console log or with any other tool's pcap.
-        var now = DateTimeOffset.UtcNow;
-        var timestamp = (uint)now.ToUnixTimeSeconds();
-        var microseconds = (uint)(now.Millisecond * 1000);
-
         // Build Ethernet + IP + TCP packet
         var seq = isOutbound ? _seqClientToServer : _seqServerToClient;
         var ack = isOutbound ? _seqServerToClient : _seqClientToServer;
@@ -84,9 +109,16 @@ public class PcapWriter : IDisposable
         if (isOutbound) _seqClientToServer += (uint)payload.Length;
         else _seqServerToClient += (uint)payload.Length;
 
-        var ethIpTcp = BuildPacket(payload, isOutbound, srcIp, dstIp, srcPort, dstPort, seq, ack);
+        WriteSegment(payload, srcIp, dstIp, srcPort, dstPort, seq, ack,
+            isOutbound ? (byte)0x18 : (byte)0x10); // PSH+ACK outbound, ACK inbound
+    }
 
-        // Packet header
+    private void WriteSegment(byte[] payload, IPAddress srcIp, IPAddress dstIp, ushort srcPort,
+        ushort dstPort, uint seq, uint ack, byte flags)
+    {
+        var ethIpTcp = BuildPacket(payload, srcIp, dstIp, srcPort, dstPort, seq, ack, flags);
+        var (timestamp, microseconds) = Stamp();
+
         _writer.Write(timestamp);           // ts_sec
         _writer.Write(microseconds);        // ts_usec
         _writer.Write((uint)ethIpTcp.Length); // incl_len
@@ -98,8 +130,19 @@ public class PcapWriter : IDisposable
         _packetCount++;
     }
 
-    private byte[] BuildPacket(byte[] payload, bool isOutbound, IPAddress srcIp, IPAddress dstIp,
-        ushort srcPort, ushort dstPort, uint seq, uint ack)
+    private (uint Seconds, uint Microseconds) Stamp()
+    {
+        // DateTimeOffset.UtcNow advances in whole milliseconds on this host, so every record written
+        // inside one millisecond shares a timestamp - a busy flow then has no order Wireshark can
+        // show. The sub-second field still holds true microseconds: the wall clock fixes the file's
+        // absolute time, and QPC, which counts at Stopwatch.Frequency, carries the spacing.
+        var elapsed = (long)Stopwatch.GetElapsedTime(_startTimestamp).TotalMicroseconds;
+        var micros = _wallClockMicros + elapsed;
+        return ((uint)(micros / 1_000_000), (uint)(micros % 1_000_000));
+    }
+
+    private byte[] BuildPacket(byte[] payload, IPAddress srcIp, IPAddress dstIp,
+        ushort srcPort, ushort dstPort, uint seq, uint ack, byte flags)
     {
         // The capture is one synthetic flow, so a client on v4 and a server on v6 cannot both keep
         // their own family: both endpoints are carried as v6, the v4 one in its ::ffff: form.
@@ -121,7 +164,7 @@ public class PcapWriter : IDisposable
         WriteBigEndian(tcpHeader, 4, seq); // Sequence number
         WriteBigEndian(tcpHeader, 8, ack); // Acknowledgment number
         tcpHeader[12] = 0x50; // Data offset (5 * 4 = 20 bytes)
-        tcpHeader[13] = isOutbound ? (byte)0x18 : (byte)0x10; // Flags (PSH+ACK for outbound, ACK for inbound)
+        tcpHeader[13] = flags;
         tcpHeader[14] = 0xff; tcpHeader[15] = 0xff; // Window size
         // RFC 9293 §3.1 requires the field to cover the pseudo-header, the header and the data;
         // Wireshark validates it, so a placeholder marks every packet "Bad checksum".
