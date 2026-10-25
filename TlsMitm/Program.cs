@@ -5,8 +5,10 @@ using System.Text;
 const int ProxyPort = 8443;
 const string EmSignCertDir = "emsign_certs";
 
-var logPath = Path.Combine(AppContext.BaseDirectory, "tlsmitm.log");
-var logWriter = new StreamWriter(new FileStream(logPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
+// One file per run: a fixed name truncated the previous run, which is the run whose crash the next
+// start is usually asked about. AutoFlush stays on - a native fail-fast never flushes a buffer.
+var logPath = Path.Combine(AppContext.BaseDirectory, $"tlsmitm-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+var logWriter = new StreamWriter(new FileStream(logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
 {
     AutoFlush = true
 };
@@ -19,6 +21,13 @@ var useEmSign = args.Contains("--emsign") || args.Contains("-e");
 var emSignOnly = args.Contains("--emsign-only");
 var rotate = args.Contains("--rotate");
 var echDowngrade = args.Contains("--no-ech-downgrade") ? null : new EchDowngrade();
+var initCa = args.Contains("--init-ca");
+var rootPath = Option("--root");
+var rootThumbprint = Option("--root-thumbprint");
+var pids = ParseInts(Option("--pid"), "--pid");
+var includeImages = ParseNames(Option("--process"));
+var excludedPids = ParseInts(Option("--exclude-pid"), "--exclude-pid");
+var excludedImages = ParseNames(Option("--exclude-process"));
 
 var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
@@ -29,15 +38,30 @@ Console.CancelKeyPress += (_, e) =>
 };
 
 Console.WriteLine("[Main] TlsMitm - WinDivert + MITM Proxy (Transparent)");
-Console.WriteLine("[Main] Requires: Fiddler root CA installed, Administrator privileges");
+Console.WriteLine("[Main] Requires: administrator (driver load); a root from --init-ca, --root, or Fiddler");
 Console.WriteLine("[Main] Usage: dotnet run [--emsign | --emsign-only | --rotate] [--no-ech-downgrade]");
+Console.WriteLine("[Main]                          [--init-ca | --root <pfx> | --root-thumbprint <thumbprint>]");
+Console.WriteLine("[Main]                          [--pid <pid,...> | --exclude-pid <pid,...>]");
+Console.WriteLine("[Main]                          [--process <exe,...> | --exclude-process <exe,...>]");
 Console.WriteLine("[Main]   --emsign      pick the chain per client process (emSign for Node/Electron, Fiddler otherwise)");
 Console.WriteLine("[Main]   --emsign-only force the emSign chain for every client");
 Console.WriteLine("[Main]   --rotate      rotate between the Fiddler root and the emSign intermediates");
 Console.WriteLine("[Main]   --no-ech-downgrade  relay ECH hellos blind instead of terminating them");
+Console.WriteLine("[Main]   --init-ca     create a machine-wide root when none is installed (needs elevation)");
+Console.WriteLine("[Main]   --root        sign with this PFX (password from TLSMITM_ROOT_PASSWORD)");
+Console.WriteLine("[Main]   --pid / --process  intercept only these client processes (pid or executable)");
+Console.WriteLine("[Main]   --exclude-pid / --exclude-process  intercept everything except these client processes");
 Console.WriteLine();
 
-var rootCa = RootCa.GetFiddlerRoot();
+X509Certificate2 rootCa;
+if (initCa)
+    rootCa = RootCa.CreateAndInstall();
+else if (rootPath != null)
+    rootCa = RootCa.LoadFromPfx(rootPath, Environment.GetEnvironmentVariable("TLSMITM_ROOT_PASSWORD"));
+else if (rootThumbprint != null)
+    rootCa = RootCa.FindByThumbprint(rootThumbprint);
+else
+    rootCa = RootCa.GetFiddlerRoot();
 
 // Node and Electron never read the Windows store, so a Node client needs this root as a PEM. It has
 // to be exactly the root that signs the leaves: four same-subject Fiddler roots are installed here,
@@ -70,7 +94,8 @@ else
 using var crl = CrlService.Start(rootCa);
 var certEngine = new CertEngine(rootCa, emSignCas, mode, crl);
 
-using var redirector = new PacketRedirector(ProxyPort);
+using var redirector = new PacketRedirector(ProxyPort,
+    new ProcessFilter(pids, includeImages, excludedPids, excludedImages));
 // Loopback traffic is captured too, so the CRL endpoint needs both halves: RegisterExemption covers
 // its replies (matched by source port), RegisterLocalService covers a validator's GET to it, whose
 // source port is ephemeral and would otherwise be forward-swapped into the proxy.
@@ -104,8 +129,6 @@ catch (OperationCanceledException)
 }
 
 Console.WriteLine("[Main] Stopping...");
-quicBlocker.Dispose();
-redirector.Dispose();
 
 List<EmSignCa> LoadEmSignCas()
 {
@@ -165,6 +188,43 @@ List<EmSignCa> LoadEmSignCas()
 
 static bool IsCertFile(string path) =>
     Path.GetExtension(path).ToLowerInvariant() is ".pem" or ".crt" or ".cer" or ".der";
+
+// Flags are still hand-parsed: the project ships no NuGet dependencies and needs no completion, so a
+// table-driven parser with one lookup per option is the whole requirement.
+string? Option(string name)
+{
+    var at = Array.IndexOf(args, name);
+    if (at < 0) return null;
+    if (at + 1 >= args.Length || args[at + 1].StartsWith("--", StringComparison.Ordinal))
+    {
+        Console.WriteLine($"[Main] {name} needs a value");
+        Environment.Exit(2);
+    }
+    return args[at + 1];
+}
+
+static string[] ParseNames(string? text) =>
+    text == null
+        ? Array.Empty<string>()
+        : text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(name => name.Length > 0)
+            .ToArray();
+
+static int[] ParseInts(string? text, string name)
+{
+    if (text == null) return Array.Empty<int>();
+    var values = new List<int>();
+    foreach (var part in text.Split(',', StringSplitOptions.RemoveEmptyEntries))
+    {
+        if (!int.TryParse(part, out var value))
+        {
+            Console.WriteLine($"[Main] {name}: '{part}' is not a process id");
+            Environment.Exit(2);
+        }
+        values.Add(value);
+    }
+    return values.ToArray();
+}
 
 sealed class TeeWriter : TextWriter
 {

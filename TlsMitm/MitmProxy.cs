@@ -105,7 +105,7 @@ public class MitmProxy
             // Server-first protocols (SMTP/IMAP/POP3/FTP) greet before the client says anything, so
             // protocol detection cannot wait on the client alone. Peek both sockets and let whichever
             // speaks first decide; a peek consumes nothing, so the session starts with a clean stream.
-            var (fromClient, firstByte) = await FirstSpeakerAsync(client.Client, realServer.Client, ct);
+            var (fromClient, firstByte) = await FirstSpeakerAsync(client.Client, realServer.Socket, ct);
 
             if (fromClient && firstByte == 0x16)
             {
@@ -115,12 +115,14 @@ public class MitmProxy
             }
             else
             {
-                await HandlePlainAsync(client, realServer, stream, serverStream, origIp, origPort, identity, ct);
+                await HandlePlainAsync(client, realServer.Client, stream, serverStream, origIp, origPort, identity, ct);
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Proxy] Error: {ex.Message}");
+            // This catch only sees what the per-leg handlers did not: an unexpected failure whose
+            // stack is the only thing that says where. Per-leg failures log their own message.
+            Console.WriteLine($"[Proxy] Error: {ex}");
         }
         finally
         {
@@ -266,7 +268,12 @@ public class MitmProxy
         if (upstreamFirst)
         {
             var upstream = await AuthenticateUpstreamAsync(sslServer, host, offeredAlpn, ct);
-            if (!upstream.Ok) return;
+            if (!upstream.Ok)
+            {
+                await BlindAfterRefusalAsync(client, rawClientStream, replayedHello, host, upstream.Error,
+                    origIp, origPort, ct);
+                return;
+            }
             serverProtocol = upstream.Protocol;
         }
 
@@ -337,7 +344,15 @@ public class MitmProxy
         if (!upstreamFirst)
         {
             var upstream = await AuthenticateUpstreamAsync(sslServer, host, offeredAlpn, ct);
-            if (!upstream.Ok) return;
+            if (!upstream.Ok)
+            {
+                // The client leg is already terminated here, so the client's hello no longer exists on
+                // the wire and cannot be replayed to a fresh connection. Name the refusal instead of
+                // letting a bare close look like a client abort.
+                Console.WriteLine($"[Proxy] Upstream refused after the client leg for {host}: {upstream.Error}" +
+                    " - closing; a blind fallback would need the untranslated hello");
+                return;
+            }
         }
 
         Console.WriteLine($"[Proxy] MITM established: {host}");
@@ -543,7 +558,7 @@ public class MitmProxy
         return identity.Trust;
     }
 
-    private async Task<TcpClient?> ConnectExemptedAsync(IPAddress address, int port, CancellationToken ct)
+    private async Task<UpstreamConnection?> ConnectExemptedAsync(IPAddress address, int port, CancellationToken ct)
     {
         // The socket's family is the family of the packet the client meant to send: dialing a v6
         // destination from an AF_INET socket fails before a single byte leaves.
@@ -558,39 +573,63 @@ public class MitmProxy
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Proxy] Bind failed: {ex.Message}");
+            Console.WriteLine($"[Proxy] Bind failed for {address}:{port}: {ex.Message}");
             socket.Close();
             return null;
         }
 
-        _redirector.RegisterExemption(exemptPort);
+        // Exempted by the flow, not by the port: this port is an ephemeral one the OS will hand to a
+        // different connection the moment this socket closes, and that connection is not ours to skip.
+        _redirector.RegisterFlowExemption(exemptPort, address, port);
         try
         {
             await socket.ConnectAsync(new IPEndPoint(address, port), ct);
         }
-        catch
+        catch (Exception ex)
         {
-            _redirector.UnregisterExemption(exemptPort);
+            Console.WriteLine($"[Proxy] Connect to {address}:{port} failed: {ex.GetType().Name}: {ex.Message}");
+            _redirector.UnregisterFlowExemption(exemptPort, address, port);
             socket.Close();
             return null;
         }
 
-        var client = new TcpClient { Client = socket };
-        _ = UnregisterOnCloseAsync(client, exemptPort);
-        return client;
+        return new UpstreamConnection(new TcpClient { Client = socket }, _redirector, exemptPort, address, port);
     }
 
-    private async Task UnregisterOnCloseAsync(TcpClient client, int exemptPort)
+    /// <summary>
+    /// An upstream socket that holds a flow exemption for exactly as long as it can send: the release
+    /// runs after the socket is closed, so no new connection can inherit the exemption while the old
+    /// socket still exists, and none is left behind after it is gone.
+    /// </summary>
+    private sealed class UpstreamConnection : IDisposable
     {
-        try
+        private readonly IRedirector _redirector;
+        private readonly int _exemptPort;
+        private readonly IPAddress _destination;
+        private readonly int _destinationPort;
+        private int _disposed;
+
+        public UpstreamConnection(TcpClient client, IRedirector redirector, int exemptPort,
+            IPAddress destination, int destinationPort)
         {
-            while (client.Connected)
-                await Task.Delay(1000);
+            Client = client;
+            _redirector = redirector;
+            _exemptPort = exemptPort;
+            _destination = destination;
+            _destinationPort = destinationPort;
         }
-        catch { }
-        finally
+
+        public TcpClient Client { get; }
+
+        public Socket Socket => Client.Client;
+
+        public NetworkStream GetStream() => Client.GetStream();
+
+        public void Dispose()
         {
-            _redirector.UnregisterExemption(exemptPort);
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            Client.Dispose();
+            _redirector.UnregisterFlowExemption(_exemptPort, _destination, _destinationPort);
         }
     }
 
@@ -1014,7 +1053,7 @@ public class MitmProxy
         return s.ToString();
     }
 
-    private async Task<(bool Ok, SslApplicationProtocol Protocol)> AuthenticateUpstreamAsync(
+    private async Task<(bool Ok, SslApplicationProtocol Protocol, string Error)> AuthenticateUpstreamAsync(
         SslStream sslServer, string host, IReadOnlyList<string>? offeredAlpn, CancellationToken ct)
     {
         var authOptions = new SslClientAuthenticationOptions
@@ -1035,19 +1074,42 @@ public class MitmProxy
             await sslServer.AuthenticateAsClientAsync(authOptions, ct);
             var protocol = sslServer.NegotiatedApplicationProtocol;
             Console.WriteLine($"[Proxy] Server TLS established, ALPN: {protocol} (client offered: {DescribeAlpn(offeredAlpn)})");
-            return (true, protocol);
+            return (true, protocol, "");
         }
         catch (Exception ex)
         {
             // A refused hello names nothing but the exception unless the hello itself is on the line:
             // offered protocols and ALPN are how this differs from the certificate cases logged above.
             Console.WriteLine($"[Proxy] Server TLS failed for {host}: {ex.Message} (alpn: {DescribeAlpn(offeredAlpn)}, protocols: {authOptions.EnabledSslProtocols})");
-            return (false, default);
+            return (false, default, ex.Message);
         }
     }
 
     private static string DescribeAlpn(IReadOnlyList<string>? alpn) =>
         alpn is { Count: > 0 } ? string.Join(",", alpn) : "none";
+
+    /// <summary>
+    /// Falls back to an end-to-end session when the real server refuses the hello this proxy composed.
+    /// A refusal is not a reason to kill the connection: a server can demand a client certificate, or
+    /// key on something in the raw hello, none of which the client asked for. Only possible before the
+    /// client leg is answered - the original hello is what gets replayed, and it is gone once our own
+    /// ServerHello is on the wire. The refused leg's socket cannot be reused for it (the server has
+    /// already seen one handshake), so this dials a second one.
+    /// </summary>
+    private async Task BlindAfterRefusalAsync(
+        TcpClient client, Stream rawClientStream, byte[] replayedHello, string host, string reason,
+        IPAddress origIp, int origPort, CancellationToken ct)
+    {
+        using var retry = await ConnectExemptedAsync(origIp, origPort, ct);
+        if (retry == null)
+        {
+            Console.WriteLine($"[Proxy] Blind fallback for {host} unavailable: a second connection to {origIp}:{origPort} failed");
+            return;
+        }
+
+        await BlindRelayAsync(client, new PrefixedStream(replayedHello, rawClientStream), retry.GetStream(),
+            host, $"upstream refused the hello ({reason})", origIp, origPort, ct);
+    }
 
     /// <summary>
     /// Relays a session that cannot be terminated: the bytes the client already sent are replayed to the

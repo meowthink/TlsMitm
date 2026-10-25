@@ -23,7 +23,8 @@ public enum ClientTrust
 /// TLS stack and Chromium's networking code in one binary, so a single connection still has to be
 /// told apart by its ClientHello (Chromium sends GREASE, Node does not).
 /// </param>
-public readonly record struct ClientIdentity(ClientTrust Trust, int Pid, string Label, bool Ambiguous);
+/// <param name="Image">Executable file name, which is what a process-scope filter names.</param>
+public readonly record struct ClientIdentity(ClientTrust Trust, int Pid, string Label, bool Ambiguous, string Image);
 
 /// <summary>
 /// Names the process that owns a client connection. The redirector hands the proxy the client's own
@@ -39,7 +40,6 @@ public static class ClientProcess
     private const int ERROR_INSUFFICIENT_BUFFER = 122;
 
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
-    private const uint PROCESS_VM_READ = 0x0010;
 
     private static readonly TimeSpan RowTtl = TimeSpan.FromMilliseconds(200);
     private static readonly TimeSpan PidTtl = TimeSpan.FromSeconds(10);
@@ -66,7 +66,7 @@ public static class ClientProcess
             // Still unknown means the process is gone or inaccessible. Surface it instead of falling
             // back silently; this is the one path where the chain choice is a guess.
             firstSighting = true;
-            return new ClientIdentity(ClientTrust.WindowsStore, 0, "unknown (no TCP owner)", false);
+            return new ClientIdentity(ClientTrust.WindowsStore, 0, "unknown (no TCP owner)", false, "");
         }
 
         var now = Environment.TickCount64;
@@ -89,29 +89,29 @@ public static class ClientProcess
         // Electron's utilityProcess API runs Node in a --type=utility child; that child verifies with
         // the bundled list, unlike every other Chromium child.
         if (cmd.Contains("node.mojom.NodeService", StringComparison.OrdinalIgnoreCase))
-            return new ClientIdentity(ClientTrust.NodeBundled, pid, $"{exe} (electron node service)", false);
+            return new ClientIdentity(ClientTrust.NodeBundled, pid, $"{exe} (electron node service)", false, exe);
 
         // Renderers, GPU and the network service all reach TLS through Schannel; the network service
         // is the one that carries page traffic.
         if (cmd.Contains("--type=", StringComparison.OrdinalIgnoreCase))
-            return new ClientIdentity(ClientTrust.WindowsStore, pid, $"{exe} (chromium child)", false);
+            return new ClientIdentity(ClientTrust.WindowsStore, pid, $"{exe} (chromium child)", false, exe);
 
         if (string.Equals(exe, "node.exe", StringComparison.OrdinalIgnoreCase))
-            return new ClientIdentity(ClientTrust.NodeBundled, pid, "node.exe", true);
+            return new ClientIdentity(ClientTrust.NodeBundled, pid, "node.exe", true, exe);
 
         // A packaged Electron app spawns its own Node children as "app.exe <script>.mjs <args>". That
         // argv has no --type=, so without this it would be logged as the main process even though it
         // is a separate process on the same bundled-store TLS stack.
         if (RunsNodeScript(cmd))
-            return new ClientIdentity(ClientTrust.NodeBundled, pid, $"{exe} (electron node worker)", true);
+            return new ClientIdentity(ClientTrust.NodeBundled, pid, $"{exe} (electron node worker)", true, exe);
 
         // An Electron main process has no --type= and verifies with its bundled list; the .asar
         // beside the executable is what distinguishes it from a Chromium browser process, which
         // does not run Node and whose own connections go through its network service child.
         if (LooksLikeElectronApp(imagePath))
-            return new ClientIdentity(ClientTrust.NodeBundled, pid, $"{exe} (electron main)", true);
+            return new ClientIdentity(ClientTrust.NodeBundled, pid, $"{exe} (electron main)", true, exe);
 
-        return new ClientIdentity(ClientTrust.WindowsStore, pid, $"{exe} (no known bundling)", false);
+        return new ClientIdentity(ClientTrust.WindowsStore, pid, $"{exe} (no known bundling)", false, exe);
     }
 
     private static bool RunsNodeScript(string commandLine)
@@ -266,50 +266,48 @@ public static class ClientProcess
         }
     }
 
-    private static string? QueryCommandLine(int pid)
+    private static unsafe string? QueryCommandLine(int pid)
     {
-        var handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid);
+        // ProcessCommandLineInformation returns a UNICODE_STRING whose Buffer points into the caller's
+        // own buffer (measured on 10.0.17763: base + sizeof(UNICODE_STRING)), so it needs only
+        // PROCESS_QUERY_LIMITED_INFORMATION - unlike walking the PEB, which needs PROCESS_VM_READ and
+        // therefore fails on any process that forbids it. The array is pinned across the call and the
+        // read because the kernel writes that pointer, not a string we may chase later.
+        const int ProcessCommandLineInformation = 60;
+        const int StatusInfoLengthMismatch = unchecked((int)0xC0000004);
+
+        var handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
         if (handle == IntPtr.Zero) return null;
         try
         {
-            var info = new byte[48];
-            if (NtQueryInformationProcess(handle, 0, info, info.Length, out _) != 0) return null;
-            var peb = (ulong)Marshal.ReadInt64(info, 8);
-            if (peb == 0) return null;
-
-            var paramsPtr = ReadPointer(handle, (IntPtr)(long)(peb + 0x20));
-            if (paramsPtr == IntPtr.Zero) return null;
-
-            // RTL_USER_PROCESS_PARAMETERS (x64): ImagePathName at 0x60, CommandLine at 0x70, both
-            // UNICODE_STRINGs { ushort Length; ushort MaximumLength; wchar_t *Buffer; }.
-            var header = new byte[16];
-            if (!ReadProcessMemory(handle, (IntPtr)(long)((ulong)paramsPtr + 0x70), header,
-                    (IntPtr)header.Length, out var read) || read != header.Length)
-                return null;
-
-            var length = (int)BitConverter.ToUInt16(header, 0);
-            var bufferPtr = (ulong)Marshal.ReadInt64(header, 8);
-            if (length <= 0 || length > 0x10000 || bufferPtr == 0) return null;
-
-            var bytes = new byte[length];
-            if (!ReadProcessMemory(handle, (IntPtr)(long)bufferPtr, bytes, (IntPtr)length, out read)
-                || read < length)
-                return null;
-            return Encoding.Unicode.GetString(bytes);
+            var size = 0x400;
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                var buffer = new byte[size];
+                int status;
+                int needed;
+                fixed (byte* p = buffer)
+                {
+                    status = NtQueryInformationProcess(handle, ProcessCommandLineInformation, buffer,
+                        buffer.Length, out needed);
+                    if (status == 0)
+                    {
+                        var length = *(ushort*)p;
+                        var text = *(IntPtr*)(p + 8);
+                        var offset = (long)text - (long)p;
+                        if (length <= 0 || offset < 16 || offset >= buffer.Length) return null;
+                        return Marshal.PtrToStringUni(text, length / 2);
+                    }
+                }
+                if (status != StatusInfoLengthMismatch || needed <= size) return null;
+                size = needed;
+            }
+            return null;
         }
         finally
         {
             CloseHandle(handle);
         }
-    }
-
-    private static IntPtr ReadPointer(IntPtr process, IntPtr address)
-    {
-        var buf = new byte[IntPtr.Size];
-        if (!ReadProcessMemory(process, address, buf, (IntPtr)buf.Length, out var read)
-            || read != buf.Length)
-            return IntPtr.Zero;
-        return (IntPtr)BitConverter.ToInt64(buf, 0);
     }
 
     [DllImport("iphlpapi.dll", SetLastError = true)]
@@ -326,11 +324,77 @@ public static class ClientProcess
     private static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder name,
         ref int size);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool ReadProcessMemory(IntPtr process, IntPtr baseAddress, byte[] buffer,
-        IntPtr size, out IntPtr bytesRead);
-
     [DllImport("ntdll.dll")]
     private static extern int NtQueryInformationProcess(IntPtr process, int infoClass, byte[] info,
         int infoLength, out int returnLength);
+}
+
+/// <summary>
+/// Narrows interception to a set of client processes. There are two selectors, each usable on either
+/// side of the decision: a pid, and an executable name. <c>--pid</c>/<c>--process</c> keep only the
+/// named processes, <c>--exclude-pid</c>/<c>--exclude-process</c> drop them, and a flow that is not in
+/// scope is left alone - not the packet only, but the whole connection, because a half-redirected
+/// flow breaks the client.
+/// </summary>
+public sealed class ProcessFilter
+{
+    private readonly HashSet<int> _includePids;
+    private readonly HashSet<string> _includeImages;
+    private readonly HashSet<int> _excludePids;
+    private readonly HashSet<string> _excludeImages;
+    private readonly Func<IPAddress, int, ClientIdentity> _identify;
+
+    public ProcessFilter(IEnumerable<int> includePids, IEnumerable<string> includeImages,
+        IEnumerable<int> excludePids, IEnumerable<string> excludeImages,
+        Func<IPAddress, int, ClientIdentity>? identify = null)
+    {
+        _includePids = includePids.ToHashSet();
+        _includeImages = Names(includeImages);
+        _excludePids = excludePids.ToHashSet();
+        _excludeImages = Names(excludeImages);
+        _identify = identify ?? ((address, port) => ClientProcess.Identify(address, port, out _));
+    }
+
+    public bool IsActive =>
+        _includePids.Count > 0 || _includeImages.Count > 0 || _excludePids.Count > 0 || _excludeImages.Count > 0;
+
+    public string Describe() =>
+        string.Join(", ", new[]
+        {
+            _includePids.Count > 0 ? $"pid {string.Join('/', _includePids)}" : null,
+            _includeImages.Count > 0 ? string.Join('/', _includeImages) : null,
+            _excludePids.Count > 0 ? $"not pid {string.Join('/', _excludePids)}" : null,
+            _excludeImages.Count > 0 ? $"not {string.Join('/', _excludeImages)}" : null
+        }.Where(s => s != null));
+
+    public bool Allows(IPAddress clientAddress, int clientPort, out ClientIdentity identity)
+    {
+        identity = default;
+        if (!IsActive) return true;
+        identity = _identify(clientAddress, clientPort);
+
+        // With no include list every flow is a candidate; with one, either key may name it. An unowned
+        // flow (pid 0, no image) satisfies neither, and letting it through would mean a request to
+        // watch one process silently captures everything the TCP table could not name.
+        var included = (_includePids.Count == 0 && _includeImages.Count == 0)
+            || _includePids.Contains(identity.Pid)
+            || _includeImages.Contains(NormalizeImage(identity.Image));
+        if (!included) return false;
+
+        // An exclusion is a hard no even for a flow an include named: the two sides of each pair are
+        // the same selector, so "capture chrome but not pid 4000" has to mean the pid wins.
+        return !_excludePids.Contains(identity.Pid) && !_excludeImages.Contains(NormalizeImage(identity.Image));
+    }
+
+    private static HashSet<string> Names(IEnumerable<string> names) =>
+        names.Select(NormalizeImage).Where(name => name.Length > 0).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    // The empty string is what an unowned flow carries; it must never turn into ".exe" and match a
+    // pattern, so it stays empty and no set can contain it.
+    private static string NormalizeImage(string name)
+    {
+        var file = Path.GetFileName(name.Trim());
+        if (file.Length == 0) return "";
+        return file.Contains('.') ? file : file + ".exe";
+    }
 }

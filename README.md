@@ -25,12 +25,15 @@ per-client chain selection, a local CRL, and plain pcap output.
    the server's readiness reply the same TCP connection is upgraded in place.
 3. For TLS the ClientHello is parsed (SNI, ALPN, `early_data`, PSK, ECH, GREASE), the signing chain
    is chosen by the process that owns the client socket, and the session is terminated toward the
-   client and re-originated toward the server.
+   client and re-originated toward the server. A hello the real server refuses is not fatal: the
+   client's own hello is replayed on a fresh connection and that session goes blind.
 4. ECH hellos are terminated with a leaf for the public name, which is what makes Chromium either
    keep the session or retry without ECH. A host that yields neither application bytes nor a
    plaintext retry within 5 s is relayed blind for 10 minutes, so the site keeps working.
 5. 0-RTT and PSK-only resumptions are relayed blind: decryption would need keys we cannot have.
-   They are still captured, as is every other session (`captures/<host>_<time>_<id>.pcap`).
+   They are still captured, as is every other TLS session (`captures/<host>_<time>_<id>.pcap`).
+   Each file opens with a synthesized three-way handshake, so Wireshark reads one connection from
+   its start rather than a fragment out of the middle.
 6. QUIC is dropped by long-header signature, so HTTP/3 clients fall back to TCP and stay visible.
 7. Every Fiddler-root leaf carries a CRL distribution point served by the proxy itself on
    `http://127.0.0.1:8873/crl/<root-thumbprint>.crl`, so a validating client gets an answer.
@@ -51,7 +54,7 @@ below are what the mechanism covers; no port table is consulted.
 | NNTP | `STARTTLS` → `382` (RFC 4642 §2.2) | upgraded in place |
 | LDAP | BER `ExtendedRequest` `1.3.6.1.4.1.1466.20037` → `ExtendedResponse` success (RFC 4511 §4.14) | upgraded in place |
 | XMPP | `<starttls/>` → `<proceed/>` (RFC 6120 §5.4.2) | blind pass-through |
-| any other TCP | — | relayed and captured as it comes |
+| any other TCP | — | relayed as it comes, not captured |
 
 A grant this proxy does not act on is not a broken session: the two sockets keep carrying bytes, so
 client and real server finish the handshake between themselves, and the plaintext simply stays inside
@@ -85,15 +88,15 @@ connection; a GREASE-bearing ClientHello from an ambiguous PID is treated as Chr
   overrides the embedded one.
 * **emSign intermediates** (`TlsMitm/emsign_certs`) are only needed for Node/Electron clients.
 
-`tests\make-test-root.ps1` covers the Fiddler-root bullet on a machine that has no Fiddler: from an
-elevated terminal, it generates a root carrying the same name and extensions, leaves the key in
-`LocalMachine\My` and adds the trust anchor to `LocalMachine\Root`. The machine-wide stores avoid
-the interactive `CurrentUser\Root` consent path used by hosted Windows CI runners. The script
-refuses to run while a usable root already exists, so `-Force` is the opt-in for adding a second one.
-`starttlsprobe` uses that machine root only when `TLSMITM_CI_ROOT_STORE=LocalMachine` is set, as it
-is in CI. Normal execution continues to use `RootCa`'s real-Fiddler `CurrentUser` discovery, and the
-`rootcheck` mode runs that discovery in either case: it logs which root each route reached and fails
-if the two disagree.
+`RootCa` looks for a Fiddler root in `CurrentUser` and `LocalMachine`, in both `Root` and `My` — the
+trust anchor and the signing key do not have to live in the same store — and accepts only a copy it
+can actually sign with. When there is none, `--init-ca` (elevated) creates one with the same shape as
+the measured Fiddler root: CA=TRUE with pathLen 0, keyCertSign|cRLSign, serverAuth EKU, ~820 days,
+key in `LocalMachine\My`, anchor in `LocalMachine\Root`. `tests\make-test-root.ps1` builds that same
+fixture for CI and refuses to run while a usable root already exists, so `-Force` is the opt-in for
+adding a second one. `starttlsprobe` signs with the machine root only when
+`TLSMITM_CI_ROOT_STORE=LocalMachine` is set, as it is in CI; the `rootcheck` mode compares the root it
+signed with against the one `RootCa` finds and fails if the two disagree.
 
 ## Build and run
 
@@ -101,6 +104,9 @@ if the two disagree.
 dotnet build TlsMitm
 # elevated:
 TlsMitm\bin\Debug\net10.0\TlsMitm.exe [--emsign | --emsign-only | --rotate] [--no-ech-downgrade]
+    [--root <pfx> | --root-thumbprint <thumbprint> | --init-ca]
+    [--pid <pid,...> | --exclude-pid <pid,...>]
+    [--process <name,...> | --exclude-process <name,...>]
 ```
 
 | flag | effect |
@@ -110,8 +116,19 @@ TlsMitm\bin\Debug\net10.0\TlsMitm.exe [--emsign | --emsign-only | --rotate] [--n
 | `--emsign-only` | emSign chain for every client |
 | `--rotate` | alternate between the Fiddler root and the emSign intermediates |
 | `--no-ech-downgrade` | relay ECH hellos blind instead of terminating them |
+| `--init-ca` | create and install a root when discovery finds none (elevated); a usable root is reused |
+| `--root <pfx>` | sign with a root from a PFX; password from `TLSMITM_ROOT_PASSWORD` |
+| `--root-thumbprint <tp>` | sign with an installed root chosen by thumbprint |
+| `--pid <pid,...>` | intercept only the flows owned by these processes |
+| `--process <name,...>` | intercept only the flows owned by these executables |
+| `--exclude-pid <pid,...>` | intercept everything except these processes |
+| `--exclude-process <name,...>` | intercept everything except these executables |
 
-The console is mirrored to `tlsmitm.log` next to the executable.
+Scoping is decided at the SYN that starts a flow, so an excluded process is passed through whole —
+its packets are never rewritten, rather than half-intercepted. Each pair names a process by pid or by
+executable, and an exclusion wins over an include.
+
+The console is mirrored to `tlsmitm-<yyyyMMdd-HHmmss>.log` next to the executable.
 
 ## Tests
 
@@ -123,12 +140,14 @@ No admin and no WinDivert: the real `MitmProxy` is driven through `FakeRedirecto
 a loopback conversation the harness judges itself. Stop a live `TlsMitm` first — it intercepts the
 suite's own loopback traffic and turns passing modes into false failures.
 
-* `starttlsprobe` — 31 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP/LDAP
+* `starttlsprobe` — 33 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP/LDAP
   and XMPP's dialect deliberately left alone, FTPS passive/active/clear, ALPN, IPv6, implicit TLS without
   SNI, emSign and per-process chains, 0-RTT, the ECH hello terminated and relayed blind, close_notify
   via a strict Schannel client, a Node client that refuses the flight and must leave its handshake in an
-  `*_aborted.pcap`, and `rootcheck`, which compares the root the suite signs with against
-  the one `RootCa` finds on its own. The emSign modes use Electron when `TLSMITM_ELECTRON` or the
+  `*_aborted.pcap`, an upstream that refuses the composed hello and must leave the session to a blind
+  relay, the process-scope decision table, and `rootcheck`, which
+  compares the root the suite signs with against the one `RootCa` finds on its own and checks that
+  `--init-ca` produces the same shape. The emSign modes use Electron when `TLSMITM_ELECTRON` or the
   default Qoder install is available, then fall back to Node; `TLSMITM_NODE` overrides the Node
   executable.
   The chain the client is *presented* must name an emSign intermediate and the relay must complete;
@@ -154,6 +173,15 @@ TlsMitm/             the proxy (Program, MitmProxy, redirector, cert engines, re
 tests/               offline suites (run-offline.ps1) and the live chainprobe
 tools/               manual probes
 ```
+
+## Licensing
+
+The proxy is Apache-2.0; see `LICENSE`. Two third-party binaries are redistributed with it:
+
+* **WinDivert 2.2.2** — LGPL-3.0, or GPL-2.0 at your option (`TlsMitm/windivert/COPYING`,
+  `COPYING.LESSER`). The DLL and driver are unpacked from embedded resources into `%APPDATA%`, so a
+  replacement build can be dropped in place.
+* **OpenSSL 3.x** — Apache-2.0 (`TlsMitm/openssl/LICENSE.txt`); the DLL pair is unpacked the same way.
 
 ## Caveats
 

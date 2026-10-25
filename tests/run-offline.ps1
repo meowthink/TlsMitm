@@ -17,15 +17,16 @@ if (Get-Process TlsMitm -ErrorAction SilentlyContinue) {
 $groups = @(
     ,@('smtp', 'smtpsplit', 'imap', 'pop3', 'ftp', 'nntp', 'xmpp', 'reject', 'ldap', 'ldap-decline', 'ldap-bad')
     ,@('ftps-pasv', 'ftps-epsv', 'ftps-active', 'ftps-active-split', 'ftps-active-clear')
-    ,@('plain', 'implicit', 'implicit-ip', 'ipv6', 'early-data', 'https-close', 'alpn-fallback', 'alpn-h2')
-    ,@('ech-relay', 'ech-downgrade', 'emsign', 'auto', 'handshake-abort', 'grease', 'rootcheck')
+    ,@('plain', 'implicit', 'implicit-ip', 'ipv6', 'early-data', 'https-close', 'alpn-fallback', 'alpn-h2', 'mtls-refused')
+    ,@('ech-relay', 'ech-downgrade', 'emsign', 'auto', 'handshake-abort', 'grease', 'rootcheck', 'filter')
 )
 
 $failed = New-Object System.Collections.Generic.List[string]
 
 # One solution build rather than one per project: every project references TlsMitm, so building them
-# separately restores and evaluates the same graph again for each. chainprobe is in the solution and
-# built here but not run below - it needs real endpoints - which is what catches API drift in it.
+# separately restores and evaluates the same graph again for each. chainprobe and tools/abortcheck are
+# in the solution and built here but not run below - they need real endpoints - which is what catches
+# API drift in them.
 $t0 = [DateTime]::UtcNow
 dotnet build (Join-Path $root 'TlsMitm.slnx') -c $Configuration --nologo | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }

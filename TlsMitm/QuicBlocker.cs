@@ -71,7 +71,7 @@ public class QuicBlocker : IDisposable
                 return;
             }
         }
-        else if (recvLen >= sizeof(NativeIpv6Header))
+        else if (((*(byte*)_pPacket >> 4) & 0x0F) == 6 && recvLen >= sizeof(NativeIpv6Header))
         {
             var ip6 = (NativeIpv6Header*)_pPacket;
             if (ip6->NextHeader == 17)
@@ -116,7 +116,8 @@ public class QuicBlocker : IDisposable
 
     public void Dispose()
     {
-        // Same double-dispose path as PacketRedirector: explicit call in Program.cs plus `using var`.
+        // Same double-dispose guard as PacketRedirector: harmless now, and it keeps a future explicit
+        // call from cancelling a disposed CTS and freeing the same native buffers twice.
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _cts.Cancel();
         _divert.Shutdown();
