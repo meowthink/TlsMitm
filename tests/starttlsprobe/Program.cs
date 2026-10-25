@@ -91,6 +91,9 @@ async Task<int> RunModeAsync(string mode)
             case "ftp": await ServeFtpAsync(stream, upstreamCert); break;
             case "nntp": await ServeNntpAsync(stream, upstreamCert); break;
             case "xmpp": await ServeXmppAsync(stream, upstreamCert); break;
+            case "ldap": await ServeLdapAsync(stream, upstreamCert); break;
+            case "ldap-decline": await ServeLdapDeclineAsync(stream); break;
+            case "ldap-bad": await ServeLdapBadAsync(stream); break;
             case "ftps-pasv": await ServeFtpDataAsync(stream, upstreamCert, dataTarget, false); break;
             case "ftps-epsv": await ServeFtpDataAsync(stream, upstreamCert, dataTarget, true); break;
             case "ftps-active":
@@ -261,6 +264,9 @@ async Task<int> RunModeAsync(string mode)
             case "ftp": await ClientFtpAsync(s, notes); break;
             case "nntp": await ClientNntpAsync(s, notes); break;
             case "xmpp": await ClientXmppAsync(s, notes); break;
+            case "ldap": await ClientLdapAsync(s, notes, failures); break;
+            case "ldap-decline": await ClientLdapDeclineAsync(s, notes); break;
+            case "ldap-bad": await ClientLdapBadAsync(s, notes); break;
             case "ftps-pasv": await ClientFtpDataAsync(s, notes, failures, proxyPort, false); break;
             case "ftps-epsv": await ClientFtpDataAsync(s, notes, failures, proxyPort, true); break;
             case "ftps-active":
@@ -369,6 +375,66 @@ async Task<int> RunModeAsync(string mode)
         await SendAsync(ssl, "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='ANONYMOUS'/>\r\n");
         await ExpectAsync(ssl, "<success");
         notes.Add("xmpp: the relay left the XML dialect alone and carried the TLS handshake through untouched");
+    }
+
+    // LDAP's StartTLS is an extended operation, not a line (RFC 4511 §4.14). A whoami operation
+    // (RFC 4532 §2) runs first, and its response is also a success ExtendedResponse, so only the
+    // messageID the response carries can pick out the grant (RFC 4511 §4.1.1.1).
+    static async Task ClientLdapAsync(NetworkStream s, List<string> notes, List<string> failures)
+    {
+        await SendBytesAsync(s, WhoamiRequest(1));
+        await ExpectBytesAsync(s, WhoamiResponse(1), "whoami response");
+
+        await SendStartTlsRequestAsync(s, 2);
+        await ExpectBytesAsync(s, StartTlsResponse(2, 0, null), "StartTLS response");
+
+        var ssl = await UpgradeAsync(s, "probe.test", notes);
+        await SendBytesAsync(ssl, WhoamiRequest(3));
+        var content = await ExpectBytesAsync(ssl, WhoamiResponse(3), "post-TLS whoami response");
+        if (!Encoding.ASCII.GetString(content).Contains("u:probe@example.net"))
+            failures.Add("ldap: the post-TLS whoami response lost its authzId");
+        notes.Add("ldap: a success ExtendedResponse for another operation was relayed, the StartTLS grant upgraded");
+    }
+
+    // The refusal half: RFC 4511 §4.14.2 leaves the session without a TLS layer when the resultCode is
+    // not success, and names unavailable (52, §4.1.9) as the code for a TLS subsystem that is not there.
+    static async Task ClientLdapDeclineAsync(NetworkStream s, List<string> notes)
+    {
+        await SendBytesAsync(s, WhoamiRequest(1));
+        await ExpectBytesAsync(s, WhoamiResponse(1), "whoami response");
+
+        await SendStartTlsRequestAsync(s, 2);
+        await ExpectBytesAsync(s, StartTlsResponse(2, 52, "TLS subsystem unavailable"), "refusal");
+
+        await SendBytesAsync(s, WhoamiRequest(3));
+        await ExpectBytesAsync(s, WhoamiResponse(3), "plaintext whoami response");
+        notes.Add("ldap-decline: unavailable(52) was relayed and the session carried on in plaintext");
+    }
+
+    // The gate LDAP detection hangs on is the client's first octet, so a stream that opens with a
+    // SEQUENCE tag and is not BER has to survive as an untouched relay. 0x30 0x80 is the indefinite
+    // length form RFC 4511 §5.1 rules out, which ends the walk after two octets.
+    static async Task ClientLdapBadAsync(NetworkStream s, List<string> notes)
+    {
+        await SendBytesAsync(s, [0x30, 0x80]);
+        await Task.Delay(150);
+        await SendAsync(s, "PING\r\n");
+        await ExpectAsync(s, "PONG");
+        notes.Add("ldap-bad: an indefinite-length envelope was relayed as opaque octets");
+    }
+
+    // The shape wldap32 sends, measured here as 39 octets: both outer lengths in the four-octet long
+    // form, and the requestName as the dotted text of an LDAPOID (RFC 4511 §4.1.2) rather than the
+    // DER of the identifier. Written in three pieces so the walk has to reassemble the long form, the
+    // messageID and the OID across chunk boundaries.
+    static async Task SendStartTlsRequestAsync(Stream s, long messageId)
+    {
+        var request = StartTlsRequest(messageId);
+        await SendBytesAsync(s, request[..3]);
+        await Task.Delay(150);
+        await SendBytesAsync(s, request[3..20]);
+        await Task.Delay(150);
+        await SendBytesAsync(s, request[20..]);
     }
 
     static async Task ClientFtpDataAsync(NetworkStream s, List<string> notes, List<string> failures, int proxyPort, bool epsv)
@@ -761,6 +827,123 @@ async Task<int> RunModeAsync(string mode)
         await ssl.AuthenticateAsServerAsync(cert);
         await ExpectAsync(ssl, "<auth");
         await SendAsync(ssl, "<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>\r\n");
+    }
+
+    // The LDAP grant path. whoami is answered first with a success ExtendedResponse of its own, so the
+    // upstream has to see the StartTLS request before anything is upgraded, and the socket only becomes
+    // TLS after the response the messageID names (RFC 4511 §4.14.2).
+    static async Task ServeLdapAsync(NetworkStream s, X509Certificate2 cert)
+    {
+        await ExpectBytesAsync(s, WhoamiRequest(1), "whoami request");
+        await SendBytesAsync(s, WhoamiResponse(1));
+        await ExpectBytesAsync(s, StartTlsRequest(2), "StartTLS request");
+        await SendBytesAsync(s, StartTlsResponse(2, 0, null));
+
+        using var ssl = new SslStream(s, false);
+        await ssl.AuthenticateAsServerAsync(cert);
+        await ExpectBytesAsync(ssl, WhoamiRequest(3), "post-TLS whoami request");
+        await SendBytesAsync(ssl, WhoamiResponse(3));
+    }
+
+    // The refusal stays in the plaintext session (RFC 4511 §4.14.2), so the upstream keeps reading
+    // ordinary LDAP messages after it has said no.
+    static async Task ServeLdapDeclineAsync(NetworkStream s)
+    {
+        await ExpectBytesAsync(s, WhoamiRequest(1), "whoami request");
+        await SendBytesAsync(s, WhoamiResponse(1));
+        await ExpectBytesAsync(s, StartTlsRequest(2), "StartTLS request");
+        await SendBytesAsync(s, StartTlsResponse(2, 52, "TLS subsystem unavailable"));
+        await ExpectBytesAsync(s, WhoamiRequest(3), "plaintext whoami request");
+        await SendBytesAsync(s, WhoamiResponse(3));
+    }
+
+    static async Task ServeLdapBadAsync(NetworkStream s)
+    {
+        var junk = await ReadExactAsync(s, 2);
+        if (junk[0] != 0x30 || junk[1] != 0x80)
+            throw new InvalidOperationException($"expected '30 80', got '{Convert.ToHexString(junk)}'");
+        await ExpectAsync(s, "PING");
+        await SendAsync(s, "PONG\r\n");
+    }
+
+    // --- LDAP fixtures. Both ends build the same octets, so every read is a byte-exact comparison
+    //     instead of a second BER parser that could repeat the first one's mistake. WhoamiRequest and
+    //     WhoamiResponse are the encodings RFC 4532 §2.1 and §2.2 print as their examples, down to the
+    //     30 1e / 30 21 outer lengths.
+
+    static byte[] WhoamiRequest(long messageId) =>
+        LdapMessage(messageId, 0x77, Ber(0x80, Encoding.ASCII.GetBytes("1.3.6.1.4.1.4203.1.11.3")));
+
+    static byte[] WhoamiResponse(long messageId) =>
+        LdapMessage(messageId, 0x78, [.. LdapResult(0),
+            .. Ber(0x8B, Encoding.ASCII.GetBytes("u:probe@example.net"))]);
+
+    // The form wldap32 puts on the wire (measured here as 39 octets) and the form RFC 4511 §4.14.1
+    // requires: requestName present, requestValue absent.
+    static byte[] StartTlsRequest(long messageId) =>
+        LdapMessage(messageId, 0x77, Ber(0x80, Encoding.ASCII.GetBytes("1.3.6.1.4.1.1466.20037")), 4);
+
+    // RFC 4511 §4.14.2: the responseName is the StartTLS OID "when provided" and the responseValue is
+    // always absent, so a refusal carries a name, a resultCode and a diagnostic and nothing else.
+    static byte[] StartTlsResponse(long messageId, int resultCode, string? diagnostic)
+    {
+        var content = new List<byte>(LdapResult(resultCode, diagnostic));
+        content.AddRange(Ber(0x8A, Encoding.ASCII.GetBytes("1.3.6.1.4.1.1466.20037")));
+        return LdapMessage(messageId, 0x78, content.ToArray());
+    }
+
+    static byte[] LdapResult(int resultCode, string? diagnostic = null) =>
+        [.. Ber(0x0A, [(byte)resultCode]), .. Ber(0x04, []),
+            .. Ber(0x04, Encoding.ASCII.GetBytes(diagnostic ?? ""))];
+
+    static byte[] LdapMessage(long messageId, byte opTag, byte[] opContent, int lengthOctets = 0) =>
+        Ber(0x30, [.. Ber(0x02, [(byte)messageId]), .. Ber(opTag, opContent, lengthOctets)], lengthOctets);
+
+    // RFC 4511 §5.1 permits only the definite form of length; lengthOctets pads that form to a chosen
+    // width, which §5.1 leaves to the encoder because it constrains the form and not its width.
+    static byte[] Ber(byte tag, byte[] content, int lengthOctets = 0)
+    {
+        if (lengthOctets == 0)
+        {
+            if (content.Length > 0x7F)
+                throw new ArgumentOutOfRangeException(nameof(content), "fixture too long for the short form");
+            return [tag, (byte)content.Length, .. content];
+        }
+
+        var head = new byte[2 + lengthOctets];
+        head[0] = tag;
+        head[1] = (byte)(0x80 | lengthOctets);
+        for (var i = 0; i < lengthOctets; i++)
+            head[2 + i] = (byte)(content.Length >> (8 * (lengthOctets - 1 - i)));
+        return [.. head, .. content];
+    }
+
+    static async Task SendBytesAsync(Stream s, byte[] bytes)
+    {
+        await s.WriteAsync(bytes);
+        await s.FlushAsync();
+    }
+
+    static async Task<byte[]> ReadExactAsync(Stream s, int count)
+    {
+        var buffer = new byte[count];
+        var got = 0;
+        while (got < count)
+        {
+            var n = await s.ReadAsync(buffer.AsMemory(got));
+            if (n == 0) throw new EndOfStreamException($"EOF after {got} of {count} octets");
+            got += n;
+        }
+        return buffer;
+    }
+
+    static async Task<byte[]> ExpectBytesAsync(Stream s, byte[] expected, string what)
+    {
+        var got = await ReadExactAsync(s, expected.Length);
+        if (!got.AsSpan().SequenceEqual(expected))
+            throw new InvalidOperationException(
+                $"{what}: expected {Convert.ToHexString(expected)}, got {Convert.ToHexString(got)}");
+        return got;
     }
 
     // A passive-mode FTPS session: the control channel carries the 227/229 reply, and the file itself
