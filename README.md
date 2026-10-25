@@ -49,7 +49,7 @@ below are what the mechanism covers; no port table is consulted.
 | POP3 | `STLS` → `+OK` (RFC 2595 §4) | upgraded in place |
 | FTP | `AUTH TLS` → `234` (RFC 4217 §4.2), data channels per §7 | upgraded in place |
 | NNTP | `STARTTLS` → `382` (RFC 4642 §2.2) | upgraded in place |
-| LDAP | a BER `ExtendedResponse` with `resultCode` success (RFC 2830 §2.2) | blind pass-through |
+| LDAP | BER `ExtendedRequest` `1.3.6.1.4.1.1466.20037` → `ExtendedResponse` success (RFC 4511 §4.14) | upgraded in place |
 | XMPP | `<starttls/>` → `<proceed/>` (RFC 6120 §5.4.2) | blind pass-through |
 | any other TCP | — | relayed and captured as it comes |
 
@@ -123,8 +123,8 @@ No admin and no WinDivert: the real `MitmProxy` is driven through `FakeRedirecto
 a loopback conversation the harness judges itself. Stop a live `TlsMitm` first — it intercepts the
 suite's own loopback traffic and turns passing modes into false failures.
 
-* `starttlsprobe` — 28 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP and
-  XMPP's dialect deliberately left alone, FTPS passive/active/clear, ALPN, IPv6, implicit TLS without
+* `starttlsprobe` — 31 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP/LDAP
+  and XMPP's dialect deliberately left alone, FTPS passive/active/clear, ALPN, IPv6, implicit TLS without
   SNI, emSign and per-process chains, 0-RTT, the ECH hello terminated and relayed blind, close_notify
   via a strict Schannel client, a Node client that refuses the flight and must leave its handshake in an
   `*_aborted.pcap`, and `rootcheck`, which compares the root the suite signs with against

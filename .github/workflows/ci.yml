@@ -26,7 +26,7 @@ jobs:
         run: pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./tests/make-test-root.ps1
 
       # Debug is what the local runs use, so this step checks the binaries developers actually test.
-      # Builds every project, then runs the 27 starttlsprobe modes in four grouped processes, the ECH
+      # Builds every project, then runs the 30 starttlsprobe modes in four grouped processes, the ECH
       # state-machine check and the ClientHello parser test. chainprobe is built but not run: it needs
       # real endpoints.
       - name: Offline suites

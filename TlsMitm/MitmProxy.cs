@@ -464,7 +464,7 @@ public class MitmProxy
 
                 var forward = n;
                 if (isClient) forward = session.ScanClient(buf.AsSpan(0, n));
-                else if (session.AwaitingReply) forward = session.ScanServer(buf.AsSpan(0, n));
+                else forward = session.ScanServer(buf.AsSpan(0, n));
 
                 if (forward > 0)
                 {
