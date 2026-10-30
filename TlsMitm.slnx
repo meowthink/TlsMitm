@@ -2,10 +2,18 @@
   <Folder Name="/tests/">
     <Project Path="tests/chainprobe/chainprobe.csproj" />
     <Project Path="tests/echcheck/echcheck.csproj" />
+    <Project Path="tests/flowcheck/flowcheck.csproj" />
+    <Project Path="tests/fwcheck/fwcheck.csproj" />
+    <Project Path="tests/natcheck/natcheck.csproj" />
+    <Project Path="tests/quiccheck/quiccheck.csproj" />
+    <Project Path="tests/servcheck/servcheck.csproj" />
     <Project Path="tests/starttlsprobe/starttlsprobe.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/abortcheck/abortcheck.csproj" />
+    <Project Path="tools/apcheck/apcheck.csproj" />
+    <Project Path="tools/inject/inject.csproj" />
   </Folder>
+  <Project Path="Router/Router.csproj" />
   <Project Path="TlsMitm/TlsMitm.csproj" />
 </Solution>

@@ -151,6 +151,14 @@ foreach ($name in @('203.0.113.10', 'probe.test')) {
     $ok = $text -like "*$want*"
     if (-not $ok) { $failures++ }
     Log ("{0} leaf '{1}' SAN: {2}" -f $(if ($ok) { 'ok  ' } else { 'FAIL' }), $name, $text)
+
+    # Chromium refuses a leaf whose own span exceeds the CA/Browser Forum ceiling (SC-081v3: 200 days
+    # since 2026-03-15) with ERR_CERT_VALIDITY_TOO_LONG, no matter how long the issuer lives.
+    $span = ($leaf.NotAfter - $leaf.NotBefore).TotalDays
+    $vok = ($span -le 200) -and ($leaf.NotBefore -le [datetime]::Now) -and ($leaf.NotAfter -ge [datetime]::Now.AddDays(7))
+    if (-not $vok) { $failures++ }
+    Log ("{0} leaf '{1}' validity: {2:N1} days ({3:yyyy-MM-dd} .. {4:yyyy-MM-dd})" -f `
+        $(if ($vok) { 'ok  ' } else { 'FAIL' }), $name, $span, $leaf.NotBefore, $leaf.NotAfter)
 }
 $rsa.Dispose()
 

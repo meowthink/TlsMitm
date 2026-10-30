@@ -265,6 +265,15 @@ async Task<int> RunModeAsync(string mode)
         failures.Add($"server: {ex.GetType().Name}: {ex.Message}");
     }
 
+    // The proxy gives back the flow it claimed by its token when its own session ends. The release runs
+    // on the session's task, not the client's, so wait for it rather than judge a race. A mode that
+    // never opens a session - grease, rootcheck, filter - claims nothing and is judged on nothing.
+    var releaseDeadline = DateTime.UtcNow.AddSeconds(3);
+    while (redirector.Releases < redirector.Claims && DateTime.UtcNow < releaseDeadline)
+        await Task.Delay(20);
+    if (redirector.Releases != redirector.Claims)
+        failures.Add($"flow tokens: {redirector.Releases} released of {redirector.Claims} claimed");
+
     foreach (var note in notes) Console.WriteLine($"  {note}");
     foreach (var note in serverNotes) Console.WriteLine($"  {note}");
     failures.AddRange(serverFailures);
@@ -1840,6 +1849,27 @@ async Task<int> RunModeAsync(string mode)
         if (kept != ClientTrust.NodeBundled)
             failures.Add("grease: an ambiguous process without GREASE lost its emSign chain");
         notes.Add($"grease: ambiguous pid -> chromium='{decided}' node='{kept}'");
+
+        // A client with no PID - every forwarded LAN client - has no local process to judge it by, so
+        // --emsign has to give it the same chain --emsign-only gives everyone.
+        var chain = typeof(MitmProxy).GetMethod("ChainIdentity",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        var unowned = new ClientIdentity(ClientTrust.WindowsStore, 0, "unknown (no TCP owner)", false, "");
+        var remote = (ClientIdentity)chain.Invoke(null,
+            new object?[] { unowned, IPAddress.Parse("192.168.122.50") })!;
+        if (remote.Trust != ClientTrust.NodeBundled || remote.Ambiguous)
+            failures.Add("grease: a client with no PID on the LAN did not get the emSign chain");
+        if (remote.Label != "remote client (no process on this machine)")
+            failures.Add($"grease: a LAN client with no PID was labelled '{remote.Label}'");
+        var local = (ClientIdentity)chain.Invoke(null, new object?[] { unowned, IPAddress.Loopback })!;
+        if (local.Trust != ClientTrust.NodeBundled)
+            failures.Add("grease: a local flow with no PID did not get the emSign chain");
+        var owned = new ClientIdentity(ClientTrust.WindowsStore, 4242, "curl.exe", false, "curl.exe");
+        var keptOwned = (ClientIdentity)chain.Invoke(null,
+            new object?[] { owned, IPAddress.Parse("192.168.122.50") })!;
+        if (keptOwned.Trust != ClientTrust.WindowsStore || keptOwned.Label != "curl.exe")
+            failures.Add("grease: a client with a PID lost its per-process chain");
+        notes.Add($"grease: no pid -> remote='{remote.Trust}' local='{local.Trust}' owned='{keptOwned.Trust}'");
     }
 
     // Minimal but structurally valid ClientHello: TLS 1.2 record, SNI and ALPN present, and optionally a
@@ -2370,16 +2400,26 @@ sealed class FakeRedirector : IRedirector
 {
     private readonly Func<int, IPEndPoint> _targetFor;
     private int _lookupIndex;
+    private int _claims;
+    private int _releases;
 
     public FakeRedirector(Func<int, IPEndPoint> targetFor) => _targetFor = targetFor;
 
+    public int Claims => Volatile.Read(ref _claims);
+    public int Releases => Volatile.Read(ref _releases);
+
     // Connections are handed their original destination in arrival order: control first, then the
     // data channel it opens later, which is the only way the harness can model an ephemeral port.
-    public (IPAddress ip, int port)? LookupOriginalDest(IPAddress clientIp, int clientPort, IPAddress serverIp)
+    // Nothing was rewritten here, so the socket's own endpoints are the client's and go back as such.
+    public OriginalDest? LookupOriginalDest(IPAddress deliveredTo, int token, IPAddress serverAddr)
     {
         var target = _targetFor(Interlocked.Increment(ref _lookupIndex) - 1);
-        return (target.Address, target.Port);
+        Interlocked.Increment(ref _claims);
+        return new OriginalDest(target.Address, target.Port, deliveredTo, token);
     }
+
+    // No token pool here, so nothing is given back to; the count is what the run is judged on.
+    public void ReleaseFlow(int token) => Interlocked.Increment(ref _releases);
 
     public void RegisterExemption(int sourcePort) { }
 

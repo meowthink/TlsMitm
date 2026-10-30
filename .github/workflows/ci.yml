@@ -26,9 +26,9 @@ jobs:
         run: pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./tests/make-test-root.ps1
 
       # Debug is what the local runs use, so this step checks the binaries developers actually test.
-      # Builds every project, then runs the 30 starttlsprobe modes in four grouped processes, the ECH
-      # state-machine check and the ClientHello parser test. chainprobe is built but not run: it needs
-      # real endpoints.
+      # Builds every project, then runs the starttlsprobe modes in four grouped processes, the ECH
+      # state-machine check, the router's NAT check and its DHCP/DNS check, and the ClientHello parser
+      # test. chainprobe is built but not run: it needs real endpoints.
       - name: Offline suites
         # CurrentUser\Root is consent-gated on hosted runners, so the fixture is machine-wide. This
         # test-only switch selects it without changing production RootCa discovery; the rootcheck mode
