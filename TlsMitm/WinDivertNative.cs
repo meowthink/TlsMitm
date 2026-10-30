@@ -31,7 +31,12 @@ public static unsafe class WinDivertPInvoke
         Fragments = 0x0020,
     }
 
-    public enum ShutdownMode : int { Recv = 0, Send = 1, Both = 2 }
+    // These three are bit values in windivert.h (WINDIVERT_SHUTDOWN_RECV = 0x1, _SEND = 0x2,
+    // _BOTH = 0x3), not an ordinal sequence: 0 is not "shut down nothing" but an invalid argument that
+    // WinDivertShutdown rejects. Declaring them 0/1/2 made every Recv=0 call a silent no-op and every
+    // Both=2 call a send-only shutdown, which left a blocked WinDivertRecv un-abortable.
+    [Flags]
+    public enum ShutdownMode : int { Recv = 0x1, Send = 0x2, Both = Recv | Send }
 
     [Flags]
     public enum AddressFlag : byte
@@ -247,9 +252,6 @@ public static unsafe class WinDivertPInvoke
 
         public WinDivertHandle(string filter, Layer layer = Layer.Network, short priority = 0, Flag flags = Flag.None)
         {
-            if (layer != Layer.Network && flags == Flag.None)
-                flags = Flag.Sniff | Flag.RecvOnly;
-
             var compiled = CompileFilter(filter, layer);
             _handle = WinDivertOpen(compiled, layer, priority, flags);
             if (_handle == IntPtr.Zero || _handle == new IntPtr(-1))

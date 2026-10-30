@@ -45,6 +45,37 @@ $ech = Join-Path $root "tests\echcheck\bin\$Configuration\net10.0\echcheck.exe"
 $out = & $ech 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { $failed.Add('echcheck'); Write-Host $out } else { Write-Host 'ok   echcheck' }
 
+# natcheck judges the router's NAT rewrite on synthetic packets: no driver, no admin, no sockets.
+$nat = Join-Path $root "tests\natcheck\bin\$Configuration\net10.0\natcheck.exe"
+$out = & $nat 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('natcheck'); Write-Host $out } else { Write-Host 'ok   natcheck' }
+
+# flowcheck judges the redirector's flow table on synthetic keys: which connections share a state, what
+# token each one gets, what ageing frees. It is the only check that can name the two-LAN-clients-on-one-
+# port case, since a live run needs a second machine to produce it.
+$flow = Join-Path $root "tests\flowcheck\bin\$Configuration\net10.0\flowcheck.exe"
+$out = & $flow 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('flowcheck'); Write-Host $out } else { Write-Host 'ok   flowcheck' }
+
+# fwcheck pins what the inbound reachability probe is made of: the SYN's own header octets, the address
+# it claims to come from, a token no live flow holds, and which rule port fields name the relay port.
+# It never opens the firewall COM object, so it says nothing about this machine's policy.
+$fwc = Join-Path $root "tests\fwcheck\bin\$Configuration\net10.0\fwcheck.exe"
+$out = & $fwc 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('fwcheck'); Write-Host $out } else { Write-Host 'ok   fwcheck' }
+
+# servcheck drives the router's DHCP pool and resolver the same way: client messages in, reply bytes
+# asserted, and an injected transport standing in for the upstream.
+$svc = Join-Path $root "tests\servcheck\bin\$Configuration\net10.0\servcheck.exe"
+$out = & $svc 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('servcheck'); Write-Host $out } else { Write-Host 'ok   servcheck' }
+
+# quiccheck pins the QUIC long-header layout the blocker drops on. The version sits immediately after
+# the flags byte; reading it from anywhere else makes every real datagram miss and HTTP/3 walk past.
+$quic = Join-Path $root "tests\quiccheck\bin\$Configuration\net10.0\quiccheck.exe"
+$out = & $quic 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('quiccheck'); Write-Host $out } else { Write-Host 'ok   quiccheck' }
+
 $noSni = Join-Path $PSScriptRoot 'no-sni-test.ps1'
 if (-not (Get-Command pwsh -ErrorAction SilentlyContinue)) {
     throw 'no-sni-test needs PowerShell 7 (pwsh); Windows PowerShell cannot load a net10.0 assembly'
@@ -58,4 +89,4 @@ if ($failed.Count -gt 0) {
     exit 1
 }
 $modeCount = ($groups | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
-Write-Host "`n[run-offline] PASS - $modeCount starttlsprobe modes in $($groups.Count) processes + echcheck + no-sni-test"
+Write-Host "`n[run-offline] PASS - $modeCount starttlsprobe modes in $($groups.Count) processes + echcheck + natcheck + flowcheck + fwcheck + servcheck + quiccheck + no-sni-test"

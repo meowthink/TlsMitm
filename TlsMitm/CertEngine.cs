@@ -121,7 +121,12 @@ public class CertEngine
         var serial = RandomNumberGenerator.GetBytes(16);
         serial[0] &= 0x7F; // force a positive serial; the DER encoder treats a leading 0x80 as negative
         var notBefore = DateTimeOffset.UtcNow.AddDays(-1);
-        var notAfter = DateTimeOffset.UtcNow.AddYears(1);
+        // Chrome and Edge reject a leaf that outlives the CA/Browser Forum ceiling (SC-081v3: 398 days,
+        // 200 from 2026-03-15, 100 from 2027-03-15, 47 from 2029-03-15) with ERR_CERT_VALIDITY_TOO_LONG.
+        // The check is on the leaf's own span, so a long-lived issuer does not help. Leaves are minted
+        // on demand and cached in memory only, so 30 days costs nothing and sits under every step of
+        // that schedule.
+        var notAfter = notBefore + TimeSpan.FromDays(30);
 
         notAfter = ClampToIssuer(notAfter, ca.Certificate);
         var cert = CreateSigned(req, ca, serial, notBefore, notAfter);

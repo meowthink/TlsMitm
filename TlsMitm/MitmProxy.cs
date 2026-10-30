@@ -38,19 +38,19 @@ public class MitmProxy
         while (!ct.IsCancellationRequested)
         {
             var client = await _listener.AcceptTcpClientAsync(ct);
-            // Nothing is relayed end to end yet, so the accept loop can only name the socket's own
-            // endpoints. After the redirector's swap those are (local) the client, and (remote) the
-            // server whose port field carries the client's ephemeral port - logging the remote
-            // address as "from" would name the server as the peer.
-            var local = client.Client.LocalEndPoint as IPEndPoint;
+            // The socket's own endpoints cannot name the peer yet: the redirector's rewrite leaves the
+            // server the client asked for as the remote address, and the flow token in its port field.
+            // The lookup below resolves both, so this line claims only what it knows.
             var remote = client.Client.RemoteEndPoint as IPEndPoint;
-            Console.WriteLine($"[Proxy] Accepted connection from {local?.Address}:{remote?.Port}");
+            Console.WriteLine($"[Proxy] Accepted connection, flow token {remote?.Port}");
             _ = HandleClientAsync(client, ct);
         }
     }
 
     private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
     {
+        // Set once the lookup claims the flow: only this session may free the token it was given.
+        int? claimed = null;
         try
         {
             var remoteEp = client.Client.RemoteEndPoint as IPEndPoint;
@@ -61,35 +61,43 @@ public class MitmProxy
                 return;
             }
 
-            var serverPort = remoteEp.Port;
+            var token = remoteEp.Port;
 
-            // A dual-stack listener reports an IPv4 peer as ::ffff:a.b.c.d. The redirector keys its
-            // tables on the address the packet carried, so a mapped form is a guaranteed miss.
-            var clientAddress = Unmap(localEp.Address);
+            // A dual-stack listener reports an IPv4 peer as ::ffff:a.b.c.d. The redirector's own record
+            // of the flow carries the addresses the packet had, so the mapped form is not needed here.
+            var deliveredTo = Unmap(localEp.Address);
             var serverAddress = Unmap(remoteEp.Address);
-            var origDest = _redirector.LookupOriginalDest(clientAddress, serverPort, serverAddress);
+            var origDest = _redirector.LookupOriginalDest(deliveredTo, token, serverAddress);
 
             if (origDest == null)
             {
-                Console.WriteLine($"[Proxy] No connection found for {clientAddress}:{serverPort} -> {serverAddress}");
+                Console.WriteLine($"[Proxy] No connection found for token {token} on {deliveredTo}");
                 client.Close();
                 return;
             }
 
-            var (origIp, origPort) = origDest.Value;
-            Console.WriteLine($"[Proxy] {clientAddress}:{serverPort} -> original dest {origIp}:{origPort}");
+            var dest = origDest.Value;
+            claimed = token;
+            var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
+            // The socket's own endpoints cannot name the client: a forwarded flow was delivered to this
+            // host, and every flow's source port was replaced by the token. Both come back from the
+            // redirector, which read them off the packet.
+            var (clientAddress, clientPort) = (dest.ClientAddr, dest.ClientPort);
+            Console.WriteLine($"[Proxy] {clientAddress}:{clientPort} -> original dest {origIp}:{origPort}");
 
             // The chain a client accepts is not universal: Node/Electron verify against their bundled
             // list (emSign roots), everything else against the Windows store (Fiddler root). Classify
             // once per connection from the owning process; the result rides down to every leg.
-            var identity = ClientProcess.Identify(clientAddress, serverPort, out var firstSighting);
+            var identity = ChainIdentity(
+                ClientProcess.Identify(clientAddress, clientPort, out var firstSighting), clientAddress);
             if (firstSighting)
             {
                 var wanted = identity.Trust == ClientTrust.NodeBundled ? "emSign" : "Fiddler";
                 var caveat = identity.Trust == ClientTrust.NodeBundled && !_certEngine.HonorsClientTrust
                     ? " - but this engine cannot serve it; restart with --emsign"
                     : "";
-                Console.WriteLine($"[Client] pid {identity.Pid}: {identity.Label} -> {wanted} chain{caveat}");
+                Console.WriteLine($"[Client] {clientAddress}:{clientPort} pid {identity.Pid}: " +
+                    $"{identity.Label} -> {wanted} chain{caveat}");
             }
 
             using var realServer = await ConnectExemptedAsync(origIp, origPort, ct);
@@ -111,11 +119,11 @@ public class MitmProxy
             {
                 var hello = new byte[1];
                 if (await stream.ReadAsync(hello, ct) == 0) return;
-                await HandleTlsAsync(client, stream, serverStream, origIp, origPort, hello[0], identity, ct);
+                await HandleTlsAsync(stream, serverStream, dest, hello[0], identity, ct);
             }
             else
             {
-                await HandlePlainAsync(client, realServer.Client, stream, serverStream, origIp, origPort, identity, ct);
+                await HandlePlainAsync(client, realServer.Client, stream, serverStream, dest, identity, ct);
             }
         }
         catch (Exception ex)
@@ -127,6 +135,9 @@ public class MitmProxy
         finally
         {
             client.Close();
+            // The connection is over here in every case the code can see, so this is where the flow stops
+            // being a session's; the closing clock below it still has this connection's own FIN to carry.
+            if (claimed is { } t) _redirector.ReleaseFlow(t);
         }
     }
 
@@ -170,11 +181,12 @@ public class MitmProxy
     }
 
     private async Task HandleTlsAsync(
-        TcpClient client, Stream stream, Stream serverStream, IPAddress origIp, int origPort,
-        byte firstByte, ClientIdentity identity, CancellationToken ct)
+        Stream stream, Stream serverStream, OriginalDest dest, byte firstByte, ClientIdentity identity,
+        CancellationToken ct)
     {
+        var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         var (clientHello, rawBytes) = await ReadClientHelloAsync(stream, firstByte, ct);
-        var host = ResolveTlsHost(clientHello, client, origIp, origPort);
+        var host = ResolveTlsHost(clientHello, dest);
         var helloStream = new PrefixedStream(rawBytes, stream);
         Console.WriteLine(clientHello?.ServerName != null
             ? $"[Proxy] TLS SNI: {host} (original dest: {origIp}:{origPort}){DescribeHello(clientHello)}"
@@ -192,35 +204,28 @@ public class MitmProxy
 
         if (blind != null)
         {
-            await BlindRelayAsync(client, helloStream, serverStream, host, blind, origIp, origPort, ct);
+            await BlindRelayAsync(helloStream, serverStream, host, blind, dest, ct);
             return;
         }
 
-        // The other proof is the measured one: Edge 155 accepted the leaf named for the public name it
-        // sent and kept the terminated connection, so application bytes rule out a silent revert to
-        // blind relay without waiting for a retry that this client never sends.
-        Action? terminationWorked = echTerminate
-            ? () => _echDowngrade?.ObservedData(identity.Pid, host)
-            : null;
-
-        await MitmAsync(client, stream, rawBytes, serverStream, host, clientHello?.Alpn, origIp, origPort,
-            ResolveTrust(identity, clientHello), identity.Pid, ct, terminationWorked);
+        // Both proofs are read off the terminated session itself: application bytes mean the client
+        // kept using it, and a failed client leg is the §6.1.7 refusal. Neither is a timer, because a
+        // GREASE-ECH connection (RFC 9849 §6.2.1) can finish the handshake and then sit idle.
+        await MitmAsync(stream, rawBytes, serverStream, host, clientHello?.Alpn, dest,
+            ResolveTrust(identity, clientHello), identity.Pid, ct, echTerminate);
     }
 
-    private string ResolveTlsHost(ClientHelloInfo? hello, TcpClient client, IPAddress origIp, int origPort)
+    private string ResolveTlsHost(ClientHelloInfo? hello, OriginalDest dest)
     {
         if (hello?.ServerName != null) return hello.ServerName;
 
+        var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         // An FTPS data channel is the one TLS connection a client dials blind: the endpoint came out
         // of the control session's 227/229 reply and the name is not repeated in the handshake.
-        if (client.Client.LocalEndPoint is IPEndPoint clientEp)
+        if (_ftpSessions.Lookup(dest.ClientAddr, origIp, origPort) is { } owner)
         {
-            var owner = _ftpSessions.Lookup(Unmap(clientEp.Address), origIp, origPort);
-            if (owner != null)
-            {
-                Console.WriteLine($"[Proxy] FTPS data channel of {owner} at {origIp}:{origPort}");
-                return owner;
-            }
+            Console.WriteLine($"[Proxy] FTPS data channel of {owner} at {origIp}:{origPort}");
+            return owner;
         }
 
         // A missing SNI is legal: RFC 6066 §3 lets a client omit it, RFC 5246 §7.4.1.2 requires a
@@ -234,10 +239,15 @@ public class MitmProxy
     }
 
     private async Task MitmAsync(
-        TcpClient client, Stream rawClientStream, byte[] replayedHello, Stream serverStream, string host,
-        IReadOnlyList<string>? offeredAlpn, IPAddress origIp, int origPort, ClientTrust trust, int pid,
-        CancellationToken ct, Action? onClientData = null)
+        Stream rawClientStream, byte[] replayedHello, Stream serverStream, string host,
+        IReadOnlyList<string>? offeredAlpn, OriginalDest dest, ClientTrust trust, int pid,
+        CancellationToken ct, bool echProbe = false)
     {
+        var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
+        // The probe's two proofs are read off this session: application bytes, reported after they
+        // reached the server (a failed write proves nothing about the handshake), and a client leg that
+        // fails, reported below.
+        Action? onClientData = echProbe ? () => _echDowngrade?.ObservedData(pid, host) : null;
         var issued = _certEngine.GetCert(host, trust);
         // One line per connection carrying what a live log needs to attribute a reset: which process
         // asked, which chain its hello settled, and which issuer answered.
@@ -270,18 +280,17 @@ public class MitmProxy
             var upstream = await AuthenticateUpstreamAsync(sslServer, host, offeredAlpn, ct);
             if (!upstream.Ok)
             {
-                await BlindAfterRefusalAsync(client, rawClientStream, replayedHello, host, upstream.Error,
-                    origIp, origPort, ct);
+                await BlindAfterRefusalAsync(rawClientStream, replayedHello, host, upstream.Error,
+                    dest, ct);
                 return;
             }
             serverProtocol = upstream.Protocol;
         }
 
-        // The redirector swapped the flow, so the accepted socket's local side is the client's own
-        // address and its remote side is the server; the remote port is the client's ephemeral port.
-        var clientEp = client.Client.LocalEndPoint as IPEndPoint;
-        var clientIp = clientEp == null ? IPAddress.Loopback : Unmap(clientEp.Address);
-        var clientPort = (ushort)((client.Client.RemoteEndPoint as IPEndPoint)?.Port ?? 0);
+        // Both ends of the client leg come from the packet the redirector read, not from the socket:
+        // the swap leaves the client's address only on a forwarded flow's egress interface, and its
+        // port was replaced by the flow token.
+        var (clientIp, clientPort) = (dest.ClientAddr, (ushort)dest.ClientPort);
         var serverPortUshort = (ushort)origPort;
 
         // Both engines read and write the client through here, so one wrapper records the whole
@@ -309,6 +318,7 @@ public class MitmProxy
             catch (Exception ex)
             {
                 Console.WriteLine($"[Proxy] Client TLS failed for {host} (OpenSSL): {ex.Message}");
+                if (echProbe) _echDowngrade?.ProbeFailed(pid, host);
                 capture.SaveAborted(host, clientIp, clientPort, origIp, serverPortUshort);
                 return;
             }
@@ -335,6 +345,7 @@ public class MitmProxy
             catch (Exception ex)
             {
                 Console.WriteLine($"[Proxy] Client TLS failed for {host}: {ex.Message}");
+                if (echProbe) _echDowngrade?.ProbeFailed(pid, host);
                 capture.SaveAborted(host, clientIp, clientPort, origIp, serverPortUshort);
                 return;
             }
@@ -419,8 +430,9 @@ public class MitmProxy
 
     private async Task HandlePlainAsync(
         TcpClient client, TcpClient realServer, Stream clientStream, Stream serverStream,
-        IPAddress origIp, int origPort, ClientIdentity identity, CancellationToken ct)
+        OriginalDest dest, ClientIdentity identity, CancellationToken ct)
     {
+        var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         Console.WriteLine($"[Proxy] Non-TLS forward to {origIp}:{origPort}");
 
         var session = new StartTlsSession();
@@ -446,7 +458,7 @@ public class MitmProxy
             return;
         }
 
-        await HandleStartTlsAsync(client, clientStream, serverStream, session, origIp, origPort, identity, ct);
+        await HandleStartTlsAsync(clientStream, serverStream, session, dest, identity, ct);
     }
 
     private static async Task<bool> PumpPlainAsync(
@@ -505,9 +517,10 @@ public class MitmProxy
     }
 
     private async Task HandleStartTlsAsync(
-        TcpClient client, Stream clientPlain, Stream serverPlain, StartTlsSession session,
-        IPAddress origIp, int origPort, ClientIdentity identity, CancellationToken ct)
+        Stream clientPlain, Stream serverPlain, StartTlsSession session,
+        OriginalDest dest, ClientIdentity identity, CancellationToken ct)
     {
+        var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         Console.WriteLine("[Proxy] STARTTLS accepted, upgrading connection");
 
         var clientRaw = new PrefixedStream(session.ClientRemainder, clientPlain);
@@ -522,7 +535,7 @@ public class MitmProxy
         }
 
         var (clientHello, rawBytes) = await ReadClientHelloAsync(clientRaw, first[0], ct);
-        var host = ResolveTlsHost(clientHello, client, origIp, origPort);
+        var host = ResolveTlsHost(clientHello, dest);
         var helloStream = new PrefixedStream(rawBytes, clientRaw);
         Console.WriteLine(clientHello?.ServerName != null
             ? $"[Proxy] STARTTLS SNI: {host} (original dest: {origIp}:{origPort}){DescribeHello(clientHello)}"
@@ -531,14 +544,32 @@ public class MitmProxy
         var blind = clientHello?.CannotTerminate();
         if (blind != null)
         {
-            await BlindRelayAsync(client, helloStream, serverRaw, host, blind, origIp, origPort, ct);
+            await BlindRelayAsync(helloStream, serverRaw, host, blind, dest, ct);
             return;
         }
 
         // A STARTTLS upgrade negotiates no application protocol, so no ALPN is offered to either
         // peer; the client never asked for one.
-        await MitmAsync(client, clientRaw, rawBytes, serverRaw, host, null, origIp, origPort,
+        await MitmAsync(clientRaw, rawBytes, serverRaw, host, null, dest,
             ResolveTrust(identity, clientHello), identity.Pid, ct);
+    }
+
+    /// <summary>
+    /// A flow with no owning process has nothing local to judge its TLS stack by: a forwarded LAN
+    /// client never appears in this machine's TCP table, and a local flow the table cannot name is in
+    /// the same position. It gets what <c>--emsign-only</c> gives every client instead of a guess.
+    /// </summary>
+    private static ClientIdentity ChainIdentity(ClientIdentity identity, IPAddress clientAddress)
+    {
+        if (identity.Pid != 0) return identity;
+        return identity with
+        {
+            Trust = ClientTrust.NodeBundled,
+            Ambiguous = false,
+            Label = IPAddress.IsLoopback(clientAddress)
+                ? identity.Label
+                : "remote client (no process on this machine)"
+        };
     }
 
     /// <summary>
@@ -1097,9 +1128,10 @@ public class MitmProxy
     /// already seen one handshake), so this dials a second one.
     /// </summary>
     private async Task BlindAfterRefusalAsync(
-        TcpClient client, Stream rawClientStream, byte[] replayedHello, string host, string reason,
-        IPAddress origIp, int origPort, CancellationToken ct)
+        Stream rawClientStream, byte[] replayedHello, string host, string reason,
+        OriginalDest dest, CancellationToken ct)
     {
+        var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         using var retry = await ConnectExemptedAsync(origIp, origPort, ct);
         if (retry == null)
         {
@@ -1107,8 +1139,8 @@ public class MitmProxy
             return;
         }
 
-        await BlindRelayAsync(client, new PrefixedStream(replayedHello, rawClientStream), retry.GetStream(),
-            host, $"upstream refused the hello ({reason})", origIp, origPort, ct);
+        await BlindRelayAsync(new PrefixedStream(replayedHello, rawClientStream), retry.GetStream(),
+            host, $"upstream refused the hello ({reason})", dest, ct);
     }
 
     /// <summary>
@@ -1116,9 +1148,10 @@ public class MitmProxy
     /// real server verbatim, so the handshake the client asked for happens end to end.
     /// </summary>
     private async Task BlindRelayAsync(
-        TcpClient client, Stream clientStream, Stream serverStream, string host, string reason,
-        IPAddress origIp, int origPort, CancellationToken ct)
+        Stream clientStream, Stream serverStream, string host, string reason,
+        OriginalDest dest, CancellationToken ct)
     {
+        var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         Console.WriteLine($"[Proxy] Blind relay to {origIp}:{origPort} for {host}: {reason}");
 
         var safeHost = string.Join("_", host.Split(Path.GetInvalidFileNameChars()));
@@ -1127,14 +1160,10 @@ public class MitmProxy
         using var pcap = new PcapWriter(pcapPath);
         Console.WriteLine($"[Proxy] Saving to {pcapPath}");
 
-        var clientEp = client.Client.LocalEndPoint as IPEndPoint;
-        var clientIp = clientEp == null ? IPAddress.Loopback : Unmap(clientEp.Address);
-        var clientPort = (ushort)((client.Client.RemoteEndPoint as IPEndPoint)?.Port ?? 0);
-
         try
         {
-            await RelayAsync(clientStream, serverStream, host, clientIp, origIp, clientPort,
-                (ushort)origPort, pcap, ftp: null, ct);
+            await RelayAsync(clientStream, serverStream, host, dest.ClientAddr, origIp,
+                (ushort)dest.ClientPort, (ushort)origPort, pcap, ftp: null, ct);
         }
         catch (Exception ex)
         {

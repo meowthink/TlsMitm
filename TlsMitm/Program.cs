@@ -4,6 +4,9 @@ using System.Text;
 
 const int ProxyPort = 8443;
 const string EmSignCertDir = "emsign_certs";
+// The name the README's manual instruction uses too, so a rule made by hand and a rule made by
+// --allow-relay-in are the same object to this program.
+const string RelayRuleName = "tlsmitm-relay-in";
 
 // One file per run: a fixed name truncated the previous run, which is the run whose crash the next
 // start is usually asked about. AutoFlush stays on - a native fail-fast never flushes a buffer.
@@ -24,6 +27,8 @@ var echDowngrade = args.Contains("--no-ech-downgrade") ? null : new EchDowngrade
 var initCa = args.Contains("--init-ca");
 var rootPath = Option("--root");
 var rootThumbprint = Option("--root-thumbprint");
+var lanText = Option("--lan");
+var allowRelayIn = args.Contains("--allow-relay-in");
 var pids = ParseInts(Option("--pid"), "--pid");
 var includeImages = ParseNames(Option("--process"));
 var excludedPids = ParseInts(Option("--exclude-pid"), "--exclude-pid");
@@ -43,7 +48,8 @@ Console.WriteLine("[Main] Usage: dotnet run [--emsign | --emsign-only | --rotate
 Console.WriteLine("[Main]                          [--init-ca | --root <pfx> | --root-thumbprint <thumbprint>]");
 Console.WriteLine("[Main]                          [--pid <pid,...> | --exclude-pid <pid,...>]");
 Console.WriteLine("[Main]                          [--process <exe,...> | --exclude-process <exe,...>]");
-Console.WriteLine("[Main]   --emsign      pick the chain per client process (emSign for Node/Electron, Fiddler otherwise)");
+Console.WriteLine("[Main]                          [--lan <ipv4> [--allow-relay-in]]");
+Console.WriteLine("[Main]   --emsign      pick the chain per client process; a client with no PID gets emSign");
 Console.WriteLine("[Main]   --emsign-only force the emSign chain for every client");
 Console.WriteLine("[Main]   --rotate      rotate between the Fiddler root and the emSign intermediates");
 Console.WriteLine("[Main]   --no-ech-downgrade  relay ECH hellos blind instead of terminating them");
@@ -51,6 +57,8 @@ Console.WriteLine("[Main]   --init-ca     create a machine-wide root when none i
 Console.WriteLine("[Main]   --root        sign with this PFX (password from TLSMITM_ROOT_PASSWORD)");
 Console.WriteLine("[Main]   --pid / --process  intercept only these client processes (pid or executable)");
 Console.WriteLine("[Main]   --exclude-pid / --exclude-process  intercept everything except these client processes");
+Console.WriteLine("[Main]   --lan         also intercept TCP forwarded to clients on this address's subnet");
+Console.WriteLine("[Main]   --allow-relay-in  add the inbound allow rule the relay port needs for --lan, and remove it on exit");
 Console.WriteLine();
 
 X509Certificate2 rootCa;
@@ -76,13 +84,15 @@ var mode = CertEngineMode.FiddlerOnly;
 if (useEmSign || emSignOnly || rotate)
 {
     emSignCas = LoadEmSignCas();
-    
+
+    // --emsign decides per client from its PID, and a client with no PID - every forwarded LAN one -
+    // gets emSign, which is what --emsign-only gives everyone.
     if (emSignOnly)
         mode = CertEngineMode.EmSignOnly;
     else if (rotate)
         mode = CertEngineMode.Rotate;
     else
-        mode = CertEngineMode.Auto; // --emsign: emSign only for clients that trust it, Fiddler for the rest
+        mode = CertEngineMode.Auto;
 }
 else
 {
@@ -94,8 +104,46 @@ else
 using var crl = CrlService.Start(rootCa);
 var certEngine = new CertEngine(rootCa, emSignCas, mode, crl);
 
-using var redirector = new PacketRedirector(ProxyPort,
-    new ProcessFilter(pids, includeImages, excludedPids, excludedImages));
+LanSide? lan = null;
+if (lanText != null)
+{
+    lan = LanSide.Resolve(lanText);
+    if (lan == null) Environment.Exit(2);
+}
+
+var scope = new ProcessFilter(pids, includeImages, excludedPids, excludedImages);
+// The scope is read out of this machine's process table, and a client that is not on this machine has
+// no row there. Say it before anything starts capturing, so a scope never looks like it also limits
+// what --lan takes in.
+if (lan != null && scope.IsActive)
+    Console.WriteLine("[Main] Scope names processes on this machine only: a flow forwarded from the LAN has none, so --lan traffic is intercepted whatever --pid/--process say");
+// Where a redirected connection lands: the swap turns it into an inbound connection to this host's own
+// relay port whose peer address is the server the client asked for. Windows filters inbound and does not
+// filter loopback, which is why a local client keeps working while every forwarded one stops before the
+// first byte. The probe below asks the stack whether that filter is up; the rule store is only asked to
+// hold the rule this run names, never to decide reachability.
+var relayRuleOwned = false;
+if (lan != null)
+{
+    Console.WriteLine($"[Main] Firewall: {InboundFirewall.EnabledState()}");
+    if (InboundFirewall.Exists(RelayRuleName))
+        Console.WriteLine($"[Main] '{RelayRuleName}' is already in the store; left in place, and not removed on exit");
+    else if (allowRelayIn)
+    {
+        relayRuleOwned = InboundFirewall.Add(RelayRuleName,
+            "Inbound connections to TlsMitm's relay port, which a redirected flow reaches from its server's address",
+            InboundFirewall.ProtoTcp, ProxyPort.ToString());
+        Console.WriteLine(relayRuleOwned
+            ? $"[Main] Added '{RelayRuleName}' for TCP {ProxyPort}; removed when this run ends"
+            : $"[Main] --allow-relay-in did not put '{RelayRuleName}' in the store (needs elevation)");
+    }
+}
+else if (allowRelayIn)
+{
+    Console.WriteLine("[Main] --allow-relay-in concerns a client that is not this machine, so nothing is added without --lan");
+}
+
+using var redirector = new PacketRedirector(ProxyPort, scope, lan);
 // Loopback traffic is captured too, so the CRL endpoint needs both halves: RegisterExemption covers
 // its replies (matched by source port), RegisterLocalService covers a validator's GET to it, whose
 // source port is ephemeral and would otherwise be forward-swapped into the proxy.
@@ -104,7 +152,7 @@ if (crl != null)
     redirector.RegisterExemption(crl.Port);
     redirector.RegisterLocalService(crl.Port);
 }
-using var quicBlocker = new QuicBlocker();
+using var quicBlocker = new QuicBlocker(lan);
 var proxy = new MitmProxy(certEngine, redirector, ProxyPort, echDowngrade);
 
 var redirectorTask = redirector.StartAsync();
@@ -113,12 +161,88 @@ var proxyTask = proxy.StartAsync(cts.Token);
 
 Console.WriteLine("[Main] Ready. Press Ctrl+C to stop.");
 Console.WriteLine("[Main] All outbound TCP traffic will be intercepted.");
-Console.WriteLine("[Main] QUIC/UDP port 443 will be blocked (forces HTTP/2 fallback).");
+Console.WriteLine("[Main] QUIC is dropped by its packet signature, on any port (forces HTTP/2 fallback).");
+if (lan != null)
+{
+    Console.WriteLine($"[Main] LAN capture on {lan.Address}: TCP forwarded from {lan.Network}..{lan.Last} is intercepted,");
+    Console.WriteLine("[Main] and UDP forwarded from the same range is captured to drop QUIC. IPv4 forwarding must be on");
+    Console.WriteLine("[Main] for that interface (Router --enable-forwarding); DHCP and DNS stay with Router.");
+    if (!useEmSign && !emSignOnly && !rotate)
+    {
+        // A forwarded client is never in this machine's TCP table, so its chain cannot be chosen by
+        // process; --emsign is what decides it.
+        Console.WriteLine("[Main] This engine serves the Fiddler root to every client; run with --emsign to give a client");
+        Console.WriteLine("[Main] with no PID here the emSign chain instead.");
+    }
+}
 if (echDowngrade != null)
-    Console.WriteLine("[Main] ECH downgrade on (default): ECH hellos are terminated; a host that yields no data and no plaintext retry returns to blind relay.");
+    Console.WriteLine("[Main] ECH downgrade on (default): ECH hellos are terminated; a host is relayed blind for 10 min once a terminated session's client leg fails.");
 else
     Console.WriteLine("[Main] ECH downgrade off (--no-ech-downgrade): ECH hellos are relayed blind.");
 Console.WriteLine();
+
+// One SYN toward the relay from inside the LAN subnet, then the row the stack leaves for it in its own
+// TCP table. This is the only reading that settles the question the policy leaves open: an allow rule can
+// be in the store and still be outranked by a block rule, and a port nothing names can still be covered by
+// a pre-defined rule whose own port field reads as a wildcard.
+if (lan != null)
+{
+    var token = redirector.InjectRelayProbe(lan.ProbeAddress);
+    if (token == 0)
+    {
+        Console.WriteLine("[Main] inbound probe not sent, so whether a remote SYN reaches the relay port is unknown;");
+        Console.WriteLine("[Main]   a forwarded client may still be filtered, and a local one never is");
+    }
+    else
+    {
+        var answered = false;
+        var read = false;
+        for (var tick = 0; tick < 15 && !answered; tick++)
+        {
+            await Task.Delay(100);
+            if (RelayProbe.ReadTcpTable() is not { } table) continue;
+            read = true;
+            answered = RelayProbe.Answers(table, lan.ProbeAddress, token, lan.Address,
+                unchecked((ushort)ProxyPort));
+        }
+
+        if (answered)
+        {
+            Console.WriteLine("[Main] inbound probe: the relay port has a half-open row for a SYN from outside this host,");
+            Console.WriteLine("[Main]   so a forwarded client reaches the listener");
+        }
+        else if (!read)
+        {
+            Console.WriteLine("[Main] inbound probe sent, but the connection table could not be read, so whether that SYN");
+            Console.WriteLine("[Main]   reached the relay port is unknown; the run continues as if it had");
+        }
+        else
+        {
+            Console.WriteLine("[Main] inbound probe: no half-open row, so the SYN never reached a listener on the relay port.");
+            Console.WriteLine("[Main]   Every forwarded client would stop before its first byte, while a local client keeps");
+            Console.WriteLine("[Main]   working (loopback is not filtered), which is what makes the two look unrelated.");
+            var blocks = InboundFirewall.BlockCandidates(InboundFirewall.ProtoTcp, ProxyPort);
+            foreach (var name in blocks.Take(5))
+                Console.WriteLine($"[Main]   block rule that could outrank an allow here: {name}");
+            if (blocks.Count > 5)
+                Console.WriteLine($"[Main]   ... {blocks.Count - 5} more enabled inbound block rules could cover this port");
+            if (InboundFirewall.Exists(RelayRuleName))
+                Console.WriteLine($"[Main]   '{RelayRuleName}' is in the store and the port stays filtered, so this run ends");
+            else
+            {
+                Console.WriteLine($"[Main]   Add it with: New-NetFirewallRule -DisplayName '{RelayRuleName}' -Direction Inbound");
+                Console.WriteLine($"[Main]                  -Protocol TCP -LocalPort {ProxyPort} -Action Allow -Profile Any");
+                Console.WriteLine("[Main]   or re-run with --allow-relay-in (needs elevation, removed again when the run ends).");
+            }
+            if (relayRuleOwned)
+            {
+                InboundFirewall.Remove(RelayRuleName);
+                relayRuleOwned = false;
+            }
+            return 1;
+        }
+    }
+}
 
 try
 {
@@ -129,6 +253,13 @@ catch (OperationCanceledException)
 }
 
 Console.WriteLine("[Main] Stopping...");
+if (relayRuleOwned)
+{
+    InboundFirewall.Remove(RelayRuleName);
+    Console.WriteLine($"[Main] '{RelayRuleName}' removed with it; the port is filtered inbound again");
+}
+
+return 0;
 
 List<EmSignCa> LoadEmSignCas()
 {
