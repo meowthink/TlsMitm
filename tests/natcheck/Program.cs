@@ -166,6 +166,85 @@ var oddAlone = Frame(17, NatTable.ParseAddress("192.0.2.88"), server, Udp(7001, 
 parityTable.Translate(oddAlone.AsSpan(), WanIfIdx, WanIfIdx);
 Expect(Sport(oddAlone) % 2 == 1, $"a third client whose internal port is odd is not forced onto an even one, got {Sport(oddAlone)}");
 
+// --- a port this host already holds is never mapped -------------------------------------------------
+// RFC 4787 REQ-1 makes the mapped port the whole reverse key, so a client mapped onto a port one of this
+// host's own sockets is bound to receives that socket's answer. This host's dynamic range is the same span
+// as the pool, so the collision is not exotic - the resolver's upstream socket is one long-lived example.
+clock.Now = start;
+var heldUdp = new HashSet<ushort> { 49152 };
+var heldTcp = new HashSet<ushort>();
+var heldTable = new NatTable(wan, lanAddr, lanMask, () => clock.Now,
+    localPorts: proto => proto == 17 ? heldUdp : heldTcp);
+
+var heldFlow = Frame(17, client, server, Udp(5004, 5005));
+heldTable.Translate(heldFlow.AsSpan(), WanIfIdx, WanIfIdx);
+Expect(Sport(heldFlow) == 49154,
+    $"the held 49152 is skipped for the next port of the same parity, got {Sport(heldFlow)}");
+Expect(heldTable.PortHeld == 1, $"the skip is counted, got {heldTable.PortHeld}");
+
+// The payoff, stated as what the table refuses to do: an answer to the port the host holds is the host's.
+var localAnswer = Frame(17, server, wan, Udp(5005, 49152));
+var localOutcome = heldTable.Translate(localAnswer.AsSpan(), WanIfIdx, WanIfIdx);
+Expect(localOutcome.Action == NatAction.None && heldTable.LocalDest == 1,
+    "a reply to the port this host holds is left for the local stack instead of being destination-NATed");
+
+// The provider is asked per protocol, because the reverse key carries the protocol: a UDP port the host
+// holds is nothing to a TCP mapping. Fresh table, since the cursor is shared by both protocols.
+var crossTable = new NatTable(wan, lanAddr, lanMask, () => clock.Now,
+    localPorts: proto => proto == 17 ? heldUdp : heldTcp);
+var tcpFlow = Frame(6, client, server, Tcp(4000, 443, 0x02));
+crossTable.Translate(tcpFlow.AsSpan(), WanIfIdx, WanIfIdx);
+Expect(Sport(tcpFlow) == 49152 && crossTable.PortHeld == 0,
+    $"a port held on the other protocol does not move this mapping, got {Sport(tcpFlow)}");
+
+// The stateful translator sharing this interface address is a second holder of the same number, and one address
+// can answer for only one of them: RFC 6146 §3.5.1.1 lets a port live in two BIBs of two different tables, but
+// the reply the mapped port is the whole key for has to be read by whichever table bound it. Program.cs hands
+// each allocator the other's claims; this is the IPv4 side of that exchange, on the same terms as the
+// local-socket skip above and with the same arithmetic.
+var otherClaims = new HashSet<ushort> { 49152 };
+var claimedTable = new NatTable(wan, lanAddr, lanMask, () => clock.Now) { OtherMapped = proto => otherClaims };
+var claimedFlow = Frame(17, client, server, Udp(5004, 5005));
+claimedTable.Translate(claimedFlow.AsSpan(), WanIfIdx, WanIfIdx);
+Expect(Sport(claimedFlow) == 49154 && claimedTable.PortClaimed == 1,
+    $"a port the stateful table holds is skipped for the next one of the same parity, got {Sport(claimedFlow)}");
+Expect(claimedTable.MappedPorts(17).Count == 1 && claimedTable.MappedPorts(6).Count == 0,
+    "and the table reports its own claims to the other side per protocol, which is the same call in the other direction");
+
+// And with nothing known about the host the arithmetic is what it always was, so the three cases above
+// are about the check and not about the slot maths.
+var unheld = new NatTable(wan, lanAddr, lanMask, () => clock.Now);
+var unheldFlow = Frame(17, client, server, Udp(5004, 5005));
+unheld.Translate(unheldFlow.AsSpan(), WanIfIdx, WanIfIdx);
+Expect(Sport(unheldFlow) == 49152 && unheld.PortHeld == 0,
+    $"a table with no provider maps 49152, got {Sport(unheldFlow)}");
+
+// The provider caches a read, so a port the host released has to come back into the pool - otherwise the
+// exclusion shrinks it for the rest of a long run. The reader is counted here because the refresh is the
+// thing under test, not the iphlpapi calls behind the real one.
+clock.Now = start;
+var reads = 0;
+var providerHeld = new HashSet<ushort> { 49152 };
+ICollection<ushort> CountedReader(byte proto)
+{
+    reads++;
+    return proto == 17 ? providerHeld : Array.Empty<ushort>();
+}
+var provider = new LocalPorts(CountedReader, now: () => clock.Now);
+Expect(provider.Held(17).Count == 1 && reads == 2, $"the first ask reads both tables once, got {reads} reads");
+clock.Now = start + TimeSpan.FromSeconds(4);
+provider.Held(17);
+Expect(reads == 2, $"a second ask inside the window is served from the cache, got {reads} reads");
+providerHeld.Clear();
+clock.Now = start + TimeSpan.FromSeconds(6);
+Expect(provider.Held(17).Count == 0 && reads == 4,
+    $"past the window the read is taken again, so a released port is not held for good, got {reads} reads");
+var freedTable = new NatTable(wan, lanAddr, lanMask, () => clock.Now, localPorts: provider.Held);
+var freedFlow = Frame(17, client, server, Udp(5004, 5005));
+freedTable.Translate(freedFlow.AsSpan(), WanIfIdx, WanIfIdx);
+Expect(Sport(freedFlow) == 49152 && freedTable.PortHeld == 0,
+    $"and the port the host gave back is mapped again, got {Sport(freedFlow)}");
+
 // --- expiry, at the RFC floors and not before ---------------------------------------------------
 // One table per protocol: on a shared table an unrelated shorter-lived mapping would expire inside
 // another case's window, and the assertion would no longer say what it claims to.
@@ -477,6 +556,48 @@ Expect(lanSide.UdpFilter.Contains("ip.SrcAddr >= 192.168.122.0"), "the UDP leg i
 Expect(lanSide.UdpFilter.Contains("udp") && !lanSide.UdpFilter.Contains("tcp"), "and it names udp, not tcp");
 Expect(CompilesForward(lanSide.TcpFilter, out var tcpFilterError), $"WinDivert compiles the TCP filter at the forward layer{(tcpFilterError is null ? "" : $": {tcpFilterError}")}");
 Expect(CompilesForward(lanSide.UdpFilter, out var udpFilterError), $"WinDivert compiles the UDP filter at the forward layer{(udpFilterError is null ? "" : $": {udpFilterError}")}");
+
+// --- the same leg in IPv6 -------------------------------------------------------------------------
+// A forwarded v6 client is picked up by the same handle as the v4 one, so the IPv4 side's filter must
+// not change when a v6 side is attached: one capture, both families, and the v4 branch byte-identical.
+var lanAddr6 = System.Net.IPAddress.Parse("2001:db8:1:f18::1");
+var lan6Side = new TlsMitm.LanSideV6(lanAddr6,
+    TlsMitm.LanSideV6.NetworkOf(lanAddr6, 64), TlsMitm.LanSideV6.LastOf(lanAddr6, 64), 30);
+Expect(lan6Side.Network.ToString() == "2001:db8:1:f18::",
+    $"a /64 network address keeps all 64 prefix bits and clears the rest, got {lan6Side.Network}");
+Expect(lan6Side.Last.ToString() == "2001:db8:1:f18:ffff:ffff:ffff:ffff",
+    $"and the subnet's last address fills every host bit, got {lan6Side.Last}");
+Expect(TlsMitm.LanSideV6.LastOf(System.Net.IPAddress.Parse("2001:db8:1:f18::"), 61).ToString()
+       == "2001:db8:1:f1f:ffff:ffff:ffff:ffff",
+    "a /61 - the shape the delegation actually hands out - fills the three host bits of its last nibble");
+Expect(TlsMitm.LanSideV6.NetworkOf(System.Net.IPAddress.Parse("2001:db8:1:f18::5"), 0).ToString() == "::"
+       && TlsMitm.LanSideV6.LastOf(System.Net.IPAddress.Parse("::"), 0).ToString() == "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+    "a /0 masks every octet away and bounds the subnet at both ends of the address space");
+Expect(TlsMitm.LanSideV6.NetworkOf(lanAddr6, 128).Equals(lanAddr6)
+       && TlsMitm.LanSideV6.LastOf(lanAddr6, 128).Equals(lanAddr6),
+    "a /128 subnet holds the one address it is written on");
+
+// The two words the rewrite writes into the header have to be the address's own octets, read the way
+// FlowState reads a v6 address, or the packet is delivered to something this host does not hold.
+var rawWords = new byte[16];
+BitConverter.TryWriteBytes(rawWords.AsSpan(0, 8), lan6Side.Raw.Hi);
+BitConverter.TryWriteBytes(rawWords.AsSpan(8, 8), lan6Side.Raw.Lo);
+Expect(rawWords.SequenceEqual(lanAddr6.GetAddressBytes()), "the words the v6 rewrite writes are the address's own octets");
+
+var dualSide = lanSide with { V6 = lan6Side };
+Expect(!lanSide.TcpFilter.Contains("ipv6") && !lanSide.UdpFilter.Contains("ipv6"),
+    "a side with no v6 address leaves both filters exactly as the v4 leg had them");
+Expect(dualSide.TcpFilter.Contains("ip.SrcAddr >= 192.168.122.0")
+       && dualSide.TcpFilter.Contains("ipv6.SrcAddr >= 2001:db8:1:f18::")
+       && dualSide.TcpFilter.Contains("ipv6.SrcAddr <= 2001:db8:1:f18:ffff:ffff:ffff:ffff"),
+    $"the dual-stack filter is bounded to both subnets, got '{dualSide.TcpFilter}'");
+Expect(dualSide.UdpFilter.Contains("udp") && dualSide.UdpFilter.Contains("ipv6.SrcAddr >= 2001:db8:1:f18::")
+       && !dualSide.UdpFilter.Contains("tcp"),
+    "and the UDP leg carries the same v6 bound, which is what stops a forwarded v6 QUIC handshake");
+Expect(CompilesForward(dualSide.TcpFilter, out var dualTcpError),
+    $"WinDivert compiles the dual-stack TCP filter at the forward layer{(dualTcpError is null ? "" : $": {dualTcpError}")}");
+Expect(CompilesForward(dualSide.UdpFilter, out var dualUdpError),
+    $"and the dual-stack UDP filter{(dualUdpError is null ? "" : $": {dualUdpError}")}");
 
 // The rewrite changes words that every TCP and UDP checksum covers, and for a fragment the rest of the
 // datagram is not on hand to recompute over - so the table folds them in itself (RFC 1624 §2). The far

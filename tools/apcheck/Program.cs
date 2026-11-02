@@ -10,13 +10,34 @@ using Microsoft.Win32;
 // *without* Internet Connection Sharing, whose own DHCP and DNS on 192.168.137.1 would answer the clients
 // before this program gets the chance.
 //
-// Every call here is a query. SetProperty, SetSecondaryKey, InitSettings, StartUsing and StopUsing are the
-// state-changing half and none of them is imported, so this program cannot turn a radio on. The header
-// says WlanHostedNetworkQueryProperty and WlanHostedNetworkQueryStatus may be called by any user, so it
-// runs unelevated and reports what that actually returns here.
+// Without a flag, every call here is a query. WlanHostedNetworkSetProperty, SetSecondaryKey, InitSettings,
+// StartUsing and StopUsing are the state-changing half of wlanapi and none of them is imported, and the
+// Wi-Fi Direct publisher is activated and read but never started. The header says
+// WlanHostedNetworkQueryProperty and WlanHostedNetworkQueryStatus may be called by any user, so it runs
+// unelevated and reports what that actually returns here.
+//
+// --wfd-start is the one branch that asks for a radio, and it is the reason that branch re-reads and
+// re-states everything rather than assuming: a driver that answers "Hosted network supported: no" to the
+// queries above still has the Wi-Fi Direct advertisement path, and only Start can tell you whether this
+// machine's driver takes it.
 //
 // Offsets and enum values are taken from the installed SDK headers (wlanapi.h, wlantypes.h, windot11.h)
 // rather than from documentation prose, because the header is what wlansvc's RPC boundary agrees with.
+
+if (args.Contains("--help"))
+{
+    Console.WriteLine("[apcheck] usage: apcheck [--wfd-start [--ssid <name>] --key-file <path>]" +
+                      " [--wfd-hold <seconds>]");
+    Console.WriteLine("[apcheck]   no flags: read the hosted network and the Wi-Fi Direct advertisement,");
+    Console.WriteLine("[apcheck]   advertise nothing. --wfd-start holds a beacon up until it stops itself.");
+    return 0;
+}
+
+var advertise = args.Contains("--wfd-start");
+var hold = Value(args, "--wfd-hold") is { } text && int.TryParse(text, out var seconds) ? seconds : 120;
+var ssid = Value(args, "--ssid");
+var passphrase = advertise ? ReadKeyFile(Value(args, "--key-file")) : null;
+if (advertise && passphrase is null) return 2;
 
 if (Wlan.OpenHandle(out var client, out var negotiated) != 0) return 1;
 try
@@ -30,7 +51,61 @@ finally
     Wlan.CloseHandle(client);
 }
 
-return 0;
+if (!advertise)
+{
+    WifiDirect.Report();
+    return 0;
+}
+
+return WifiDirect.Advertise(ssid, passphrase!, hold);
+
+static string? Value(string[] args, string name)
+{
+    var index = Array.IndexOf(args, name);
+    return index >= 0 && index + 1 < args.Length ? args[index + 1] : null;
+}
+
+// The passphrase comes from a file and never from the command line, which would put it in the process list
+// and the shell's history. Newlines are trimmed because a file edited by hand ends with one; spaces are
+// kept, because the standard allows them inside a passphrase.
+static string? ReadKeyFile(string? path)
+{
+    if (path is null)
+    {
+        Console.WriteLine("[apcheck] --wfd-start needs --key-file <path>: the passphrase it holds is the" +
+                          " key the client joins with, and the generated default is over the WPA2-PSK ceiling");
+        return null;
+    }
+
+    string passphrase;
+    try
+    {
+        passphrase = File.ReadAllText(path).Trim('\r', '\n');
+    }
+    catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+    {
+        Console.WriteLine($"[apcheck] cannot read --key-file {path}: {exception.Message}");
+        return null;
+    }
+
+    // Checked here rather than left for the radio to judge, because the radio's answer to an unacceptable
+    // passphrase is the same Aborted it gives for every other refusal. Measured on this host: a file of
+    // eight NUL octets aborted, and eight printable ones advertised - same SSID, same build, minutes
+    // apart. The octets outside 0x20..0x7E are ones a client cannot type into a passphrase field, so a
+    // file carrying them could never be joined even if the advertisement had taken it. The 8-to-63 length
+    // bound is the advertisement's own refusal, not this one's.
+    for (var i = 0; i < passphrase.Length; i++)
+    {
+        if (passphrase[i] is >= ' ' and <= '~') continue;
+        Console.WriteLine($"[apcheck] --key-file {path} holds a non-printable octet (0x{(int)passphrase[i]:x2})" +
+                          $" at position {i + 1} of {passphrase.Length}; a WPA2-PSK passphrase is printable" +
+                          " octets, and this host's radio answers one that is not with Aborted. The rest of" +
+                          " the file is not shown.");
+        return null;
+    }
+
+    return passphrase;
+}
 
 internal static class Wlan
 {

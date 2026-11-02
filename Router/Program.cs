@@ -17,8 +17,8 @@ Console.SetOut(new TimestampWriter(Console.Out));
 Console.WriteLine("[Router] Minimal IPv4 NAT router (WinDivert)");
 Console.WriteLine("[Router] Usage: Router [--lan <ipv4>] [--wan <ipv4>] [--enable-forwarding] [--stop-ics] " +
                   "[--pool <ipv4>/<count>] [--lease <min>] [--udp-timeout <sec>] [--dns <ipv4>] " +
-                  "[--scope <cidr>,<pool>/<count>,<router>[,<dns>]] [--no-dhcp] [--no-dns] [--allow-lan-in] " +
-                  "[--trace [<count>]] [--stats <sec>]");
+                  "[--scope <cidr>,<pool>/<count>,<router>[,<dns>]] [--no-dhcp] [--no-dns] [--no-v6] " +
+                  "[--pref64 [<ipv6>/<len>]] [--nat64] [--allow-lan-in] [--trace [<count>]] [--stats <sec>]");
 
 var lanArg = Host.OptionValue(args, "--lan");
 var wanArg = Host.OptionValue(args, "--wan");
@@ -41,6 +41,46 @@ var leaseMinutes = int.TryParse(Host.OptionValue(args, "--lease"), out var parse
 var dnsArg = Host.OptionValue(args, "--dns");
 var noDhcp = args.Contains("--no-dhcp");
 var noDns = args.Contains("--no-dns");
+var noV6 = args.Contains("--no-v6");
+var nat64On = args.Contains("--nat64");
+
+// DNS64 is opt-in: a synthesized AAAA is an address nothing can reach until a translator holding the
+// same prefix exists, so turning synthesis on says something about the rest of the configuration. A bare
+// --pref64 takes the prefix RFC 6147 §5.2 makes the default: "If no prefix is available, the algorithm
+// MUST use the Well-Known Prefix 64:ff9b::/96".
+Pref64Config? pref64 = null;
+if (args.Contains("--pref64"))
+{
+    var prefArg = Host.OptionValue(args, "--pref64");
+    pref64 = prefArg is null ? Pref64Config.WellKnown : Pref64Config.Parse(prefArg);
+    if (pref64 is null)
+    {
+        Console.WriteLine($"[Router] --pref64 wants an IPv6 prefix with none of its host bits set and " +
+                          $"one of the lengths RFC 6052 §2.2 allows ({string.Join(", ", Pref64.PrefixLengths)}), " +
+                          $"got '{prefArg}'.");
+        return 1;
+    }
+}
+
+// The stateful translator is the second half of what --pref64 starts: RFC 6147 §5.2's synthesized AAAA is
+// "an address nothing can reach until a translator holding the same prefix exists", and RFC 6146 §3.6.1
+// generates both of the outgoing addresses from that prefix and from the pool the table answers on. With no
+// prefix named, there is no realm to translate into and no address to embed a peer in.
+if (nat64On && pref64 is null)
+{
+    Console.WriteLine("[Router] --nat64 needs --pref64 [<ipv6>/<len>] to name the prefix whose addresses it translates.");
+    return 1;
+}
+
+// The same argument from the other side: without the IPv6 plane the LAN is never given a prefix, so no client
+// on it has a route to an address inside Pref64::/n, and a stateful table that is offered no IPv6 binds no
+// port. Refusing says that at the start rather than leaving it to a counter that stays at zero.
+if (nat64On && noV6)
+{
+    Console.WriteLine("[Router] --nat64 with --no-v6 would translate traffic the LAN has no route to: " +
+                      "the advertised prefix is what delivers a Pref64::/n packet to this program.");
+    return 1;
+}
 
 // One --scope per subnet on the far side of a BOOTP relay agent, matched against the 'giaddr' the agent
 // filled in. Kept as text until the LAN side is known, because the resolver a relayed client is pointed
@@ -49,6 +89,12 @@ var scopeArgs = Host.OptionValues(args, "--scope");
 if (noDhcp && scopeArgs.Count > 0)
 {
     Console.WriteLine("[Router] --scope configures the lease server, which --no-dhcp turns off.");
+    return 1;
+}
+
+if (noDns && pref64 is not null)
+{
+    Console.WriteLine("[Router] --pref64 configures the resolver's synthesis, which --no-dns turns off.");
     return 1;
 }
 
@@ -171,6 +217,29 @@ else if (lanForwarding == "Disabled" || wanForwarding == "Disabled")
     return 1;
 }
 
+// The same switch for IPv6, and for the same reason: a delegated prefix only carries a client's packet
+// once the stack is willing to forward it. Windows keeps the two families' settings apart, so the IPv4
+// line above says nothing about this one. A disabled family is reported rather than refused: the prefix
+// can still be delegated and advertised, and only the forwarding of what hosts then send is lost.
+if (!noV6)
+{
+    var lan6Forwarding = Host.QueryForwarding(lan.IfIdx, "IPv6");
+    var wan6Forwarding = Host.QueryForwarding(wan.IfIdx, "IPv6");
+    Console.WriteLine($"[Router] IPv6 forwarding: LAN={lan6Forwarding ?? "unknown"} WAN={wan6Forwarding ?? "unknown"}");
+    if (enableForwarding)
+    {
+        Host.SetForwarding(lan.IfIdx, "IPv6");
+        Host.SetForwarding(wan.IfIdx, "IPv6");
+        Console.WriteLine($"[Router] IPv6 forwarding now: LAN={Host.QueryForwarding(lan.IfIdx, "IPv6")} " +
+                          $"WAN={Host.QueryForwarding(wan.IfIdx, "IPv6")}");
+    }
+    else if (lan6Forwarding == "Disabled" || wan6Forwarding == "Disabled")
+    {
+        Console.WriteLine("[Router] IPv6 forwarding is off on one of the two, so a LAN client's v6 packet is");
+        Console.WriteLine("[Router]   discarded by the stack however good the advertised prefix is; --enable-forwarding sets it.");
+    }
+}
+
 // The one conflict that leaves this program looking healthy: Windows' own NAT shares the forwarding path,
 // and with sharing on both would rewrite the same packet, so traffic that works says nothing about which
 // of the two carried it. Refuse rather than run under it, unless asked to take it over.
@@ -196,14 +265,65 @@ if (ics == "Running")
         return 1;
     }
     Console.WriteLine($"[Router] SharedAccess stopped for this run ({ics}).");
+
+    // Stopping the service takes its own scope address off the interface it was sharing, and when that
+    // interface is this run's LAN the address selected above was read from is the one that goes. Re-adding
+    // it here is the difference between a client that gets a lease and one whose DHCP request has nowhere
+    // to arrive; measured 2026-11-02 as three "Cannot bind 192.168.137.1" lines over an associated client.
+    if (!Host.HasIpv4Address(lan.IfIdx, lan.AddrText))
+    {
+        Console.WriteLine($"[Router] {lan.AddrText} left ifIdx {lan.IfIdx} with the sharing stop; " +
+                          $"putting it back as /{lan.Prefix}.");
+        if (!Host.AddIpv4Address(lan.AddrText, lan.Prefix, lan.IfIdx))
+        {
+            Console.WriteLine("[Router]   the LAN has no address to answer DHCP and DNS on, so nothing a client");
+            Console.WriteLine("[Router]   asks would be answered. Add it yourself with New-NetIPAddress and read");
+            Console.WriteLine("[Router]   what it says, or pass --lan an address this program does not have to create.");
+            return 1;
+        }
+    }
 }
 Console.WriteLine($"[Router] ICS: SharedAccess={ics ?? "unknown"}");
 
-var table = new NatTable(wan.Addr, lan.Addr, lan.Mask, udpIdle: udpIdle);
+// Opened before any handle, so a WAN without a link-local address or a LAN without one is a line next to
+// the interface listing rather than a task that died in silence. The loop itself starts further down,
+// after every early return: a delegation installed by a run that then refused to start would leave an
+// address behind with nothing behind it.
+var v6 = noV6 ? null : V6Router.Open(wan, lan);
+
+// Read at the moment a port is picked rather than once at startup, because the socket this program cares
+// most about - the resolver's upstream one - is not bound yet here, and its ephemeral port comes out of the
+// same 49152+16384 span the NAT allocates from.
+var localPorts = new LocalPorts();
+var table = new NatTable(wan.Addr, lan.Addr, lan.Mask, udpIdle: udpIdle, localPorts: localPorts.Held);
 Console.WriteLine($"[Router] NAT: UDP mapping timer {(int)udpIdle.TotalSeconds}s, " +
-                  "mapped ports preserve the internal port's parity");
+                  "mapped ports preserve the internal port's parity, and a port this host holds is never mapped");
 table.Expired += (key, natPort, idle) =>
     Console.WriteLine($"[Router] EXPIRE proto={key.Proto} {NatTable.FormatAddress(key.ClientIp)}:{key.ClientPort} nat={natPort} idle={idle.TotalMinutes:0.#}min");
+
+// The stateful PLAT, opt-in. RFC 6146 §3.5.1.1's first bullet read against a single interface address makes
+// the pool this table answers on the same one the IPv4 NAT writes, and §3.5.1.1's last bullet lets one number
+// live in the UDP BIB here and in the IPv4 table's map at the same time - which it cannot do at this host,
+// where a reply to that port would have two owners. So each allocator is shown the other's claims and takes
+// none of them.
+Nat64? nat64 = null;
+var natPath = Siit.PathMtu.Unknown;
+if (nat64On)
+{
+    nat64 = new Nat64(pref64!, System.Net.IPAddress.Parse(NatTable.FormatAddress(wan.Addr)),
+        localPorts: localPorts.Held, otherMapped: proto => table.MappedPorts(proto));
+    table.OtherMapped = proto => nat64.MappedPorts(proto);
+    // RFC 7915 §4.2 and §5.2 give the Packet Too Big message the MTU of the next hop on each side, so the two
+    // are read from the interface rather than assumed: the WAN here is a phone hotspot whose link is 1492.
+    natPath = new Siit.PathMtu((int)(Host.QueryMtu(wan.IfIdx, "IPv4") ?? (uint)Siit.PathMtu.Unknown.Ipv4NextHop),
+        (int)(Host.QueryMtu(wan.IfIdx, "IPv6") ?? (uint)Siit.PathMtu.Unknown.Ipv6NextHop));
+    Console.WriteLine($"[Router] NAT64: RFC 6146 BIB/STE table on {NatTable.FormatAddress(wan.Addr)} under " +
+                      $"{pref64!.Prefix}/{pref64.PrefixLength}; UDP {Nat64.UdpDefault.TotalMinutes:0} min, " +
+                      $"TCP {Nat64.TcpEstablished.TotalMinutes:0}+{Nat64.TcpTransitory.TotalMinutes:0} min, " +
+                      $"query {Nat64.IcmpQueryLifetime.TotalSeconds:0} s, path MTU v4={natPath.Ipv4NextHop} " +
+                      $"v6={natPath.Ipv6NextHop}. A fragment after the first is translated from the record its " +
+                      "first fragment left (RFC 6146 §3.4); the datagram is never reassembled here.");
+}
 
 // The pool and the two listeners exist so a device plugged into the LAN side answers to something:
 // an address from the pool, this host as its router and resolver, and the option 12 hostname plus the
@@ -296,10 +416,32 @@ if (!noDns && upstream is uint resolver)
     // answer under the transaction id this server put on the query, so answers for different clients'
     // questions can be in flight at once without being confused for each other.
     upstreamSocket = new UdpClient(AddressFamily.InterNetwork);
-    dns = new DnsServer(Services.Upstream(resolver, upstreamSocket, table), name => dhcp?.AddressOfHostName(name));
+    dns = new DnsServer(Services.Upstream(resolver, upstreamSocket, table), name => dhcp?.AddressOfHostName(name),
+        pref64: pref64);
+    // Subscribed here rather than in the listener loop: the resolver has one UDP loop per family and both
+    // run the same code, so an event attached per loop would print every query twice.
+    dns.Queried += (name, type, client) => Console.WriteLine($"[Router] dns {client} -> {name} type={type}");
+    // The advertisements then name this host's own LAN address as the recursive resolver, so the answer a
+    // LAN client gets is one this resolver built - which is the only place the ECH configuration is taken
+    // out of it. The same advertisement carries RFC 8781's PREF64 option when synthesis is on, so that a
+    // host which forms addresses for itself uses the prefix these answers were formed with.
+    if (v6 is { } v6Advertising)
+    {
+        v6Advertising.AnswersDnsItself = true;
+        v6Advertising.Pref64 = pref64;
+    }
     Console.WriteLine($"[Router] DNS on {lan.AddrText}:{DnsPorts.ServerPort}, " +
                       $"upstream {NatTable.FormatAddress(resolver)} from this host's UDP " +
                       $"{((System.Net.IPEndPoint)upstreamSocket.Client.LocalEndPoint!).Port}");
+    if (pref64 is { } prefix)
+    {
+        Console.WriteLine($"[Router] DNS64 answers a AAAA question that has no AAAA of its own from the " +
+                          $"A records, under Pref64 {prefix.Prefix}/{prefix.PrefixLength}.");
+        Console.WriteLine(v6 is null
+            ? "[Router]   --no-v6 leaves the advertisements out, so a client learns that prefix only from " +
+              "the answers themselves."
+            : "[Router]   The Router Advertisements carry the same prefix in RFC 8781's PREF64 option.");
+    }
 }
 
 // The forward layer is where a packet this host routes rather than delivers is diverted; the network layer
@@ -312,7 +454,15 @@ if (!noDns && upstream is uint resolver)
 // about, which is the same thing the sniff handle reports as take=.
 // Impostor is excluded so a reinjection is never handed back to be rewritten again: the passthrough path
 // sends a packet on unchanged, and a second pass would send it on again forever.
-var filter = $"(ifIdx == {wan.IfIdx} or ifIdx == {lan.IfIdx}) and ip and (tcp or udp or icmp) and not impostor";
+// --nat64 is what adds the second family, and the cost is stated rather than hidden: with it on, every
+// forwarded IPv6 TCP, UDP and ICMPv6 packet is taken by this handle and put back, including the ones whose
+// destination is outside the prefix and which Windows used to forward on its own. WinDivert's language
+// matches an IPv6 address exactly, not by prefix, so the prefix test can only live in the loop below.
+// Without the flag the filter is the one the router has been run with.
+var filter = $"(ifIdx == {wan.IfIdx} or ifIdx == {lan.IfIdx}) and " +
+             (nat64 is null ? "ip and (tcp or udp or icmp)"
+                             : "(ip and (tcp or udp or icmp) or ipv6 and (tcp or udp or icmpv6))") +
+             " and not impostor";
 
 using var cts = new CancellationTokenSource();
 // Assigned as each handle opens; the handler below runs on its own thread and may fire while a loop is
@@ -321,6 +471,9 @@ WinDivertHandle? forwardHandle = null;
 WinDivertHandle? replyHandle = null;
 WinDivertHandle? forwardTrace = null;
 WinDivertHandle? netTrace = null;
+WinDivertHandle? v6ForwardTrace = null;
+WinDivertHandle? v6NetTrace = null;
+WinDivertHandle? v6ReplyHandle = null;
 // One definition, used by Ctrl+C and by a faulted loop: set the token, then make the driver stop queuing
 // and end whatever call is blocked inside it. The handles are shut down from here rather than from the
 // loops' own finally, because a thread blocked in WinDivertRecv never observes the token: cancellation
@@ -332,8 +485,11 @@ void Abort()
     cts.Cancel();
     forwardHandle?.Shutdown(ShutdownMode.Recv);
     replyHandle?.Shutdown(ShutdownMode.Recv);
+    v6ReplyHandle?.Shutdown(ShutdownMode.Recv);
     forwardTrace?.Shutdown(ShutdownMode.Recv);
     netTrace?.Shutdown(ShutdownMode.Recv);
+    v6ForwardTrace?.Shutdown(ShutdownMode.Recv);
+    v6NetTrace?.Shutdown(ShutdownMode.Recv);
 }
 Console.CancelKeyPress += (_, e) =>
 {
@@ -352,11 +508,14 @@ Console.CancelKeyPress += (_, e) =>
 
 // Started before the driver is opened: a device that can reach this host but gets no lease is a
 // different problem from a packet that never leaves, and binding first tells you which one you have.
-UdpClient? dhcpSocket = dhcp is null ? null : Services.OpenListener(lan.Addr, DhcpPorts.ServerPort, true);
-UdpClient? dnsSocket = dns is null ? null : Services.OpenListener(lan.Addr, DnsPorts.ServerPort, false);
+UdpClient? dhcpSocket = dhcp is null ? null
+    : Services.OpenListener(Host.ToIpAddress(lan.Addr), DhcpPorts.ServerPort, true);
+UdpClient? dnsSocket = dns is null ? null
+    : Services.OpenListener(Host.ToIpAddress(lan.Addr), DnsPorts.ServerPort, false);
 // The TCP half of the resolver, for the retry RFC 1035 §4.2.1 sends there once a UDP answer came back
 // with TC set. Bound separately because a client that never sees TC never opens this connection.
-TcpListener? dnsTcp = dns is null ? null : Services.OpenTcpListener(lan.Addr, DnsPorts.ServerPort);
+TcpListener? dnsTcp = dns is null ? null
+    : Services.OpenTcpListener(Host.ToIpAddress(lan.Addr), DnsPorts.ServerPort);
 
 // The probes are made here because the loops below are what answer them, and a listener has to be running
 // before anything is put on the wire for it. A port that never bound is not probed: the answer would be
@@ -374,6 +533,24 @@ const string LanRuleName = "router-lan-in";
 const string DnsTcpRuleName = "router-dns-tcp-in";
 var lanRuleOwned = false;
 var dnsTcpRuleOwned = false;
+// Set once by whichever release path runs first - Main's own end, the process-exit handler, or the console
+// close handler, which arrives on a thread of its own while this thread is still running.
+var lanRulesReleased = 0;
+
+// Registered before anything is added, because the store call that adds a rule takes a few hundred
+// milliseconds and a close landing in that window would otherwise end the run with the rule in and no one
+// left to take it out. The release at the end of this file needs Main to reach it, and the interrupt
+// handler's own Environment.Exit does not: measured 2026-11-02, Environment.Exit does run a ProcessExit
+// handler and a console close runs none at all, so this covers the watchdog exit.
+AppDomain.CurrentDomain.ProcessExit += (_, _) => ReleaseLanRules(quiet: true);
+
+// The close that no exit handler sees gets a Win32 control handler instead; ConsoleClose carries the
+// measurements that make it worth having - its own thread, about 5 s of it, and the firewall call working
+// from there. Quiet, because the run is ending while this runs, and the store's count is the witness.
+if (!ConsoleClose.Register(() => ReleaseLanRules(quiet: true)))
+    Console.WriteLine("[Router] no console control handler could be registered (no console attached); " +
+                      "closing this window leaves the rules in the store for the next run to report");
+
 if (probePorts.Count > 0)
 {
     // Printed for the same reason the proxy prints it: a run that ends on a filtered port is easier to
@@ -396,10 +573,23 @@ bool AllowIn(string name, int protocol, string protocolName, string ports, strin
 {
     if (InboundFirewall.Exists(name))
     {
-        Console.WriteLine($"[Router] '{name}' is already in the store; left in place, and not removed on exit");
+        // Left in place because README names these two display names for a hand-made persistent rule too, so
+        // this program cannot tell its own residue from the operator's choice. What does strand a rule here
+        // is taskkill /F: measured 2026-11-02, it delivers no notification of any kind - no signal, no
+        // handler, no chance to answer - so the residue is reachable only from the next start, and the line
+        // says what clears it.
+        Console.WriteLine($"[Router] '{name}' is already in the store; left in place, and not removed on exit. " +
+                          $"If it is what a killed run left behind: Remove-NetFirewallRule -DisplayName '{name}'");
         return false;
     }
     if (!allowLanIn) return false;
+    // A close that lands while this run is still starting up has already released, and nothing will run
+    // after the process dies: adding now would strand the rule with no one left to take it out.
+    if (Volatile.Read(ref lanRulesReleased) != 0)
+    {
+        Console.WriteLine($"[Router] {name} not added: this run's rules were already released by a close");
+        return false;
+    }
     var added = InboundFirewall.Add(name, description, protocol, ports);
     Console.WriteLine(added
         ? $"[Router] Added '{name}' for {protocolName} {ports}; removed when this run ends"
@@ -409,10 +599,36 @@ bool AllowIn(string name, int protocol, string protocolName, string ports, strin
 
 if (dhcp is { } dhcpServer && dhcpSocket is { } dhcpPort && dhcpProbe is { } dhcpWitness)
     _ = Task.Run(() => Services.RunDhcp(dhcpPort, dhcpServer, lan.Addr, dhcpWitness, cts.Token));
-if (dns is { } dnsServer && dnsSocket is { } dnsPort && dnsProbe is { } dnsWitness)
-    _ = Task.Run(() => Services.RunDns(dnsPort, dnsServer, lan.Addr, dnsWitness, cts.Token));
+if (dns is { } dnsServer && dnsSocket is { } dnsPort)
+    _ = Task.Run(() => Services.RunDns(dnsPort, dnsServer, dnsProbe, cts.Token));
 if (dns is { } dnsResolver && dnsTcp is { } dnsTcpListener)
-    _ = Task.Run(() => Services.RunDnsTcp(dnsTcpListener, dnsResolver, lan.Addr, cts.Token));
+    _ = Task.Run(() => Services.RunDnsTcp(dnsTcpListener, dnsResolver, lan.AddrText, cts.Token));
+
+// The resolver's IPv6 half, which cannot be opened with the pair above: the address it binds to is the
+// one the delegation installs on the LAN interface, and a bind to an address no interface holds fails.
+// Both families are served by the one DnsServer, so the cache, the upstream socket and the query line are
+// shared rather than doubled, and the answer a v6 client gets is the same one - ECH configuration taken
+// out - that a v4 client gets. The listeners are closed from the same event with a null address:
+// V6Router.Run's finally always reaches Withdraw, so their lifetime is the address's.
+UdpClient? dnsV6 = null;
+TcpListener? dnsV6Tcp = null;
+if (v6 is { } v6Listener && dns is { } v6Dns)
+{
+    v6Listener.ResolverAddressChanged += address =>
+    {
+        dnsV6?.Dispose();
+        dnsV6 = null;
+        dnsV6Tcp?.Stop();
+        dnsV6Tcp = null;
+        if (address is null) return true;
+        dnsV6 = Services.OpenListener(address, DnsPorts.ServerPort, false);
+        dnsV6Tcp = Services.OpenTcpListener(address, DnsPorts.ServerPort);
+        if (dnsV6 is { } v6Udp) _ = Task.Run(() => Services.RunDns(v6Udp, v6Dns, null, cts.Token));
+        if (dnsV6Tcp is { } v6Tcp)
+            _ = Task.Run(() => Services.RunDnsTcp(v6Tcp, v6Dns, $"[{address}]", cts.Token));
+        return dnsV6 is not null;
+    };
+}
 
 // One datagram at each listener that is running, from an address inside the LAN subnet, and then the wait
 // for the loop that owns that port to report it. Unlike the relay's TCP probe there is nothing to read off
@@ -599,6 +815,8 @@ unsafe bool SendToListener(WinDivertHandle sender, byte[] packet, string label =
 
 WinDivertHandle? sniffer = null;
 WinDivertHandle? netSniffer = null;
+WinDivertHandle? v6Sniffer = null;
+WinDivertHandle? v6NetSniffer = null;
 if (trace)
 {
     // Sniff-only, so it observes without removing anything, and above the main handle in priority, so it
@@ -619,6 +837,15 @@ if (trace)
     netSniffer = new WinDivertHandle("inbound and ip and (tcp or udp or icmp)", Layer.Network, 100, Flag.Sniff | Flag.RecvOnly);
     var netTraceHandle = netSniffer;
     netTrace = netSniffer;
+    // The IPv6 legs are separate handles rather than a widened filter, for the reason the v4 pair already
+    // learned: a shared budget is spent by whatever is busiest, and the v6 question is answered by a packet
+    // that may arrive once a minute. `ipv6` is the filter language's name for the family (`ip6` is a bad
+    // token), and `icmpv6` is what puts Neighbour Discovery and Packet Too Big on the screen - the two
+    // messages a silent v6 path is diagnosed from.
+    v6Sniffer = new WinDivertHandle("ipv6 and (tcp or udp or icmpv6)", Layer.Forward, 100, Flag.Sniff | Flag.RecvOnly);
+    v6ForwardTrace = v6Sniffer;
+    v6NetSniffer = new WinDivertHandle("inbound and ipv6 and (tcp or udp or icmpv6)", Layer.Network, 100, Flag.Sniff | Flag.RecvOnly);
+    v6NetTrace = v6NetSniffer;
     Console.WriteLine($"[Router] Trace on: sniffing the forward layer and the network layer inbound, first {traceCount} packets on each; " +
                       $"the main handle accepts ifIdx {lan.IfIdx} or {wan.IfIdx}");
     // The two runs are read against each other, so the difference in what they print is worth stating: the
@@ -627,10 +854,27 @@ if (trace)
     Console.WriteLine("[Router]   [Trace fwd] = what the main handle is offered. [Trace net] = only the LAN subnet's");
     Console.WriteLine("[Router]   packets and the answers to mapped ports, so a client's reply showing on one layer");
     Console.WriteLine("[Router]   and not the other is the capture point, not the decision tree.");
+    // IPv6 has no rewrite to observe, only a forwarding decision, and the two legs are not the two halves
+    // of one path: a forwarded packet is never addressed to this host, so the network layer is never
+    // offered it. Measured on a live run: a client's packet prints once on v6fwd at its egress interface -
+    // the request at the WAN index, the answer at the LAN one - while v6net stays silent for the whole
+    // flow, and a transit packet Windows drops prints on neither leg. The client's own reply is therefore
+    // the end-to-end judge; this pair says where a packet went, not whether the path exists.
+    Console.WriteLine($"[Router]   [Trace v6fwd] = IPv6 Windows is forwarding, one line per packet at its egress");
+    Console.WriteLine("[Router]   interface: a client's request at the WAN index, its answer at the LAN one. A transit");
+    Console.WriteLine("[Router]   packet Windows drops prints on neither leg, so the client's reply is the end-to-end");
+    Console.WriteLine($"[Router]   judge. [Trace v6net] = IPv6 addressed to this host arriving on the LAN (ifIdx {lan.IfIdx}),");
+    Console.WriteLine("[Router]   which is where a client reaching this process' own listener shows. No take= on these");
+    Console.WriteLine("[Router]   two: the main filter is `ip`, IPv4, so it takes no IPv6 packet - the v6 path is");
+    Console.WriteLine("[Router]   Windows' own forwarding plus the on-link route the delegated /64 install brings.");
     _ = Task.Run(() => Host.TraceLoop(traceHandle, cts.Token, traceCount, "fwd", true,
         lan.Addr, lan.Mask, lan.IfIdx, wan.IfIdx, table.IsMappedPort));
     _ = Task.Run(() => Host.TraceLoop(netTraceHandle, cts.Token, traceCount, "net", false,
         lan.Addr, lan.Mask, lan.IfIdx, wan.IfIdx, table.IsMappedPort));
+    _ = Task.Run(() => Host.TraceLoop(v6Sniffer, cts.Token, traceCount, "v6fwd", true,
+        lan.Addr, lan.Mask, lan.IfIdx, wan.IfIdx, table.IsMappedPort, v6: true));
+    _ = Task.Run(() => Host.TraceLoop(v6NetSniffer, cts.Token, traceCount, "v6net", false,
+        lan.Addr, lan.Mask, lan.IfIdx, wan.IfIdx, table.IsMappedPort, v6: true));
 }
 
 WinDivertHandle divert;
@@ -691,9 +935,91 @@ Console.WriteLine($"[Router] Reply leg: {replyFilter}");
 Console.WriteLine("[Router] Layer.Network, priority -50. Disjoint from the proxy's outbound filter, so the two");
 Console.WriteLine("[Router]   handles at this layer are never asked about the same packet.");
 
+// The IPv6 half of the host's own inbound, which the filter above cannot see: `ip` is IPv4, and the bound
+// below is an IPv4 clause. What this leg does is the rewrite and nothing else - no mapping is translated,
+// because IPv6 has none here - so it is bounded to the resolver's port rather than to a WAN address and a
+// mapped range. The server port is what names an answer, the same test DnsEch makes on the bytes.
+// It costs one open handle whether or not this host resolves over IPv6: a filter this narrow is offered
+// no traffic otherwise.
+var v6ReplyFilter = "inbound and ipv6 and (udp.SrcPort == 53 or tcp.SrcPort == 53) and not impostor";
+WinDivertHandle? v6Reply = null;
+try
+{
+    v6Reply = new WinDivertHandle(v6ReplyFilter, Layer.Network, -50, Flag.None);
+    v6ReplyHandle = v6Reply;
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"[Router] the IPv6 reply leg did not open ({ex.Message}); this host's own IPv6 " +
+                      "resolver answers keep their ech configuration");
+}
+if (v6Reply != null)
+    Console.WriteLine($"[Router] IPv6 reply leg: {v6ReplyFilter}");
+
+var v6ReplyReceived = 0L;
+var v6ReplyNeutralised = 0L;
+var v6ReplyPassthroughFailed = 0L;
+unsafe void ReplyLoopV6(WinDivertHandle leg)
+{
+    var packetBuf = Marshal.AllocHGlobal(MTU_MAX);
+    var addrBuf = Marshal.AllocHGlobal(ADDR_SIZE);
+    var budget = 20;
+    try
+    {
+        while (!cts.IsCancellationRequested)
+        {
+            int recvLen;
+            if (!leg.Recv((void*)packetBuf, MTU_MAX, &recvLen, (Address*)addrBuf))
+            {
+                if (cts.IsCancellationRequested) break;
+                continue;
+            }
+
+            var addr = (Address*)addrBuf;
+            var packet = new Span<byte>((void*)packetBuf, recvLen);
+            Interlocked.Increment(ref v6ReplyReceived);
+            // This host's own IPv6 resolver traffic is local delivery, so this leg is the only place its
+            // answers can be read - the DnsServer's own rewrite only covers what it serves to clients.
+            var neutralised = DnsEch.TryNeutralize(packet);
+            if (neutralised > 0)
+            {
+                Interlocked.Add(ref v6ReplyNeutralised, neutralised);
+                if (budget-- > 0)
+                    Console.WriteLine($"[Router] v6 {Host.Describe(packet)}: {neutralised} ech parameter(s) neutralised");
+                leg.CalcChecksums((void*)packetBuf, recvLen, addr);
+            }
+            // Unchanged or rewritten, the packet is handed back with the address it arrived on and no
+            // impostor flag, exactly as the v4 leg's passthrough branch does. A send that fails here loses
+            // a packet of the host's, so it is counted rather than ignored.
+            if (!leg.Send((void*)packetBuf, recvLen, null, addr))
+                Interlocked.Increment(ref v6ReplyPassthroughFailed);
+        }
+    }
+    catch (Exception ex)
+    {
+        // The same rule as the v4 leg: this handle queues the host's own inbound answers, so a loop that
+        // has died silently is a blackout with no message.
+        Console.WriteLine($"[Router] IPv6 reply leg failed: {ex.GetType().Name}: {ex.Message}");
+        Abort();
+    }
+    finally
+    {
+        leg.Shutdown(ShutdownMode.Recv);
+        // Printed here because a leg that saw nothing and a leg that saw answers with no ech parameter
+        // otherwise end with the same silence - the arrival count is what says the handle was live.
+        Console.WriteLine($"[Router] IPv6 reply leg: recv={Interlocked.Read(ref v6ReplyReceived)} " +
+                          $"neutralised={Interlocked.Read(ref v6ReplyNeutralised)} " +
+                          $"passthroughfail={Interlocked.Read(ref v6ReplyPassthroughFailed)}");
+        Marshal.FreeHGlobal(packetBuf);
+        Marshal.FreeHGlobal(addrBuf);
+    }
+}
+if (v6Reply is { } v6ReplyLeg) _ = Task.Run(() => ReplyLoopV6(v6ReplyLeg), cts.Token);
+
 var replyReceived = 0L;
 var replyPassthroughFailed = 0L;
 var replyRewriteFailed = 0L;
+var replyV6Failed = 0L;
 unsafe void ReplyLoop()
 {
     var packetBuf = Marshal.AllocHGlobal(MTU_MAX);
@@ -732,6 +1058,45 @@ unsafe void ReplyLoop()
             if (neutralised > 0 && budget-- > 0)
                 Console.WriteLine($"[Router] {Host.Describe(packet)}: {neutralised} ech parameter(s) neutralised");
             var before = budget > 0 ? Host.Describe(packet) : null;
+            // The two tables answer on one interface address, so the port that names a reply has exactly one
+            // owner between them - which is what each allocator was shown the other's claims for. Asked here,
+            // before the IPv4 NAT sees the packet, because its own reply branch finds no mapping for it and
+            // would hand the answer to a stack with nothing listening on that port.
+            Nat64Outcome? v6Answer = nat64 is { } stateful46 && stateful46.OwnsDatagram(packet)
+                ? stateful46.Translate(packet, natPath)
+                : null;
+            if (v6Answer is Nat64Outcome a46)
+            {
+                if (a46.Action == Nat64Action.Translate)
+                {
+                    // Twenty octets longer than what arrived, the only direction here that grows a packet; the
+                    // buffer was sized for 40 + 65535 because of it. Checksums first, because the IPv6 one
+                    // covers the pseudo-header this rewrite changed, then the impostor flag for the same reason
+                    // the branch below sets it: this copy is put back by a handle rather than arriving from the
+                    // wire, and without the flag the forward-layer handle meets it on its way out to the client.
+                    var out6 = a46.Packet!;
+                    Marshal.Copy(out6, 0, packetBuf, out6.Length);
+                    leg.CalcChecksums((void*)packetBuf, out6.Length, addr);
+                    var after6 = Host.Describe(new Span<byte>((void*)packetBuf, out6.Length));
+                    addr->Flags |= AddressFlag.Impostor;
+                    var sent6 = leg.Send((void*)packetBuf, out6.Length, null, addr);
+                    if (!sent6 && Interlocked.Increment(ref replyV6Failed) == 1)
+                        Console.WriteLine($"[Router] NAT64 46 reinjection failed, error {Marshal.GetLastWin32Error()}");
+                    if (budget-- > 0)
+                        Console.WriteLine($"[Router] NAT64 46 {before} => {after6} " +
+                                          $"ifIdx={addr->IfIdx} sent={sent6}");
+                    continue;
+                }
+                if (a46.Action == Nat64Action.Discard)
+                {
+                    if (budget-- > 0)
+                        Console.WriteLine($"[Router] NAT64 discarded: {a46.Reason} {Host.Describe(packet)}");
+                    continue;
+                }
+                // None: the reverse key named a binding on the first read and not on the second, which is the
+                // sweep running between them. Left for the IPv4 NAT below, which is what this leg does for
+                // anything neither table claims.
+            }
             // The arrival interface, which is what the network layer's address documents. Translate does
             // not read it for these packets: every one of them is addressed to the WAN side, so the reply
             // branch decides on the addresses alone.
@@ -799,6 +1164,11 @@ using (divert)
     // otherwise read as "no packet arrived" when it means "the packet was eaten here".
     var passthroughFailed = 0;
     var rewriteFailed = 0;
+    // The same two failures on the IPv6 leg of --nat64, kept apart from the pair above because they say
+    // different things: these ones cost a dual-stack flow that nothing here was supposed to touch, so a
+    // run that shows them non-zero is a run where the widened filter disturbed the plain v6 path.
+    var v6PassthroughFailed = 0;
+    var v6RewriteFailed = 0;
     // Counted separately from every decision below it: with only the action counters, "the filter took
     // nothing" and "the decision tree declined everything" print the same line.
     var received = 0;
@@ -823,6 +1193,10 @@ using (divert)
         {
             await Task.Delay(TimeSpan.FromSeconds(5), cts.Token).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
             table.Sweep();
+            // Its own sweep on the same clock. RFC 6146 §4.4's TCP timers run to 124 minutes, so a table that
+            // is only swept when the IPv4 one happens to need it would hold a binding - and the port under it -
+            // for longer than the specification lets it.
+            nat64?.Sweep();
 
             // The other half of these five seconds. A WAN that renews its lease changes both what a SNAT
             // writes and what the reply leg's filter names, and a source the interface no longer owns is a
@@ -872,6 +1246,10 @@ using (divert)
             // against the address it came to, so the new filter must never be the only half that moved.
             var previous = table.WanAddress;
             table.SetWanAddress(current.Addr);
+            // The same source follows on the other table: §5.2's mapping is endpoint-independent, so nothing
+            // keyed on the address moves, but the next packet of every live flow is written with the new one -
+            // and OwnsDatagram's test that a reply came to this table's address is read against it too.
+            nat64?.SetWanAddress(System.Net.IPAddress.Parse(NatTable.FormatAddress(current.Addr)));
             var old = Interlocked.Exchange(ref reply, opened);
             old.Shutdown(ShutdownMode.Recv);
             Console.WriteLine($"[Router] WAN address {NatTable.FormatAddress(previous)} -> " +
@@ -892,13 +1270,27 @@ using (divert)
                               $"fragmap={table.FragmentRewrites} " +
                               $"otherproto={table.UnmappedProtocol} icmperr={table.IcmpErrors} " +
                               $"icmpdrop={table.IcmpErrorsDropped} passthroughfail={passthroughFailed} " +
-                              $"rewritefail={rewriteFailed}");
+                              $"rewritefail={rewriteFailed} heldskip={table.PortHeld}" +
+                              // v6passthroughfail is the one that matters for the plain path: it counts a dual-stack
+                              // flow this program took and could not put back, so a run with --nat64 that leaves it
+                              // at zero is a run where widening the filter cost the IPv6 route nothing.
+                              (nat64 is null ? "" :
+                                  $" v6passthroughfail={v6PassthroughFailed} v6rewritefail={v6RewriteFailed} " +
+                                  $"nat64 out={nat64.Translated64} in={nat64.Translated46} bib={nat64.BindingCount} " +
+                                  $"ste={nat64.SessionCount} frag={nat64.FragmentRecordCount} " +
+                                  $"hair={nat64.Hairpins} nohit={nat64.NoBinding} filt={nat64.Filtered} " +
+                                  $"exh={nat64.Exhausted} fragreuse={nat64.FragmentReuses} fragno={nat64.FragmentRefused}"));
             // On its own line because dnat can only come from this leg now: a packet addressed to this
             // host's WAN address is local delivery, so the forward handle is never offered one.
             Console.WriteLine($"[Router] reply recv={replyReceived} passthroughfail={replyPassthroughFailed} " +
-                              $"rewritefail={replyRewriteFailed}");
+                              $"rewritefail={replyRewriteFailed}" +
+                              (nat64 is null ? "" : $" nat64fail={replyV6Failed}"));
         }
     });
+
+    // One thread for the PD client and the advertisements, started where nothing below can return early
+    // without reaching the shutdown below.
+    Task? v6Task = v6 is { } v6Router ? Task.Run(() => v6Router.Run(cts.Token)) : null;
 
     try
     {
@@ -916,6 +1308,53 @@ using (divert)
 
                 var addr = (Address*)addrBuf;
                 var packet = new Span<byte>((void*)packetBuf, recvLen);
+                // IPv6 reaches this line only with --nat64, which is what widened the filter above to ask
+                // about it: the stateful PLAT decides per packet, and a v6 datagram aimed at an address
+                // inside the Pref64::/n is a client asking for an IPv4-only server. Everything the table
+                // does not take goes back untouched for Windows' own forwarding, which is the path this run
+                // must leave undisturbed. The version test is also what keeps DnsEch off these bytes: it
+                // reads the IPv4 header's length field, and a v6 traffic class would be read as one.
+                if (nat64 is { } stateful && recvLen >= 40 && packet[0] >> 4 == 6)
+                {
+                    var v6Before = logBudget > 0 ? Host.Describe(packet) : null;
+                    var sixToFour = stateful.Translate(packet, natPath);
+                    if (sixToFour.Action == Nat64Action.Discard)
+                    {
+                        // Not put back, the same reading of RFC 5508 REQ-4 the IPv4 branch below works from:
+                        // §3.5's filters and §3.4's gates say the packet is dropped, and a drop that prints
+                        // nothing is indistinguishable from a client that never sent it.
+                        if (logBudget-- > 0)
+                            Console.WriteLine($"[Router] NAT64 discarded: {sixToFour.Reason} {Host.Describe(packet)}");
+                        continue;
+                    }
+                    if (sixToFour.Action == Nat64Action.None)
+                    {
+                        // Untouched, so no checksum work and no impostor flag: the stack sees what it would
+                        // have seen without this program. Counted on its own because the flow this loses is a
+                        // dual-stack one, and a shared counter would read as a broken IPv4 passthrough.
+                        if (!divert.Send((void*)packetBuf, recvLen, null, addr))
+                        {
+                            if (++v6PassthroughFailed == 1)
+                                Console.WriteLine($"[Router] NAT64 passthrough reinjection failed, error {Marshal.GetLastWin32Error()}: {Host.Describe(packet)}");
+                        }
+                        continue;
+                    }
+                    // Usually twenty octets shorter than what arrived: the 40-octet fixed header and any
+                    // extension headers the SIIT walk stepped over become a 20-octet IPv4 one. Not always - a
+                    // hairpin (§3.8, a client addressing another client's mapped port through the prefix) is
+                    // translated twice inside one call and comes back IPv6 - so the length written into the
+                    // driver's buffer is the translated one and never recvLen, and the bytes past it are stale.
+                    var out64 = sixToFour.Packet!;
+                    Marshal.Copy(out64, 0, packetBuf, out64.Length);
+                    divert.CalcChecksums((void*)packetBuf, out64.Length, addr);
+                    var v6After = Host.Describe(new Span<byte>((void*)packetBuf, out64.Length));
+                    var v6Sent = divert.Send((void*)packetBuf, out64.Length, null, addr);
+                    if (!v6Sent && ++v6RewriteFailed == 1)
+                        Console.WriteLine($"[Router] NAT64 64 reinjection failed, error {Marshal.GetLastWin32Error()}");
+                    if (logBudget-- > 0)
+                        Console.WriteLine($"[Router] NAT64 64 {v6Before} => {v6After} ifIdx={addr->IfIdx} sent={v6Sent}");
+                    continue;
+                }
                 // A client's own resolver answer, or one that bypasses this host's resolver, is transport
                 // here; the server port is what names it, so the rewrite runs before Translate writes the
                 // mapped one over it. See DnsEch.
@@ -986,26 +1425,44 @@ using (divert)
         Marshal.FreeHGlobal(lenBuf);
         sniffer?.Dispose();
         netSniffer?.Dispose();
+        v6Sniffer?.Dispose();
+        v6NetSniffer?.Dispose();
         dhcpSocket?.Dispose();
         dnsSocket?.Dispose();
         dnsTcp?.Stop();
         upstreamSocket?.Dispose();
+        // Before the summary line, so "stopped" is only printed once the Release has gone out and the LAN
+        // address the delegation installed has been taken back. Cancelling here rather than relying on the
+        // interrupt handler covers every other way this block can end.
+        cts.Cancel();
+        v6Task?.Wait(TimeSpan.FromSeconds(10));
     }
 }
 
-if (lanRuleOwned)
-{
-    InboundFirewall.Remove(LanRuleName);
-    Console.WriteLine($"[Router] '{LanRuleName}' removed again");
-}
-if (dnsTcpRuleOwned)
-{
-    InboundFirewall.Remove(DnsTcpRuleName);
-    Console.WriteLine($"[Router] '{DnsTcpRuleName}' removed again");
-}
+ReleaseLanRules(quiet: false);
 
 Console.WriteLine($"[Router] Stopped. snat={table.Snats} dnat={table.Dnats}");
 return 0;
+
+// Each name is only this program's to take back if this run put it in, which is what the two flags record:
+// a rule the operator made by hand is left alone. The exchange makes it one release per process, because the
+// close signal runs this on its own thread while Main may still be on its way to its own call.
+void ReleaseLanRules(bool quiet)
+{
+    if (Interlocked.Exchange(ref lanRulesReleased, 1) != 0) return;
+    if (lanRuleOwned)
+    {
+        InboundFirewall.Remove(LanRuleName);
+        lanRuleOwned = false;
+        if (!quiet) Console.WriteLine($"[Router] '{LanRuleName}' removed again");
+    }
+    if (dnsTcpRuleOwned)
+    {
+        InboundFirewall.Remove(DnsTcpRuleName);
+        dnsTcpRuleOwned = false;
+        if (!quiet) Console.WriteLine($"[Router] '{DnsTcpRuleName}' removed again");
+    }
+}
 
 sealed class TimestampWriter : TextWriter
 {

@@ -28,6 +28,7 @@ var initCa = args.Contains("--init-ca");
 var rootPath = Option("--root");
 var rootThumbprint = Option("--root-thumbprint");
 var lanText = Option("--lan");
+var lan6Text = Option("--lan6");
 var allowRelayIn = args.Contains("--allow-relay-in");
 var pids = ParseInts(Option("--pid"), "--pid");
 var includeImages = ParseNames(Option("--process"));
@@ -48,7 +49,7 @@ Console.WriteLine("[Main] Usage: dotnet run [--emsign | --emsign-only | --rotate
 Console.WriteLine("[Main]                          [--init-ca | --root <pfx> | --root-thumbprint <thumbprint>]");
 Console.WriteLine("[Main]                          [--pid <pid,...> | --exclude-pid <pid,...>]");
 Console.WriteLine("[Main]                          [--process <exe,...> | --exclude-process <exe,...>]");
-Console.WriteLine("[Main]                          [--lan <ipv4> [--allow-relay-in]]");
+Console.WriteLine("[Main]                          [--lan <ipv4> [--lan6 <ipv6>] [--allow-relay-in]]");
 Console.WriteLine("[Main]   --emsign      pick the chain per client process; a client with no PID gets emSign");
 Console.WriteLine("[Main]   --emsign-only force the emSign chain for every client");
 Console.WriteLine("[Main]   --rotate      rotate between the Fiddler root and the emSign intermediates");
@@ -58,6 +59,7 @@ Console.WriteLine("[Main]   --root        sign with this PFX (password from TLSM
 Console.WriteLine("[Main]   --pid / --process  intercept only these client processes (pid or executable)");
 Console.WriteLine("[Main]   --exclude-pid / --exclude-process  intercept everything except these client processes");
 Console.WriteLine("[Main]   --lan         also intercept TCP forwarded to clients on this address's subnet");
+Console.WriteLine("[Main]   --lan6        also intercept forwarded IPv6, whose packets are delivered to this address");
 Console.WriteLine("[Main]   --allow-relay-in  add the inbound allow rule the relay port needs for --lan, and remove it on exit");
 Console.WriteLine();
 
@@ -109,6 +111,25 @@ if (lanText != null)
 {
     lan = LanSide.Resolve(lanText);
     if (lan == null) Environment.Exit(2);
+    if (lan6Text is { } sixth)
+    {
+        var side = LanSideV6.Resolve(sixth);
+        if (side is null) Environment.Exit(2);
+        lan = lan with { V6 = side };
+    }
+    else if (LanSideV6.HeldOn(lan.IfIdx) is { } held)
+    {
+        // Said here rather than left to a silent v6 leg: without --lan6 the firewall entry, the QUIC
+        // block and every forwarded v6 flow are out of scope, and the run would look like one whose
+        // client simply never used v6.
+        Console.WriteLine($"[Main] ifIdx {lan.IfIdx} also holds {held}; pass --lan6 {held} to intercept " +
+                          "forwarded IPv6, which is left alone without it");
+    }
+}
+else if (lan6Text != null)
+{
+    Console.WriteLine("[Main] --lan6 concerns a client forwarded from the LAN, so it needs --lan");
+    Environment.Exit(2);
 }
 
 var scope = new ProcessFilter(pids, includeImages, excludedPids, excludedImages);
@@ -123,19 +144,50 @@ if (lan != null && scope.IsActive)
 // first byte. The probe below asks the stack whether that filter is up; the rule store is only asked to
 // hold the rule this run names, never to decide reachability.
 var relayRuleOwned = false;
+// Set once by whichever release path runs first - Main's own end or the console close handler below, which
+// arrives on a thread of its own while this one is still running.
+var relayRulesReleased = 0;
+
+// Registered before anything is added, because the store call that adds a rule takes a few hundred
+// milliseconds and a close landing in that window would otherwise end the run with the rule in and no one
+// left to take it out. The close that no exit handler sees gets a Win32 control handler instead;
+// ConsoleClose carries the measurements that make it worth having - its own thread, about 5 s of it, and the
+// firewall call working from there. Quiet, because the run is ending while this runs, and the store's count
+// is the witness.
+if (!ConsoleClose.Register(() => ReleaseRelayRule(quiet: true)))
+    Console.WriteLine("[Main] no console control handler could be registered (no console attached); " +
+                      "closing this window leaves the rule in the store for the next run to report");
+
 if (lan != null)
 {
     Console.WriteLine($"[Main] Firewall: {InboundFirewall.EnabledState()}");
     if (InboundFirewall.Exists(RelayRuleName))
-        Console.WriteLine($"[Main] '{RelayRuleName}' is already in the store; left in place, and not removed on exit");
+    {
+        // Left in place because README names this display name for a hand-made persistent rule too, so this
+        // program cannot tell its own residue from the operator's choice. What does strand a rule here is
+        // taskkill /F: measured 2026-11-02, it delivers no notification of any kind - no signal, no handler,
+        // no chance to answer - so the residue is reachable only from the next start, and the line says what
+        // clears it.
+        Console.WriteLine($"[Main] '{RelayRuleName}' is already in the store; left in place, and not removed on exit. " +
+                          $"If it is what a killed run left behind: Remove-NetFirewallRule -DisplayName '{RelayRuleName}'");
+    }
     else if (allowRelayIn)
     {
-        relayRuleOwned = InboundFirewall.Add(RelayRuleName,
-            "Inbound connections to TlsMitm's relay port, which a redirected flow reaches from its server's address",
-            InboundFirewall.ProtoTcp, ProxyPort.ToString());
-        Console.WriteLine(relayRuleOwned
-            ? $"[Main] Added '{RelayRuleName}' for TCP {ProxyPort}; removed when this run ends"
-            : $"[Main] --allow-relay-in did not put '{RelayRuleName}' in the store (needs elevation)");
+        // A close that lands while this run is still starting up has already released, and nothing runs after
+        // the process dies: adding now would strand the rule with no one left to take it out.
+        if (Volatile.Read(ref relayRulesReleased) != 0)
+        {
+            Console.WriteLine($"[Main] '{RelayRuleName}' not added: this run's rule was already released by a close");
+        }
+        else
+        {
+            relayRuleOwned = InboundFirewall.Add(RelayRuleName,
+                "Inbound connections to TlsMitm's relay port, which a redirected flow reaches from its server's address",
+                InboundFirewall.ProtoTcp, ProxyPort.ToString());
+            Console.WriteLine(relayRuleOwned
+                ? $"[Main] Added '{RelayRuleName}' for TCP {ProxyPort}; removed when this run ends"
+                : $"[Main] --allow-relay-in did not put '{RelayRuleName}' in the store (needs elevation)");
+        }
     }
 }
 else if (allowRelayIn)
@@ -234,11 +286,7 @@ if (lan != null)
                 Console.WriteLine($"[Main]                  -Protocol TCP -LocalPort {ProxyPort} -Action Allow -Profile Any");
                 Console.WriteLine("[Main]   or re-run with --allow-relay-in (needs elevation, removed again when the run ends).");
             }
-            if (relayRuleOwned)
-            {
-                InboundFirewall.Remove(RelayRuleName);
-                relayRuleOwned = false;
-            }
+            ReleaseRelayRule(quiet: true);
             return 1;
         }
     }
@@ -253,13 +301,21 @@ catch (OperationCanceledException)
 }
 
 Console.WriteLine("[Main] Stopping...");
-if (relayRuleOwned)
-{
-    InboundFirewall.Remove(RelayRuleName);
-    Console.WriteLine($"[Main] '{RelayRuleName}' removed with it; the port is filtered inbound again");
-}
+ReleaseRelayRule(quiet: false);
 
 return 0;
+
+// The name is only this program's to take back if this run put it in, which is what the flag records: a rule
+// the operator made by hand is left alone. The exchange makes it one release per process, because the close
+// signal runs this on its own thread while Main may still be on its way to its own call.
+void ReleaseRelayRule(bool quiet)
+{
+    if (Interlocked.Exchange(ref relayRulesReleased, 1) != 0) return;
+    if (!relayRuleOwned) return;
+    InboundFirewall.Remove(RelayRuleName);
+    relayRuleOwned = false;
+    if (!quiet) Console.WriteLine($"[Main] '{RelayRuleName}' removed with it; the port is filtered inbound again");
+}
 
 List<EmSignCa> LoadEmSignCas()
 {

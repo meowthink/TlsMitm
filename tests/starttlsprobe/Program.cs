@@ -29,10 +29,17 @@ async Task<int> RunModeAsync(string mode)
     // A "live-ftps" mode points the proxy's upstream leg at a real server instead of the fake one. The
     // control leg still runs through the proxy, so everything the product does to a session - implicit
     // TLS detection, the leaf, the two pumps - stays under test; only the redirector is taken out.
-    var liveHost = mode == "live-ftps" ? "sft.rohdentVariable(" : null;
-    const int livePort = 990;
-    var livePath = "/";
+    // Which server, and which file to ask for, comes from the environment: the mode needs an account on
+    // the host, so the person running it names one they have, and curl reads it from .netrc.
+    var liveHost = mode == "live-ftps" ? Environment.GetEnvironmentVariable("TLSMITM_LIVE_FTPS_HOST") : null;
+    var livePort = int.Parse(Environment.GetEnvironmentVariable("TLSMITM_LIVE_FTPS_PORT") ?? "990");
+    var livePath = Environment.GetEnvironmentVariable("TLSMITM_LIVE_FTPS_PATH") ?? "/";
     var isLive = liveHost != null;
+    if (mode == "live-ftps" && liveHost == null)
+    {
+        Console.WriteLine("[Probe] live-ftps: SKIPPED, set TLSMITM_LIVE_FTPS_HOST to a FTPS server you can log into");
+        return 0;
+    }
 
     Console.WriteLine($"[Probe] mode={mode}");
 
@@ -79,7 +86,7 @@ async Task<int> RunModeAsync(string mode)
         // legacy eMSign root before completing the handshake.
         var acceptCount = mode == "auto" ? 2
             : mode == "mtls-refused" ? 2
-            : mode is "grease" or "rootcheck" or "handshake-abort" or "filter" ? 0 : 1;
+            : mode is "grease" or "rootcheck" or "handshake-abort" or "filter" or "early-refuse" ? 0 : 1;
         for (var i = 0; i < acceptCount; i++)
         {
         using var accepted = await listener.AcceptTcpClientAsync();
@@ -113,7 +120,7 @@ async Task<int> RunModeAsync(string mode)
             case "implicit":
             case "implicit-ip":
             case "ipv6":
-            // alpn-fallback: the upstream is a server with no ALPN at all, exach edge.
+            // alpn-fallback: the upstream selects no ALPN, which is what a measured search edge does.
             case "alpn-fallback": await ServeImplicitAsync(stream, upstreamCert); break;
             case "emsign": await ServeOptionalImplicitAsync(stream, upstreamCert); break;
             case "auto":
@@ -219,6 +226,12 @@ async Task<int> RunModeAsync(string mode)
             // Scoping is decided in the redirector before any socket exists, so it is judged here
             // without traffic: only the decision table needs to be right, not a handshake.
             CheckProcessFilter(notes, failures);
+        }
+        else if (mode == "early-refuse")
+        {
+            // Not the proxy: this measures the terminator the proxy hands a session to, because the
+            // question is whether that stack can be given a hello offering early data at all.
+            await CheckEarlyRefuseAsync(upstreamCert, notes, failures);
         }
         else if (mode is "ech-relay" or "ech-downgrade")
         {
@@ -1388,9 +1401,10 @@ async Task<int> RunModeAsync(string mode)
             failures.Add($"live-ftps: the control leg did not reach PASV: '{stdout}' err='{stderr}'");
     }
 
-    // A 0-RTT first flight: a ClientHello offering a PSK plus early_data, then the application data the
-    // client sent before the handshake finished. Neither is readable by the proxy, so what is under test is
-    // that the real server receives both byte for byte and the client still gets its reply back.
+    // A resumption that allows no ECDHE fallback: the hello offers a PSK, early_data, and psk_ke(0) alone,
+    // the mode RFC 9846 §4.3.9 gives no server key_share, so there is no ephemeral secret for a proxy to
+    // obtain and the session goes blind. What is under test is that the real server receives the flight -
+    // the hello and the records behind it - byte for byte, and that the client still gets its reply back.
     static byte[] BuildEarlyDataFlight()
     {
         static void U16(Stream s, int v) { s.WriteByte((byte)(v >> 8)); s.WriteByte((byte)v); }
@@ -1406,7 +1420,9 @@ async Task<int> RunModeAsync(string mode)
         sni.Write(name);
         Ext(ext, 0x0000, sni.ToArray());
         Ext(ext, 0x002b, new byte[] { 4, 0x03, 0x04, 0x03, 0x03 });
-        Ext(ext, 0x002d, new byte[] { 1, 0x01 });
+        // psk_ke(0): in this mode RFC 9846 §4.3.9 has the server supply no key_share at all, so no
+        // ephemeral secret exists for a proxy to obtain and the session has nothing to be terminated with.
+        Ext(ext, 0x002d, new byte[] { 1, 0x00 });
 
         var identity = Encoding.ASCII.GetBytes("ticket-1");
         var psk = new MemoryStream();
@@ -1450,6 +1466,390 @@ async Task<int> RunModeAsync(string mode)
         return flight.ToArray();
     }
 
+    // The same first flight, but well-formed enough for a real stack to answer: a key_share so that a full
+    // handshake is possible, supported_groups and signature_algorithms lists, a 32-byte legacy session
+    // identifier, and the pre_shared_key extension last in the list where the protocol puts it. The binder
+    // is 32 bytes the server cannot make sense of, so the only handshake left is the full one.
+    // psk adds only the pre_shared_key extension (the key-exchange-modes list is in every one of these hellos,
+    // so the legs differ by one extension each), and earlyData adds the empty early_data extension plus the
+    // records a client sends before the handshake is over.
+    static byte[] BuildEarlyDataHello(bool earlyData, bool psk)
+    {
+        static void U16(Stream s, int v) { s.WriteByte((byte)(v >> 8)); s.WriteByte((byte)v); }
+        static void Ext(Stream s, int type, byte[] data) { U16(s, type); U16(s, data.Length); s.Write(data); }
+        static byte[] GroupList(params int[] groups)
+        {
+            var m = new MemoryStream();
+            U16(m, groups.Length * 2);
+            foreach (var g in groups) U16(m, g);
+            return m.ToArray();
+        }
+
+        var name = Encoding.ASCII.GetBytes("probe.test");
+        var ext = new MemoryStream();
+
+        var sni = new MemoryStream();
+        U16(sni, 3 + name.Length);
+        sni.WriteByte(0);
+        U16(sni, name.Length);
+        sni.Write(name);
+        Ext(ext, 0x0000, sni.ToArray());
+        Ext(ext, 0x000a, GroupList(0x0017));
+        Ext(ext, 0x000d, GroupList(0x0804, 0x0403, 0x0401));
+        Ext(ext, 0x002b, new byte[] { 4, 0x03, 0x04, 0x03, 0x03 });
+        Ext(ext, 0x002d, new byte[] { 1, 0x01 });
+
+        var shares = new MemoryStream();
+        // A real key_share rather than a block of zeros, because a share the server cannot use is answered the
+        // same way an extension it dislikes is. P-256 is the curve this framework will hand out coordinates
+        // for; listing it in supported_groups too keeps the server from picking a group this hello has no
+        // share for.
+        using (var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256))
+        {
+            var point = ecdh.ExportParameters(false).Q;
+            var x = point.X!;
+            var y = point.Y!;
+            var key = new byte[1 + x.Length + y.Length];
+            key[0] = 4;
+            x.CopyTo(key, 1);
+            y.CopyTo(key, 1 + x.Length);
+            U16(shares, 2 + 2 + key.Length);
+            U16(shares, 0x0017);
+            U16(shares, key.Length);
+            shares.Write(key);
+        }
+        Ext(ext, 0x0033, shares.ToArray());
+        if (earlyData) Ext(ext, 0x002a, Array.Empty<byte>());
+
+        if (psk)
+        {
+            var identity = Encoding.ASCII.GetBytes("ticket-1");
+            var pskExt = new MemoryStream();
+            U16(pskExt, 2 + identity.Length + 4);
+            U16(pskExt, identity.Length);
+            pskExt.Write(identity);
+            pskExt.Write(new byte[4]);
+            U16(pskExt, 1 + 32);
+            pskExt.WriteByte(32);
+            pskExt.Write(new byte[32]);
+            Ext(ext, 0x0029, pskExt.ToArray());
+        }
+
+        var body = new MemoryStream();
+        U16(body, 0x0303);
+        body.Write(new byte[32]);
+        body.WriteByte(32);
+        body.Write(new byte[32]);
+        U16(body, 2);
+        U16(body, 0x1301);
+        body.WriteByte(1);
+        body.WriteByte(0);
+        var extBytes = ext.ToArray();
+        U16(body, extBytes.Length);
+        body.Write(extBytes);
+        var hello = body.ToArray();
+
+        var flight = new MemoryStream();
+        flight.WriteByte(22);
+        U16(flight, 0x0301);
+        U16(flight, hello.Length + 4);
+        flight.WriteByte(1);
+        flight.WriteByte(0);
+        U16(flight, hello.Length);
+        flight.Write(hello);
+
+        // RFC 9846 Appendix E.4's dummy record, then the request sent before the handshake finished. Only an
+        // early-data client puts records behind its hello, so the control legs stop at the hello itself: a
+        // plaintext application record in a handshake that never offered 0-RTT would be refused for a reason
+        // that has nothing to do with what these legs are asking.
+        if (earlyData)
+        {
+            flight.Write([20, 0x03, 0x03, 0x00, 0x01, 0x01]);
+            var payload = Encoding.ASCII.GetBytes("GET / HTTP/1.1\r\nHost: probe.test\r\n\r\n");
+            flight.WriteByte(23);
+            U16(flight, 0x0303);
+            U16(flight, payload.Length);
+            flight.Write(payload);
+        }
+        return flight.ToArray();
+    }
+
+    // Each leg is a control for the next, on the socket the proxy's own terminator options would be built
+    // with. A hand-written ClientHello that a stack would refuse whatever it carried would make every later
+    // verdict about the encoding rather than about early data, so the first leg has neither a PSK identity
+    // nor an early_data extension and has to get an answer out. The last two legs differ only in whether the
+    // records behind the hello reach the terminator, which is the one thing a relay here could choose to do.
+    // The client never sends a Finished, so what is read is the terminator's own first flight on the wire:
+    // a ServerHello in it means the hello was accepted and the full handshake chosen, which is what refusing
+    // 0-RTT would have to look like.
+    static async Task CheckEarlyRefuseAsync(X509Certificate2 cert, List<string> notes, List<string> failures)
+    {
+        var legs = new (string Label, byte[] Flight, bool Withhold)[]
+        {
+            ("plain hello", BuildEarlyDataHello(false, false), false),
+            ("hello with an unusable psk identity", BuildEarlyDataHello(false, true), false),
+            ("early_data offered, early records given to the terminator", BuildEarlyDataHello(true, true), false),
+            ("early_data offered, early records kept off the terminator", BuildEarlyDataHello(true, true), true),
+        };
+
+        // SChannel first, with a client that completes its own handshake: whether this host's SChannel can
+        // negotiate 1.3 at all decides if the synthetic 1.3 hellos below mean anything for it. A 1.2-only
+        // client runs alongside as the control that the certificate and options are workable, because a bare
+        // "no Tls13" would otherwise be indistinguishable from a broken listener.
+        var tls13 = await CheckRealClientAsync(SslProtocols.Tls13, cert);
+        var tls12 = await CheckRealClientAsync(SslProtocols.Tls12, cert);
+        notes.Add($"early-refuse(schannel, real client asked only for 1.3): {tls13}");
+        notes.Add($"early-refuse(schannel, real client asked only for 1.2): {tls12}");
+        if (!tls12.Contains("established Tls12", StringComparison.Ordinal))
+            failures.Add($"early-refuse(schannel): the 1.2 control leg did not establish ('{tls12}'), " +
+                         "so this harness has no working server side to test against");
+
+        // The verdict each leg's terminator returned, kept for the comparison of the two early_data shapes.
+        var byWire = new Dictionary<string, string>();
+
+        foreach (var terminator in new[] { "schannel", "openssl" })
+        {
+            if (terminator == "schannel" && !tls13.Contains("established Tls13", StringComparison.Ordinal))
+            {
+                notes.Add("early-refuse(schannel): skipped, this host's SChannel does not negotiate TLS 1.3 " +
+                          "even with a client that completes the handshake, so it never sees a 1.3 hello to refuse");
+                continue;
+            }
+
+            foreach (var (label, flight, withhold) in legs)
+            {
+                using var probe = new TcpListener(IPAddress.Loopback, 0);
+                probe.Start();
+                var port = ((IPEndPoint)probe.LocalEndpoint).Port;
+                var serverTask = Task.Run(async () =>
+                {
+                    using var accepted = await probe.AcceptTcpClientAsync();
+                    var inner = accepted.GetStream();
+                    // For the OpenSSL terminator the hello goes in through the replay argument the proxy
+                    // already has it in, so nothing may be left in the socket for it to read twice: a second
+                    // copy of the hello arrives after the handshake keys are up, which libssl reports as a
+                    // record-layer error whatever the leg was meant to be measuring. SChannel reads the hello
+                    // off the stream itself, so there the withheld shape is the stream that hands on one
+                    // record and drops the rest.
+                    Stream transport = terminator == "openssl"
+                        ? new FirstRecordStream(inner, 0)
+                        : withhold ? new FirstRecordStream(inner, 1) : inner;
+                    var replay = terminator == "openssl" && withhold ? FirstRecord(flight) : flight;
+                    try
+                    {
+                        if (terminator == "openssl")
+                        {
+                            using var stream = await OpenSslServerStream
+                                .AcceptAsync(transport, replay, cert, null, null, CancellationToken.None)
+                                .WaitAsync(TimeSpan.FromSeconds(8));
+                            return $"established, ALPN '{stream.NegotiatedProtocol}'";
+                        }
+                        using var ssl = new SslStream(transport, false);
+                        await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                        {
+                            ServerCertificate = cert,
+                            ClientCertificateRequired = false,
+                            EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                            CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+                        }).WaitAsync(TimeSpan.FromSeconds(8));
+                        return $"established {ssl.SslProtocol}";
+                    }
+                    catch (Exception ex)
+                    {
+                        return $"{ex.GetType().Name}: {ex.Message}";
+                    }
+                });
+
+                using var tcp = new TcpClient();
+                await tcp.ConnectAsync(IPAddress.Loopback, port);
+                var net = tcp.GetStream();
+                await net.WriteAsync(flight);
+                await net.FlushAsync();
+                var buf = new byte[16384];
+                var seen = "";
+                try
+                {
+                    var n = await net.ReadAsync(buf).AsTask().WaitAsync(TimeSpan.FromSeconds(8));
+                    seen = n == 0 ? "closed with no record" : DescribeRecords(buf.AsSpan(0, n));
+                }
+                catch (TimeoutException)
+                {
+                    seen = "nothing within 8s";
+                }
+
+                // The terminator is still waiting for a Finished this client will never send, and closing the
+                // socket at once would answer "what does it do with the records behind the hello" with
+                // "nothing, the peer went away". So let it read what it has before the leg ends.
+                await Task.Delay(TimeSpan.FromSeconds(2));
+                tcp.Close();
+                var verdict = await serverTask;
+                byWire[$"{terminator}/{label}"] = verdict;
+                notes.Add($"early-refuse({terminator}, {label}): terminator said '{verdict}'; " +
+                          $"the flight it sent back was {seen}");
+                if (seen == "nothing within 8s" || seen == "closed with no record")
+                    failures.Add($"early-refuse({terminator}, {label}): the client leg saw '{seen}' " +
+                                 $"for a {flight.Length}-byte flight");
+
+                // A ServerHello out of the plain hello is the anchor: it says this listener, certificate and
+                // encoding are workable, so any refusal after it is about what the later hello carries. The
+                // two branches a server may take with a PSK it was handed are both legal - RFC 8446 §4.2.11
+                // has an unknown identity "simply be ignored" and the server "perform a non-PSK handshake if
+                // possible", and the same section has it abort where a binder "is not present or does not
+                // validate", which Appendix E.6 notes implementations do. libssl takes the first branch. The
+                // Schannel on the CI image (windows-2025-vs2026, measured 2026-11-02) sends a fatal alert for
+                // all three of these hellos while answering the plain one, so a refusal here is a recorded
+                // verdict about that build and not a fault of this harness.
+                if (label == "plain hello" && !seen.Contains(":msg2", StringComparison.Ordinal))
+                    failures.Add($"early-refuse({terminator}, {label}): no ServerHello came out ('{verdict}', {seen})" +
+                        ", so every later leg on that terminator says nothing about early data");
+            }
+        }
+
+        // Measured here on 2026-11-01 against the terminator that does negotiate 1.3 on this host. libssl
+        // answers a hello offering early_data under an identity it cannot resolve with a ServerHello and the
+        // full handshake, and the records that client put behind its hello do not upset it: the leg that hands
+        // them over reaches the same point as the leg that keeps them off, which is waiting for a Finished
+        // this synthetic client never sends. So refusing 0-RTT costs the terminator nothing at all. The pin is
+        // the absence of a record-layer error, in both shapes, because the proxy withholds only the records
+        // it already has in hand: one that arrives after the hello reaches the terminator, and the leg that
+        // hands them over is what says that is survivable.
+        if (byWire.TryGetValue("openssl/early_data offered, early records given to the terminator", out var passedThrough) &&
+            byWire.TryGetValue("openssl/early_data offered, early records kept off the terminator", out var withheld))
+        {
+            if (passedThrough.Contains("bad record", StringComparison.Ordinal) ||
+                withheld.Contains("bad record", StringComparison.Ordinal))
+                failures.Add($"early-refuse(openssl): the early records were not tolerated, given " +
+                             $"'{passedThrough}' and kept off '{withheld}'");
+        }
+
+        // What the proxy does with the fourth leg's flight: it hands the terminator the hello record and
+        // keeps the rest back. Both halves are pinned, because a split that leaves one octet of the client's
+        // request in the replay is the failure the branch exists to prevent, and one that cuts into the hello
+        // leaves no session at all.
+        var early = BuildEarlyDataHello(true, true);
+        var (helloOnly, heldBack) = EarlyData.Split(early, clientOfferedEarlyData: true);
+        if (heldBack.Length == 0)
+        {
+            failures.Add("early-refuse(split): a flight with records behind the hello held back nothing, so " +
+                         "the terminator would be handed records it cannot open");
+        }
+        else
+        {
+            if (!helloOnly.SequenceEqual(FirstRecord(early)))
+                failures.Add($"early-refuse(split): the replay is {helloOnly.Length} octets, not the hello " +
+                             $"record's {FirstRecord(early).Length}");
+            if (heldBack.Length != early.Length - FirstRecord(early).Length)
+                failures.Add($"early-refuse(split): held back {heldBack.Length} of {early.Length} octets");
+            // The dummy change_cipher_spec first, then the request: RFC 9846 Appendix E.4 puts that record
+            // "immediately after the first ClientHello" for a client offering early data, and §4.3.10 lets
+            // the application data follow it in the same flight.
+            if (!DescribeRecords(heldBack).StartsWith("ccs(1) appdata(", StringComparison.Ordinal))
+                failures.Add($"early-refuse(split): the records held back are {DescribeRecords(heldBack)}, " +
+                             "not the dummy change_cipher_spec and the request behind it");
+            if (!Encoding.ASCII.GetString(heldBack).Contains("GET / HTTP/1.1", StringComparison.Ordinal))
+                failures.Add("early-refuse(split): the request is not among the records held back, so this " +
+                             "flight carries no early data to withhold");
+            notes.Add($"early-refuse(split): replayed {helloOnly.Length} of {early.Length} octets, held " +
+                      $"back {heldBack.Length} as {DescribeRecords(heldBack)}");
+        }
+
+        // The two shapes that have to come back as one piece: a flight whose hello this proxy has not
+        // finished reading, and records behind a hello that does not offer the extension. The second is what
+        // makes the caller's reading of the hello load-bearing - the same octets are held back for one
+        // hello and replayed for the other.
+        var half = early[..(early.Length / 2)];
+        var (halfOnly, halfTail) = EarlyData.Split(half, clientOfferedEarlyData: true);
+        if (halfTail.Length != 0 || !halfOnly.SequenceEqual(half))
+            failures.Add("early-refuse(split): a partial hello was cut at a boundary past what was read");
+
+        var plain = BuildEarlyDataHello(false, false);
+        var (plainOnly, plainTail) = EarlyData.Split(plain, clientOfferedEarlyData: true);
+        if (plainTail.Length != 0 || !plainOnly.SequenceEqual(plain))
+            failures.Add($"early-refuse(split): a flight that is one complete hello was cut into " +
+                         $"{plainOnly.Length} and {plainTail.Length} octets");
+
+        var unoffered = plain.Concat(heldBack).ToArray();
+        var (whole, none) = EarlyData.Split(unoffered, clientOfferedEarlyData: false);
+        var (cut, held) = EarlyData.Split(unoffered, clientOfferedEarlyData: true);
+        if (none.Length != 0 || !whole.SequenceEqual(unoffered))
+            failures.Add($"early-refuse(split): a hello offering no early_data lost {none.Length} of " +
+                         $"{unoffered.Length} octets");
+        if (held.Length != heldBack.Length || !cut.SequenceEqual(FirstRecord(unoffered)))
+            failures.Add($"early-refuse(split): the same flight with the extension offered held back " +
+                         $"{held.Length} octets instead of {heldBack.Length}");
+    }
+
+    // The ClientHello record on its own: the leg that keeps the early records off the terminator hands it
+    // exactly this much of the flight.
+    static byte[] FirstRecord(byte[] flight) => flight[..(5 + ((flight[3] << 8) | flight[4]))];
+
+    // One real handshake, at the protocol the caller names, against a server built with the proxy's own
+    // options, returning what each end of it saw.
+    static async Task<string> CheckRealClientAsync(SslProtocols allowed, X509Certificate2 cert)
+    {
+        using var probe = new TcpListener(IPAddress.Loopback, 0);
+        probe.Start();
+        var port = ((IPEndPoint)probe.LocalEndpoint).Port;
+        var serverTask = Task.Run(async () =>
+        {
+            using var accepted = await probe.AcceptTcpClientAsync();
+            using var ssl = new SslStream(accepted.GetStream(), false);
+            try
+            {
+                await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = cert,
+                    ClientCertificateRequired = false,
+                    EnabledSslProtocols = allowed,
+                    CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+                }).WaitAsync(TimeSpan.FromSeconds(8));
+                return $"server established {ssl.SslProtocol}";
+            }
+            catch (Exception ex)
+            {
+                return $"server said {ex.GetType().Name}: {ex.Message}";
+            }
+        });
+
+        using var tcp = new TcpClient();
+        await tcp.ConnectAsync(IPAddress.Loopback, port);
+        using var sslClient = new SslStream(tcp.GetStream(), false);
+        try
+        {
+            await sslClient.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+            {
+                TargetHost = "probe.test",
+                EnabledSslProtocols = allowed,
+                RemoteCertificateValidationCallback = (_, _, _, _) => true,
+            }).WaitAsync(TimeSpan.FromSeconds(8));
+            return $"client established {sslClient.SslProtocol}; {await serverTask}";
+        }
+        catch (Exception ex)
+        {
+            return $"client failed {ex.GetType().Name}: {ex.Message}; {await serverTask}";
+        }
+    }
+
+    static string DescribeRecords(ReadOnlySpan<byte> bytes)
+    {
+        var s = new StringBuilder();
+        var offset = 0;
+        while (offset + 5 <= bytes.Length)
+        {
+            var type = bytes[offset];
+            var length = (bytes[offset + 3] << 8) | bytes[offset + 4];
+            if (offset + 5 + length > bytes.Length) break;
+            if (s.Length > 0) s.Append(' ');
+            var label = type switch { 22 => "handshake", 20 => "ccs", 23 => "appdata", 21 => "alert", _ => $"type{type}" };
+            s.Append($"{label}({length}");
+            if (type == 22 && length >= 1) s.Append($":msg{bytes[offset + 5]}");
+            if (type == 21 && length >= 2) s.Append($":{bytes[offset + 5]}/{bytes[offset + 6]}");
+            s.Append(')');
+            offset += 5 + length;
+        }
+        return s.Length == 0 ? $"no complete record in {bytes.Length} bytes" : s.ToString();
+    }
+
     static async Task ServeEarlyDataAsync(NetworkStream s, byte[] expected, List<string> notes, List<string> failures)
     {
         var got = new MemoryStream();
@@ -1478,7 +1878,7 @@ async Task<int> RunModeAsync(string mode)
         var buf = new byte[4096];
         var n = await s.ReadAsync(buf).AsTask().WaitAsync(TimeSpan.FromSeconds(15));
         var reply = Encoding.ASCII.GetString(buf, 0, n);
-        notes.Add($"early-data: {flight.Length}-byte 0-RTT flight relayed, reply '{reply.Split("\r\n")[0]}'");
+        notes.Add($"early-data: {flight.Length}-byte psk_ke(0) flight relayed, reply '{reply.Split("\r\n")[0]}'");
         if (!reply.EndsWith("ok")) failures.Add($"early-data: reply was '{reply}'");
     }
 
@@ -1927,7 +2327,8 @@ async Task<int> RunModeAsync(string mode)
         // Electron is preferred when it is installed: it is the TLS stack the live clients run, and its
         // Node side is reached with ELECTRON_RUN_AS_NODE.
         var electron = Environment.GetEnvironmentVariable("TLSMITM_ELECTRON")
-            ?? @"Combine(Environment.GetFolders\meolder.Local\Programs\Electron\electron.exe";
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Programs", "Electron", "electron.exe");
         var node = Environment.GetEnvironmentVariable("TLSMITM_NODE");
         var useElectron = node == null && File.Exists(electron);
         var executable = node ?? (useElectron ? electron : "node");
@@ -2393,6 +2794,84 @@ async Task<int> RunModeAsync(string mode)
         Expect("no flags", inactive, 5000, true);
         if (looked != 0)
             failures.Add($"filter: an inactive filter ran {looked} process lookups");
+    }
+}
+
+// Hands the reader the first N TLS records and discards whatever the peer put behind them, which is the
+// shape a refusal has to be offered in: the record header is in the clear even when the early payload is
+// not, so where the hello ends is knowable without reading what follows it. N = 0 hands on nothing at all.
+sealed class FirstRecordStream : Stream
+{
+    private readonly Stream _inner;
+    private readonly int _recordsToServe;
+    private readonly MemoryStream _handed = new();
+    private int _collected;
+    private int _offset;
+
+    public FirstRecordStream(Stream inner, int recordsToServe)
+    {
+        _inner = inner;
+        _recordsToServe = recordsToServe;
+    }
+
+    public override bool CanRead => _inner.CanRead;
+    public override bool CanSeek => false;
+    public override bool CanWrite => _inner.CanWrite;
+    public override long Length => _inner.Length;
+    public override long Position { get => _inner.Position; set => _inner.Position = value; }
+    public override void Flush() => _inner.Flush();
+    public override Task FlushAsync(CancellationToken cancellationToken) => _inner.FlushAsync(cancellationToken);
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => _inner.Write(buffer, offset, count);
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        => _inner.WriteAsync(buffer, cancellationToken);
+
+    public override int Read(byte[] buffer, int offset, int count)
+        => ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        while (_offset >= _handed.Length && _collected < _recordsToServe)
+        {
+            var record = new byte[5];
+            var got = await ReadFullAsync(record, cancellationToken);
+            if (got == 0) return 0;
+            if (got < record.Length) throw new IOException("the peer closed inside a record header");
+            var body = (record[3] << 8) | record[4];
+            Array.Resize(ref record, 5 + body);
+            if (await ReadFullAsync(record.AsMemory(5), cancellationToken) != body)
+                throw new IOException("the peer closed inside a record");
+            _handed.Write(record, 0, record.Length);
+            _collected++;
+        }
+
+        if (_offset < _handed.Length)
+        {
+            var n = (int)Math.Min(buffer.Length, _handed.Length - _offset);
+            _handed.GetBuffer().AsSpan(_offset, n).CopyTo(buffer.Span);
+            _offset += n;
+            return n;
+        }
+
+        var scratch = new byte[4096];
+        while (true)
+        {
+            var read = await _inner.ReadAsync(scratch, cancellationToken);
+            if (read == 0) return 0;
+        }
+    }
+
+    private async Task<int> ReadFullAsync(Memory<byte> target, CancellationToken cancellationToken)
+    {
+        var total = 0;
+        while (total < target.Length)
+        {
+            var read = await _inner.ReadAsync(target[total..], cancellationToken);
+            if (read == 0) break;
+            total += read;
+        }
+        return total;
     }
 }
 

@@ -16,10 +16,16 @@
          binaries embedded below without a conditional. InboundFirewall travels the same way: it is the
          rule store read and the one rule a run owns, and neither program asks it anything else. So does
          RelayProbe, which is the SYN and the connection-table reading that answers a question the rule
-         store cannot: Router aims it at the resolver's TCP port, the proxy at its relay. -->
+         store cannot: Router aims it at the resolver's TCP port, the proxy at its relay. So does Ipv6Chain,
+         because a packet whose transport sits behind an extension header has to lead the reply leg and the
+         proxy's swap to the same octets, or one of the two loses a flow the other found. -->
     <Compile Include="..\TlsMitm\WinDivertNative.cs" Link="WinDivertNative.cs" />
     <Compile Include="..\TlsMitm\InboundFirewall.cs" Link="InboundFirewall.cs" />
     <Compile Include="..\TlsMitm\RelayProbe.cs" Link="RelayProbe.cs" />
+    <Compile Include="..\TlsMitm\Ipv6Chain.cs" Link="Ipv6Chain.cs" />
+    <!-- ConsoleClose travels the same way: it is the one stop that no exit handler of either program sees,
+         and both of them add a firewall rule that has to outlive the decision to end the run. -->
+    <Compile Include="..\TlsMitm\ConsoleClose.cs" Link="ConsoleClose.cs" />
   </ItemGroup>
 
   <ItemGroup>

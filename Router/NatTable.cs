@@ -99,6 +99,9 @@ public sealed class NatTable
     private readonly ConcurrentDictionary<FragKey, FragVal> _frag = new();
     private readonly object _alloc = new();
     private int _cursor;
+    // What this host already holds, asked for at the moment a port is picked. Null means nothing is known
+    // and every free port is a candidate, which is how the table behaved before the NAT had this to say.
+    private readonly Func<byte, ICollection<ushort>>? _localPorts;
 
     public long Snats;
     public long Dnats;
@@ -109,15 +112,19 @@ public sealed class NatTable
     public long WrongIf;
     public long IcmpErrors;
     public long IcmpErrorsDropped;
+    public long PortHeld;
+    public long PortClaimed;
 
     // Addresses are held as the four octets read big-endian, so 192.168.2.1 is 0xC0A80201. That is
     // the readable form and the form a filter string wants; it is NOT the form NativeIpv4Header
     // fields hold on this architecture, which is why Program.cs byte-swaps at the boundary.
-    public NatTable(uint wanAddr, uint lanAddr, uint lanMask, Func<DateTime>? now = null, TimeSpan? udpIdle = null)
+    public NatTable(uint wanAddr, uint lanAddr, uint lanMask, Func<DateTime>? now = null, TimeSpan? udpIdle = null,
+        Func<byte, ICollection<ushort>>? localPorts = null)
     {
         _wanAddr = wanAddr;
         _lanAddr = lanAddr;
         _lanMask = lanMask;
+        _localPorts = localPorts;
         _lanNetwork = lanAddr & lanMask;
         _now = now ?? (() => DateTime.UtcNow);
         var requested = udpIdle ?? TimeSpan.FromSeconds(UdpTimeoutDefaultSeconds);
@@ -142,6 +149,20 @@ public sealed class NatTable
     // address-based filter loses it exactly where the interesting part begins - the copy the host
     // forwards out the WAN interface, and the reply that comes back to the mapped port.
     public bool IsMappedPort(byte proto, ushort port) => _rev.ContainsKey(new RevKey(proto, port));
+
+    // What the other translator that answers on this address has bound. RFC 6146 §3.5.1.1's last bullet lets
+    // one port number sit in the UDP BIB and the TCP BIB of the same table, because the protocol is part of
+    // the key - but two tables at one IPv4 address cannot share a number for the same protocol, since a reply
+    // to it would have two owners here. Each allocator is handed the other's view and skips what is claimed.
+    public Func<byte, ICollection<ushort>>? OtherMapped { get; set; }
+
+    public ICollection<ushort> MappedPorts(byte proto)
+    {
+        var ports = new List<ushort>();
+        foreach (var key in _rev.Keys)
+            if (key.Proto == proto) ports.Add(key.NatPort);
+        return ports;
+    }
 
     public bool IsLanAddress(uint addr) => (addr & _lanMask) == _lanNetwork;
 
@@ -279,6 +300,11 @@ public sealed class NatTable
     // rather than a whole slot further along, and a client that allocated an even/odd pair back to back
     // gets an even/odd pair out. Moving the cursor forward instead would keep the parity and lose the
     // adjacency.
+    //
+    // A port this host holds is skipped for the same reason the reverse table is consulted: REQ-1 makes the
+    // mapped port the whole reverse key, so a client mapped onto a port a local socket is bound to has the
+    // answer to that socket delivered to it instead. Skipping stays inside the parity, so REQ-4 survives a
+    // held neighbour port - the slot simply moves on by two.
     private ushort AllocatePortLocked(byte proto, ushort internalPort)
     {
         var parity = internalPort & 1;
@@ -287,6 +313,16 @@ public sealed class NatTable
             var slot = (_cursor + step) % PortSlots;
             var candidate = (ushort)(PortFirst + slot * 2 + parity);
             if (_rev.ContainsKey(new RevKey(proto, candidate))) continue;
+            if (_localPorts is { } held && held(proto).Contains(candidate))
+            {
+                Interlocked.Increment(ref PortHeld);
+                continue;
+            }
+            if (OtherMapped is { } otherTable && otherTable(proto).Contains(candidate))
+            {
+                Interlocked.Increment(ref PortClaimed);
+                continue;
+            }
             _cursor = slot;
             return candidate;
         }

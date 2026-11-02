@@ -12,7 +12,8 @@ using TlsMitm;
 // after AuthenticateAsServerAsync returns and the tee has stopped. Here the client is a separate
 // process, so it is classified as node.exe and served an emSign chain through the libssl leg.
 
-var emSignDir = @"Combine(Environment.GetFolders\meory, "emsign_certs";
+// The cert material travels into this tool's own output directory with the TlsMitm project reference.
+var emSignDir = Path.Combine(AppContext.BaseDirectory, "emsign_certs");
 var cas = new List<EmSignCa>();
 var chainPaths = Directory.GetFiles(Path.Combine(emSignDir, "chain"));
 foreach (var path in Directory.GetFiles(Path.Combine(emSignDir, "intermediates")))
@@ -57,7 +58,8 @@ File.WriteAllText(js, """
     """);
 
 var electron = Environment.GetEnvironmentVariable("TLSMITM_ELECTRON")
-    ?? @"Combine(Environment.GetFolders\meolder.Local\Programs\Electron\electron.exe";
+    ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Programs", "Electron", "electron.exe");
 var nodeExe = Environment.GetEnvironmentVariable("TLSMITM_NODE");
 var useElectron = nodeExe == null && File.Exists(electron);
 var clientExe = nodeExe ?? (useElectron ? electron : "node");

@@ -4,6 +4,7 @@
 set -u
 cd "$(dirname "$0")"
 mkdir -p out
+# NODE takes a bash path and wins; TLSMITM_NODE is the Windows path the C# harness reads.
 NODE="${NODE:-${TLSMITM_NODE:-node}}"
 EXE="./bin/Debug/net10.0/chainprobe.exe"
 

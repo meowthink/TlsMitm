@@ -22,11 +22,15 @@ internal static unsafe class QuicSignature
             if (recvLen < headerLen + sizeof(NativeUdpHeader)) return false;
             udp = (NativeUdpHeader*)(packet + headerLen);
         }
-        else if ((*packet >> 4) == 6 && recvLen >= sizeof(NativeIpv6Header))
+        else if ((*packet >> 4) == 6)
         {
-            if (((NativeIpv6Header*)packet)->NextHeader != 17) return false;
-            headerLen = sizeof(NativeIpv6Header);
-            if (recvLen < headerLen + sizeof(NativeUdpHeader)) return false;
+            // RFC 8200 §4.1 lets §4.3's hop-by-hop sit in front of the transport, so §17.2's datagram is
+            // not always at octet 40; the same walk the redirector swaps by finds it here too. Dropping a
+            // packet falsifies nothing, but a chain whose own headers name addresses is one this reader
+            // will not call a QUIC datagram.
+            if (!Ipv6Chain.TryFind(new ReadOnlySpan<byte>(packet, recvLen), out var chain)
+                || chain.Protocol != 17 || chain.AddressDependent) return false;
+            headerLen = chain.Transport;
             udp = (NativeUdpHeader*)(packet + headerLen);
         }
         else return false;

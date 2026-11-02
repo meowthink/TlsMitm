@@ -34,8 +34,11 @@ per-client chain selection, a local CRL, and plain pcap output.
    terminated session proves nothing, because a GREASE-ECH client (RFC 9849 §6.2.1) finishes the
    handshake and then sits quiet. A host goes blind for 10 minutes on a failed handshake, not on
    silence, so the site keeps working without losing interception around every page load.
-5. 0-RTT and PSK-only resumptions are relayed blind: decryption would need keys we cannot have.
-   They are still captured, as is every other TLS session (`captures/<host>_<time>_<id>.pcap`).
+5. A hello that offers early data is terminated with the records behind its ClientHello withheld: they
+   are encrypted under a PSK this handshake never learns, and the client sends its request again once
+   the handshake is over (RFC 8470 §4). A PSK-only resumption stays blind — it offers no ephemeral key
+   to obtain. Every session is still captured, as is every other TLS session
+   (`captures/<host>_<time>_<id>.pcap`).
    Each file opens with a synthesized three-way handshake, so Wireshark reads one connection from
    its start rather than a fragment out of the middle.
 6. QUIC is dropped by long-header signature, so HTTP/3 clients fall back to TCP and stay visible.
@@ -125,7 +128,7 @@ signed with against the one `RootCa` finds and fails if the two disagree.
 dotnet build TlsMitm
 # elevated:
 TlsMitm\bin\Debug\net10.0\TlsMitm.exe [--emsign | --emsign-only | --rotate] [--no-ech-downgrade]
-    [--lan <ipv4>]
+    [--lan <ipv4> [--lan6 <ipv6>]]
     [--root <pfx> | --root-thumbprint <thumbprint> | --init-ca]
     [--pid <pid,...> | --exclude-pid <pid,...>]
     [--process <name,...> | --exclude-process <name,...>]
@@ -146,6 +149,7 @@ TlsMitm\bin\Debug\net10.0\TlsMitm.exe [--emsign | --emsign-only | --rotate] [--n
 | `--exclude-pid <pid,...>` | intercept everything except these processes |
 | `--exclude-process <name,...>` | intercept everything except these executables |
 | `--lan <ipv4>` | also intercept TCP a forwarded client sends from this address's subnet |
+| `--lan6 <ipv6>` | with `--lan`: also intercept forwarded IPv6, which is delivered to this address |
 | `--allow-relay-in` | with `--lan`: add the inbound allow rule for the relay port, and remove it when the run ends |
 
 Scoping is decided at the SYN that starts a flow, so an excluded process is passed through whole —
@@ -165,6 +169,14 @@ so `--emsign` gives it the emSign chain (see above), and `--pid`/`--process` onl
 processes, so they do not narrow a forwarded flow. Forwarding has to be on for that interface
 (`Router --enable-forwarding`), while DHCP and DNS stay with Router.
 
+One interface can hold both families, and the one capture leg serves both. `--lan6` names the address a
+forwarded v6 packet is delivered to, and its filter is bounded by that address's own prefix — the
+delegated one `Router` installed — rather than by the IPv4 subnet. The rewrite is the v4 one: the
+server's address goes into the source, `--lan6`'s into the destination, and the injected packet names
+the interface that owns it. The reply leg takes the client's own address from the flow state, as for v4.
+Without `--lan6` a forwarded v6 flow is not diverted at all, and the run names the v6 address its
+interface holds so that silence has a reason next to it.
+
 UDP is captured on the same bounds for one purpose: a QUIC datagram, recognised by its packet signature
 rather than a port, is dropped instead of routed, so the client falls back to the TCP above. Anything
 else is handed back to the lower-priority handles and Router forwards it as usual. A fragmented TCP
@@ -180,17 +192,18 @@ The console is mirrored to `tlsmitm-<yyyyMMdd-HHmmss>.log` next to the executabl
 
 `Router/` is a second executable: a minimal stateful IPv4 NAT router between two of this host's interfaces,
 with a DHCP pool and a resolver on the LAN side so a device plugged into it gets an address and answers to a
-name. The interface holding the default gateway is the WAN side, the other one is the LAN side, and the
-device's cable goes there. It can run next to `TlsMitm`, and the two share only the P/Invoke surface, which
-`Router` links rather than copies.
+name, plus an IPv6 side that asks the WAN for a prefix and advertises it to the LAN. The interface holding
+the default gateway is the WAN side, the other one is the LAN side, and the device's cable goes there. It
+can run next to `TlsMitm`, and the two share only the P/Invoke surface, which `Router` links rather than
+copies.
 
 ```powershell
 dotnet build Router
 # elevated:
 Router\bin\Debug\net10.0\Router.exe [--lan <ipv4>] [--wan <ipv4>] [--enable-forwarding] [--stop-ics]
     [--pool <ipv4>/<count>] [--scope <cidr>,<pool>/<count>,<router>[,<dns>]] [--lease <min>]
-    [--udp-timeout <sec>] [--dns <ipv4>] [--no-dhcp] [--no-dns] [--allow-lan-in]
-    [--trace <count>] [--stats <sec>]
+    [--udp-timeout <sec>] [--dns <ipv4>] [--pref64 [<ipv6>/<len>]] [--nat64] [--no-dhcp] [--no-dns] [--no-v6]
+    [--allow-lan-in] [--trace <count>] [--stats <sec>]
 ```
 
 | flag | effect |
@@ -205,11 +218,15 @@ Router\bin\Debug\net10.0\Router.exe [--lan <ipv4>] [--wan <ipv4>] [--enable-forw
 | `--lease <min>` | lease length in minutes (default 1440) |
 | `--udp-timeout <sec>` | how long an idle UDP mapping lives (default 300, floor 120) |
 | `--dns <ipv4>` | upstream resolver (default: the one configured on the WAN interface) |
+| `--pref64 [<ipv6>/<len>]` | answer a AAAA question that has no AAAA of its own from the A records, under this prefix (bare: `64:ff9b::/96`); length is one of 32, 40, 48, 56, 64, 96 and no host bit may be set. The Router Advertisements carry the same prefix, in RFC 8781's PREF64 option. `--no-dns` refuses it |
+| `--nat64` | RFC 6146's stateful translator on the prefix `--pref64` names: a datagram from the LAN addressed inside it goes out as IPv4 from this host's WAN address with a port from 49152 up, and the answer to that port comes back. Needs `--pref64`; `--no-v6` refuses it |
 | `--no-dhcp` / `--no-dns` | leave out either listener; the NAT does not need them |
-| `--trace <count>` | two sniff-only handles: the forward layer, printing what the main handle is offered, and the network layer's inbound path, printing only the LAN subnet's packets and the answers to mapped ports (60 lines on each if `<count>` is omitted) |
+| `--no-v6` | leave out the IPv6 side (prefix delegation and Router Advertisements) |
+| `--trace <count>` | two sniff-only handles: the forward layer, printing what the main handle is offered, and the network layer's inbound path, printing only the LAN subnet's packets and the answers to mapped ports; a second pair does the same for IPv6, whose packets reach the main handle only under `--nat64` (`60` lines on each if `<count>` is omitted) |
 | `--stats <sec>` | interval for the mapping counters (default 30) |
 
-Both listeners bind the LAN address. The pool answers DISCOVER and REQUEST with this host as option 3
+Both listeners bind the LAN's IPv4 address, and the resolver binds its IPv6 one as well once a delegation has
+installed it. The pool answers DISCOVER and REQUEST with this host as option 3
 and option 6 and remembers the hostname from option 12; the resolver answers that name from the lease
 table without letting the query leave the host, and forwards every other name, caching it for the
 shortest TTL among its records. A question the upstream never answers costs its own client the transport
@@ -225,9 +242,12 @@ An answer leaves without the ECH configuration in it: in an HTTPS or SVCB record
 (RFC 9848 §3 is where the configuration travels) is rewritten to the private-use 65280 that RFC 9460
 §14.3.2 reserves, which §2.4.3 lets a client ignore — the record still parses and the client is handed
 nothing to encrypt its ClientHello with. The cache stores the rewritten message, and the two answers that never
-pass through this resolver — the host's own, on the reply leg, and a LAN client's to a server it named itself,
-on the forwarding leg — get the same rewrite in place; no length changes, so only the checksums are redone. A
-DoT or DoH answer is not reached, nor is a TCP answer split across segments, and a client that already holds a
+pass through this resolver — the host's own, on the reply legs, and a LAN client's to a server it named itself,
+on the forwarding leg — get the same rewrite in place; no length changes, so only the checksums are redone. The
+host's own IPv6 resolver traffic has its own reply leg, bounded to a source port of 53, because the IPv4 reply
+leg's `ip` filter is never offered an IPv6 packet. A
+DoT or DoH answer is not reached, nor is a TCP answer split across segments; an IPv6 client of this LAN is covered
+by asking this resolver rather than by a rewrite of transit traffic — and a client that already holds a
 configuration keeps it until its TTL runs out.
 
 A client's request has to reach those listeners, and Windows filters inbound, so each port that bound is
@@ -287,6 +307,55 @@ own high-port inbound traffic, stopping has to be unconditional: `Ctrl+C` shuts 
 interrupt handler — the only thing that releases a thread blocked in `WinDivertRecv` — and the process exits
 on its own if that has not finished 3 s later, so a diverted packet is never left stranded.
 
+The IPv6 side runs on its own thread and does not go through the NAT at all. It asks the WAN for a prefix
+with DHCPv6 prefix delegation (RFC 8415 §18.2: Solicit, Request, Renew, Rebind, Release, on UDP 547/546)
+and, when one arrives, puts the first /64 of it on the LAN interface and advertises it in Router
+Advertisements (RFC 4861 §4.2) — on-link and autonomous, with the lifetimes counted down as they run out.
+The same advertisement carries a recursive DNS server in the RDNSS option RFC 8106 §5.1 defines, because a
+host that configures itself from an advertisement never has the DHCPv6 conversation the address came in.
+Which server it names depends on whether this run answers DNS on that address: the resolver opens its IPv6
+listener when the delegation installs it and closes it when the address is taken back — after waiting for the
+address to leave Duplicate Address Detection, since RFC 4862 §5.4 keeps a tentative address off an interface and
+a bind on one is refused — so both families are served by the same table, the same cache and the same upstream
+socket, and an answer a client gets is one this resolver built. A listener that did not bind, or `--no-dns`,
+names the server the Reply answered with instead,
+because an address nothing listens on is worse than one this program does not control. The WAN's MTU goes
+in RFC 4861 §4.6.4's option when it could be read, and is left out when it could not. Because the LAN
+addresses are real addresses out of the delegated prefix, nothing is
+translated: the stack's own IPv6 forwarding carries a client's packet, and the only routing this program
+adds is the on-link route the LAN address brings with it. That per-interface IPv6 switch is separate from
+the IPv4 one, so `--enable-forwarding` sets both and the status of each family is printed at startup. A
+delegation that is withdrawn, or the end of the run, sends the final advertisements with zero lifetimes
+(RFC 4861 §6.2.5, RFC 4862 §5.5.3(e)) before the Release goes out (RFC 8415 §18.2.7), and then the LAN
+address is removed again. `--no-v6` leaves all of this out.
+
+`--pref64` turns the resolver into a DNS64 (RFC 6147). A AAAA answer the upstream gives is returned as it
+is; one that is empty, or that carries an RCODE other than 3, or that the upstream never sends, is answered
+instead from an A query for the same name, each A record becoming a AAAA whose address is the A's inside the
+prefix (RFC 6052 §2) and whose TTL is the shorter of the A's and the SOA the negative AAAA answer carried, or
+600 seconds. A CNAME or DNAME in the AAAA answer is kept in front of the synthetic records, and the authority
+and additional sections come from the A answer. AAAA records in `::ffff:0:0/96` never go back to a client: an
+answer holding only those is treated as empty, and one holding others is answered from those others alone, so
+no A query follows it. A PTR for an address inside the prefix is answered here with a CNAME to the
+IN-ADDR.ARPA name (§5.3.1's second option), since the upstream's reverse tree has never heard of it; a PTR
+for any other address is forwarded untouched.
+
+The advertisements then carry the same prefix in RFC 8781's PREF64 option, so a host that forms IPv4-embedded
+addresses for itself forms them with the one this resolver answers with; a withdrawal keeps the option and
+zeroes only its lifetime, which is §4.1's sole take-away signal. RFC 7050's `ipv4only.arpa` is answered like
+any other name — §5 forbids a DNS64 from doing anything special there — so a node that looks for that name's
+two well-known IPv4 addresses inside the answer it gets recovers this prefix from it.
+
+`--nat64` puts RFC 6146's stateful translator on the forwarding path for that same prefix. §3.5's two filters
+decide what it takes: a datagram whose source is already inside the prefix is discarded, and one whose
+destination is not an address this table binds on is left to the rest of the path. §3.6.1's address rules,
+carried out by RFC 7915's stateless translation, make the outgoing source this host's WAN address and the
+outgoing destination the IPv4 that was embedded in the prefix; §3.5.1.1 picks the port, preferring the
+client's own and skipping one this host's socket or the IPv4 table already holds. §3.5.2.2's machine and §4's
+timers keep a binding alive past its connection's expiry for the window `TCP_TRANS` gives it, and §3.8
+translates a client-to-client flow twice inside one packet. The `--stats` line prints this table's own
+`out`/`in`, `bib`, `ste`.
+
 Each side is chosen from exactly one candidate or not at all, and a refusal lists the candidates with their
 media type. `--wan` is there because more than one interface can carry a default gateway, and enumeration
 order cannot know which one a client should leave through. The
@@ -297,7 +366,9 @@ WAN interface is counted as `wrongif` in the `--stats` line rather than dropped 
 counter is the only thing that says the index is wrong. A diverted packet has already left the stack, so a
 reinjection that fails loses it outright; `passthroughfail` and `rewritefail` count the two call sites on each
 leg, and the first failure of each prints the driver's error. `--stats` prints the forwarding leg's counters
-and, on the line below, the reply leg's own `recv`/`passthroughfail`/`rewritefail`.
+and, on the line below, the reply leg's own `recv`/`passthroughfail`/`rewritefail`. The IPv6 reply leg prints
+its `recv`/`neutralised`/`passthroughfail` once, when its loop ends — a leg that saw nothing and a leg that saw
+answers with no `ech` parameter otherwise end in the same silence.
 
 The WAN address is re-read on the same five-second sweep that expires mappings, because a renewed lease
 changes two things at once: the source a SNAT writes, and the address the reply leg's filter names. The
@@ -308,9 +379,11 @@ old sends packets out and never takes their answers back — harder to read than
 The mapping is endpoint-independent (RFC 4787 REQ-1): it is keyed on the client's address and port
 alone, and an inbound packet is matched on the mapped port alone, so any external host may send back to
 a mapping the LAN side opened. A mapped port keeps the internal port's parity (REQ-4), and two
-allocations of opposite parity taken back to back land on adjacent ports. TCP and ICMP sit at their RFC
-floors (2 h 4 min and 4 min; 60 s); only UDP is tunable, and `--udp-timeout` refuses below the 120 s
-floor REQ-5 sets.
+allocations of opposite parity taken back to back land on adjacent ports. A port this host's own sockets
+hold is never handed out — this host's dynamic range is the same span as the pool, so the resolver's
+upstream socket sits in it — and `heldskip` counts the ports the allocator stepped over for that reason.
+TCP and ICMP sit at their RFC floors (2 h 4 min and 4 min; 60 s); only UDP is tunable, and
+`--udp-timeout` refuses below the 120 s floor REQ-5 sets.
 
 Every fragment of a datagram follows the first one's rewrite (RFC 4787 §11 REQ-14), keyed on the
 protocol, the two addresses and the datagram id the far host reassembles on; a fragment whose first one
@@ -330,12 +403,20 @@ a reply to a SNATed client is addressed to this host, so it is local delivery ra
 watches the forward layer from outside a
 running Router.
 
+`[Trace v6fwd]` and `[Trace v6net]` are not the two halves of one path, because a forwarded packet is never
+addressed to this host: `v6fwd` prints what Windows is forwarding, one line per packet at its egress
+interface — a client's request at the WAN index, its answer at the LAN one — and `v6net` prints IPv6
+addressed to this host arriving on the LAN, which is where a client reaching the resolver's own listener
+shows. A transit packet Windows drops prints on neither leg, so the client's reply is the end-to-end
+judge. These two legs print no `take=` verdict — the main handle's filter is `ip`, so it can never take
+an IPv6 packet.
+
 `tools\inject` writes a packet shaped like a leased client's, injects it inbound on an interface named by
 number with `Impostor` clear so a filter asking for `not impostor` takes it, and reads the network layer
 from above and from below its own injection:
 
 ```powershell
-tools\inject\bin\Debug\net10.0-windows\inject.exe --dst 223.5.5.5 --ifidx 5 --count 3 --watch 8
+tools\inject\bin\Debug\net10.0-windows\inject.exe --dst 1.1.1.1 --ifidx 5 --count 3 --watch 8
 ```
 
 `--count 0` injects nothing and leaves the readers running, which is how a real client's own packet gets
@@ -362,29 +443,34 @@ No admin and no WinDivert: the real `MitmProxy` is driven through `FakeRedirecto
 a loopback conversation the harness judges itself. Stop a live `TlsMitm` first — it intercepts the
 suite's own loopback traffic and turns passing modes into false failures.
 
-* `starttlsprobe` — 37 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP and the
+* `starttlsprobe` — 38 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP and the
   two element dialects, LDAP's BER and XMPP's XML, each with its split-write, refusal and unreadable-stream
   cases, XMPP's nameless-hello leaf verdict, FTPS passive/active/clear, ALPN, IPv6, implicit TLS without
-  SNI, emSign and per-process chains, 0-RTT, the ECH hello terminated and relayed blind, close_notify
+  SNI, emSign and per-process chains, 0-RTT, the same hello offered to each of the two terminators, the ECH
+  hello terminated and relayed blind, close_notify
   via a strict Schannel client, a Node client that refuses the flight and must leave its handshake in an
   `*_aborted.pcap`, an upstream that refuses the composed hello and must leave the session to a blind
   relay, the process-scope decision table, and `rootcheck`, which
   compares the root the suite signs with against the one `RootCa` finds on its own and checks that
   `--init-ca` produces the same shape. The emSign modes use Electron when `TLSMITM_ELECTRON` or the
   default Electron install is available, then fall back to Node; `TLSMITM_NODE` overrides the Node
-  executable.
+  executable. The `live-ftps` mode is not in the grouped run: it names a real server through
+  `TLSMITM_LIVE_FTPS_HOST`, whose `TLSMITM_LIVE_FTPS_PORT` and `TLSMITM_LIVE_FTPS_PATH` default to `990`
+  and `/`, and it skips with a note when the host is unset.
   The chain the client is *presented* must name an emSign intermediate and the relay must complete;
   whether its own store trusts the legacy eMSign roots is recorded, not required. A single mode still
   runs on its own: `starttlsprobe.exe smtp`.
 * `echcheck` — the `EchDowngrade` state machine (probe, data proof, failed-leg fallback, independent
   hosts) on an injected clock, so the 10-minute window is stepped over rather than waited out.
 * `natcheck` — the router's rewrite on synthetic packets: both NAT directions, endpoint-independent
-  mapping (RFC 4787 REQ-1), port parity (REQ-4), what must stay out of the table, and the mapping
+  mapping (RFC 4787 REQ-1), port parity (REQ-4), a port given to the allocator as already held being
+  stepped over without losing that parity, what must stay out of the table, and the mapping
   timeouts — the UDP one configurable, with REQ-5's two-minute floor enforced rather than rounded to.
   It covers a WAN lease renew too: the table moves to the new address with every mapping intact, and an
   error quoting a datagram sent under the old address is dropped rather than translated.
   It references `Router.csproj`, so the core is tested without a driver, without admin and without a
-  second interface.
+  second interface; and it compiles the proxy's LAN capture filters, IPv4-only and dual-stack, with the
+  driver's own parser at the layer they are opened at.
 * `servcheck` — the router's DHCP pool and resolver: DISCOVER/OFFER/REQUEST/ACK, the two NAK cases,
   option 61 as the client's identity, the broadcast-flag rule for the reply's destination, the relayed
   half (`giaddr` matched to a scope, the reply to `giaddr:67`, a scope's options 1/3/6/28/51/54, an
@@ -400,15 +486,87 @@ suite's own loopback traffic and turns passing modes into false failures.
   it runs at: the record's key becomes the private-use one and nothing else moves, alpn beside it is
   untouched, a malformed length is left alone, a second pass finds nothing; and inside a UDP datagram and
   a TCP segment the same rewrite is found by source port 53 and a whole message, with a fragment, a
-  partial segment and a query going the other way left as they were.
+  partial segment and a query going the other way left as they were. One resolver serves both families, so
+  an IPv6 client's query is answered from the same table and named in the log by the address it came from.
+  With `--pref64` the resolver is a DNS64, and each of RFC 6147 §5.1's cases is pinned against an injected
+  upstream: a real AAAA returned as it is and no A query asked for it, a synthesis from two A records with
+  §5.1.7's NAME, TYPE, CLASS, RDLENGTH and both TTL rules, the cache answering a repeat with no upstream
+  traffic, an NXDOMAIN passed through, a SERVFAIL and a timeout both read as an empty answer, §5.1.4's
+  mapped-only and mixed answers, §5.1.5's CNAME kept in front of the synthetic record, §5.4's authority
+  section copied from the basis response, §5.3.1's PTR answered inside the prefix and forwarded outside it,
+  and RFC 7050's well-known name getting nothing other than that ordinary synthesis, as its §5 requires.
+  Every name in the assembled reply is written out as labels rather than left as a pointer, because the
+  sections are not the length the source's were; a resolver without the flag is pinned as not synthesising.
+  The packet-level rewrite has its IPv6 half too, and the one walk it uses — RFC 8200 §3's extension
+  chain, shared by the rewrite, the redirector's swap, the QUIC reader and the trace — is pinned by itself:
+  hop-by-hop and destination options stepped over, two of them in a row walked, an Auth Header counted in
+  its own 4-octet units, a routing header (43) walked and then refused, because §4.4's header goes on
+  naming nodes the rewritten packet never visits and RFC 4302 §3.3.3 has the header in front of it covered
+  by an ICV no rewrite can re-sign; a fragment, a jumbo's zero base length, an ESP header and a capture
+  that stops short of the datagram all refused — with UDP, TCP and the resolver's port decided the same way
+  as on IPv4. That a chained transport can be rewritten in place is measured, not assumed: the driver's
+  recalculating call is handed each of the four shapes and the checksum it writes is compared with the
+  RFC 8200 §8.1 figure computed by hand (a userspace helper: no handle, no driver, no admin).
+* `v6check` — the router's IPv6 side: the DHCPv6 prefix-delegation exchange (Solicit, Advertise, Request,
+  Reply, Renew, Rebind, Release, T1/T2 and the resolver option), the Router Advertisement read back octet
+  by octet (flags, both lifetimes, MTU, RDNSS, PREF64 — whose 13-bit scaled lifetime and 3-bit prefix code
+  share one short, so each is read from its own end of it — and its checksum against an independently built
+  pseudo-header), which address that RDNSS option names — this process' own when it answers, the
+  delegation's when it does not, and no option at all when there is nothing to name — the withdrawal that
+  precedes a Release, which takes a prefix away by zeroing its lifetime rather than by leaving the option
+  out, the schedule the advertisements follow, and the IPv6 line `--trace` prints (the Next
+  Header field at index 6, the ports at the offset the same walk finds — so a chained transport is named
+  `hopbyhop>tcp` while a chain that stops at a fragment header invents nothing behind it — a Neighbour
+  Solicitation's target, a Packet Too Big's MTU), the address states the resolver's IPv6 listener waits
+  for before binding, and the IPv4-embedded address arithmetic of RFC 6052 —
+  the six prefix lengths, §2.2's layout with its gap at octet 8, the embedding read back at every length,
+  and the refusal of an address that carries anything but zero in that octet. RFC 7915's stateless
+  IP/ICMP translation is pinned in both directions, and it is the leg `--nat64` turns a datagram on: §5.1 and §4.1's
+  field pairing, §5.2 and §4.2's type and code tables row by row, Figures 6 and 3's pointer maps row by
+  row including the octets each marks n/a, RFC 4884's length attribute moved by the difference the quoted
+  header's own translation made and truncated to RFC 4443 §2.4's minimum, RFC 791 §3.1 and RFC 8200 §8.1's
+  pseudo-headers recomputed for a whole datagram and RFC 1624 §2's fold applied to a first fragment, §5's
+  1260-octet Don't Fragment boundary, RFC 1191 §7's plateau taken for a zero MTU figure, and the refusals
+  — a routing header with segments left, an unexpired source route, an ICMP message behind a Fragment
+  Header, a header whose checksum does not verify, an address family the mapping did not return.
+* `nat64check` — RFC 6146's stateful NAT64, the same shape: datagrams in, the outgoing 5-tuple and the BIB/STE
+  state out, on an injected clock so the two-hour, four-minute and sixty-second lifetimes and the fragment
+  window age without waiting. §3.6.1's two address rules and §3.5.1.1's allocation preferences (the client's own
+  port when it can be had, RFC 4787 §4.2.2's parity, a port this host's socket or the router's IPv4 table already
+  holds) read back as port numbers; §3.5.2.2's machine walked through SYN, the V4 SYN that establishes it, both
+  FIN rows, RST, TRANS and the probe its expiry row asks for; §3.4's error path from the quote inward — the
+  crossed tuple, §4.2's type and code rows, RFC 1624 §2's update of the quoted checksum, the error-in-error,
+  foreign-quote and truncated-quote refusals; §3.5.3's identifier, §3.4's fragment records and their DoS ceiling,
+  §3.8's hairpin, and every discard naming the clause it obeys.
 * `no-sni-test.ps1` — the ClientHello parser and the leaf SAN type, by reflection (needs `pwsh`;
   Windows PowerShell cannot reflect over a net10.0 assembly).
 
 `tests/chainprobe` serves our real chains on loopback to strict clients and records the verdicts; its
 README has the modes.
-`tools/` holds the remaining manual probes: `ftps-upstream-probe.ps1`, `probe.ps1`,
+`tools/` holds the remaining manual probes: `ftps-upstream-probe.ps1`, which takes `-Host_` with no default
+because reaching a FTPS server needs an account and its login and password stay in `.netrc`; `probe.ps1`,
 `read-proc-env.ps1`, and `tools\apcheck`, which prints what the wireless driver reports about hosted
-networks and the current hosted-network state — queries only, so it needs no elevation and changes nothing.
+networks and the current hosted-network state. With no flag every call is a query, so it needs no
+elevation and changes nothing; `--wfd-start` is the one branch that asks for a radio, advertising a
+Wi-Fi Direct legacy access point (`--ssid`, passphrase read from `--key-file`, held `--wfd-hold` seconds
+and stopped on the way out).
+
+* `hoststate.ps1` — the live state an elevated run has to be judged against: this repo's rule names, the ICS
+  services, the adapters, the addresses, the default routes, the repo's own processes. Run it immediately
+  before such a run and immediately after it, because a store count is a witness and a log's last line is not.
+* `closecheck.ps1` — whether a run takes its inbound rule back when the console closes without cleaning up.
+  `-Program router` or `tlsmitm`, needs elevation, and its second run (`taskkill /F`) is the control: residue
+  there is the point. `-SelfTest` drives its two abort branches without writing anything.
+* `tools\dns65check <resolver> <name> [name...]` — builds a type-65 query and prints the SvcParamKeys of the
+  answer, which is where a live `ech` parameter is visible. Reads only.
+* `tools\pdprobe <link-local> <ifIdx> [seconds] [iaid]` — drives Router's own DHCPv6-PD client on one
+  interface and prints every message of the exchange. No driver, no elevation.
+* `tools\tcpwitness [seconds] [port]` — the IPv4 connection-table rows a relay's inbound probe judges itself
+  against, read from outside the elevated process.
+* `sabotage.sh` — the other kind of tool: `--source <file> --test <csproj> --artifact <dll> --run <exe>
+  --cases <file>` mutates one anchor at a time and reports what the suite turned red, so an assertion that
+  never bites is named instead of counted as passing. `tools\sabotage\siit.cases.sh` is the case list for
+  RFC 7915's SIIT pins. It edits a tracked file in place and restores it; the source has to be clean to start.
 
 ## Layout
 
@@ -419,7 +577,7 @@ TlsMitm/             the proxy (Program, MitmProxy, redirector, cert engines, re
   emsign_certs/      intermediates + cross-signed chain used for Node/Electron clients
 Router/              the standalone NAT router (NAT core, DHCP pool, resolver, interface discovery)
 tests/               offline suites (run-offline.ps1) and the live chainprobe
-tools/               manual probes
+tools/               manual probes, host-state reads, the mutation harness
 ```
 
 ## Licensing

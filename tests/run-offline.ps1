@@ -1,5 +1,6 @@
-# Every offline suite in one run. No admin and no WinDivert: the real MitmProxy is driven through
-# FakeRedirector, so each mode is a loopback conversation the harness can judge itself.
+# Every offline suite in one run. No admin and no WinDivert handle: the real MitmProxy is driven through
+# FakeRedirector, so each mode is a loopback conversation the harness can judge itself. One suite does load
+# WinDivert.dll to call its userspace checksum helper, which needs no handle, no driver and no admin.
 # Stop a live TlsMitm first - it intercepts this suite's loopback traffic and makes the FTPS and
 # emSign modes fail for reasons that have nothing to do with the code under test.
 param([string]$Configuration = 'Debug')
@@ -18,7 +19,7 @@ $groups = @(
     ,@('smtp', 'smtpsplit', 'imap', 'pop3', 'ftp', 'nntp', 'xmpp', 'xmpp-split', 'xmpp-nosni', 'xmpp-decline', 'xmpp-bad', 'reject', 'ldap', 'ldap-decline', 'ldap-bad')
     ,@('ftps-pasv', 'ftps-epsv', 'ftps-active', 'ftps-active-split', 'ftps-active-clear')
     ,@('plain', 'implicit', 'implicit-ip', 'ipv6', 'early-data', 'https-close', 'alpn-fallback', 'alpn-h2', 'mtls-refused')
-    ,@('ech-relay', 'ech-downgrade', 'emsign', 'auto', 'handshake-abort', 'grease', 'rootcheck', 'filter')
+    ,@('ech-relay', 'ech-downgrade', 'emsign', 'auto', 'handshake-abort', 'grease', 'rootcheck', 'filter', 'early-refuse')
 )
 
 $failed = New-Object System.Collections.Generic.List[string]
@@ -70,6 +71,20 @@ $svc = Join-Path $root "tests\servcheck\bin\$Configuration\net10.0\servcheck.exe
 $out = & $svc 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { $failed.Add('servcheck'); Write-Host $out } else { Write-Host 'ok   servcheck' }
 
+# v6check is the same shape for the IPv6 side: the DHCPv6 prefix-delegation client (datagrams in,
+# datagrams and prefix lifetimes out) and the Router Advertisement the LAN is given (bytes out). Both
+# take their clock and their jitter as parameters, so no timer and no socket is involved.
+$v6 = Join-Path $root "tests\v6check\bin\$Configuration\net10.0\v6check.exe"
+$out = & $v6 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('v6check'); Write-Host $out } else { Write-Host 'ok   v6check' }
+
+# nat64check is RFC 6146's stateful table on the same terms: datagrams in, the outgoing 5-tuple and the
+# BIB/STE state out. Its clock is injected, so the two-hour, four-minute and sixty-second lifetimes and the
+# fragment window are all aged without waiting, and no port, socket or driver is touched.
+$n64 = Join-Path $root "tests\nat64check\bin\$Configuration\net10.0\nat64check.exe"
+$out = & $n64 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('nat64check'); Write-Host $out } else { Write-Host 'ok   nat64check' }
+
 # quiccheck pins the QUIC long-header layout the blocker drops on. The version sits immediately after
 # the flags byte; reading it from anywhere else makes every real datagram miss and HTTP/3 walk past.
 $quic = Join-Path $root "tests\quiccheck\bin\$Configuration\net10.0\quiccheck.exe"
@@ -89,4 +104,4 @@ if ($failed.Count -gt 0) {
     exit 1
 }
 $modeCount = ($groups | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
-Write-Host "`n[run-offline] PASS - $modeCount starttlsprobe modes in $($groups.Count) processes + echcheck + natcheck + flowcheck + fwcheck + servcheck + quiccheck + no-sni-test"
+Write-Host "`n[run-offline] PASS - $modeCount starttlsprobe modes in $($groups.Count) processes + echcheck + natcheck + nat64check + flowcheck + fwcheck + servcheck + v6check + quiccheck + no-sni-test"

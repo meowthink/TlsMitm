@@ -1,8 +1,10 @@
 # Does the .NET TLS client stack, i.e. exactly what MitmProxy uses for its upstream leg, get a
 # login reply from a real FTPS server? Prints response codes only; the password never leaves the
 # netrc parser. Run with the proxy stopped so the connection is genuinely direct.
+# The server is a parameter because reaching one needs an account: name any FTPS host you can log
+# into, and keep its login and password in .netrc under a `machine` entry of the same name.
 param(
-    [string]$Host_,
+    [Parameter(Mandatory = $true)][string]$Host_,
     [int]$Port = 990
 )
 

@@ -79,6 +79,8 @@ public class PacketRedirector : IRedirector, IDisposable
         {
             Console.WriteLine($"[Redirector] LAN capture: {lan.TcpFilter}");
             Console.WriteLine($"[Redirector] LAN side: {lan.Address} ifIdx={lan.IfIdx}; a forwarded packet is delivered to it");
+            if (lan.V6 is { } six)
+                Console.WriteLine($"[Redirector] LAN side v6: {six.Address} ifIdx={six.IfIdx}; a forwarded v6 packet is delivered to it");
         }
     }
 
@@ -271,20 +273,30 @@ public class PacketRedirector : IRedirector, IDisposable
         else if (version == 6 && recvLen >= sizeof(NativeIpv6Header))
         {
             var ip6 = (NativeIpv6Header*)capture.Packet;
-            if (ip6->NextHeader == 6 && recvLen >= sizeof(NativeIpv6Header) + sizeof(NativeTcpHeader))
+            // The same walk the router's reply leg takes (Ipv6Chain, one file for both programs): where
+            // the transport is is a question with one answer, and a swap aimed at octet 40 would rewrite
+            // an option byte on a packet whose ports are further in.
+            var walked = Ipv6Chain.TryFind(new ReadOnlySpan<byte>((void*)capture.Packet, recvLen), out var chain);
+            if (walked && chain.Protocol == 6 && !chain.AddressDependent)
             {
-                var tcp = (NativeTcpHeader*)((byte*)capture.Packet + sizeof(NativeIpv6Header));
+                var tcp = (NativeTcpHeader*)((byte*)capture.Packet + chain.Transport);
                 ProcessV6(capture, recvLen, ip6, tcp);
             }
             else
             {
-                // An extension header (a fragment, above all) means the TCP header is not where the
-                // rewrite expects it, and a fragment cannot be NATed without rebuilding the whole
-                // datagram. Such a flow goes out untouched, so say so rather than let it look like
-                // a session that was intercepted and simply never appeared.
+                // A fragment cannot be NATed without rebuilding the whole datagram, a chain that stops
+                // short of a transport names no flow, and a routing header's address list (RFC 8200 §4.4)
+                // or an Auth Header's ICV (RFC 4302 §3.3.3) would go on saying what the swap makes false.
+                // Such a flow goes out untouched, so say which of the three rather than let it look like a
+                // session that was intercepted and simply never appeared.
                 var ext = Interlocked.Increment(ref _v6NotTcp);
                 if (ext <= 20)
-                    Console.WriteLine($"[Redirector] PASS v6 next-header={ip6->NextHeader} (extension header, not rewritten)");
+                {
+                    var reason = !walked ? $"chain from next-header={ip6->NextHeader} reaches no transport"
+                        : chain.AddressDependent ? "a routing header or Auth Header is in the chain"
+                        : $"chain reaches protocol {chain.Protocol}, not tcp";
+                    Console.WriteLine($"[Redirector] PASS v6 {reason} (not rewritten)");
+                }
                 capture.Handle.Send((void*)capture.Packet, recvLen, null, (Address*)capture.Addr);
             }
         }
@@ -530,7 +542,10 @@ public class PacketRedirector : IRedirector, IDisposable
         {
             var srcAddr = new IPAddress(FlowState.RawV6Bytes(srcHi, srcLo));
             var dstAddr = new IPAddress(FlowState.RawV6Bytes(dstHi, dstLo));
-            if (_filter is { IsActive: true } filter && !filter.Allows(srcAddr, srcPort, out var identity))
+            // A pid scope names processes on this machine, and a forwarded client has none: the same
+            // reason the v4 leg skips the scope when the packet arrived on the LAN capture.
+            if (capture.Lan is null && _filter is { IsActive: true } filter
+                && !filter.Allows(srcAddr, srcPort, out var identity))
             {
                 _flows.Open(key, intercept: false);
                 Console.WriteLine($"[Redirector] SCOPE pass v6 {srcAddr}:{srcPort} -> {dstAddr}:{dstPort} ({identity.Label})");
@@ -539,6 +554,7 @@ public class PacketRedirector : IRedirector, IDisposable
             }
             var opened = _flows.Open(key, intercept: true);
             Console.WriteLine($"[Redirector] NEW v6 {srcAddr}:{srcPort} -> {dstAddr}:{dstPort} token={opened.Token}" +
+                              (capture.Lan?.V6 is { } side ? $" (forwarded, delivered to {side.Address})" : "") +
                               (opened.Bypassed ? " (pool full, passed through)" : ""));
         }
 
@@ -564,16 +580,44 @@ public class PacketRedirector : IRedirector, IDisposable
         tcp->SrcPort = HostToNet(entry.Token);
         tcp->DstPort = HostToNet((ushort)_relayPort);
 
+        var addr = (Address*)capture.Addr;
+        var arrivedIfIdx = addr->IfIdx;
+        var arrivedSubIfIdx = addr->SubIfIdx;
         if (!isLoopback)
         {
+            // The server's address goes in the source, exactly as in the v4 leg: the rewritten packet is
+            // one the server sends to this process, and that is the peer the accepted socket reports.
             WriteV6(ip6->SourceAddress, dstHi, dstLo);
-            WriteV6(ip6->DestinationAddress, srcHi, srcLo);
-            ((Address*)capture.Addr)->Flags &= ~AddressFlag.Outbound;
-            _local.Handle.CalcOutboundFlag((void*)capture.Packet, (Address*)capture.Addr);
+            // Which way an injected packet goes is this field alone, not the addresses inside it, and
+            // this one is now addressed to this host.
+            addr->Flags &= ~AddressFlag.Outbound;
+            if (capture.Lan?.V6 is { } lan)
+            {
+                // A forwarded client cannot be the destination of a local socket, so the packet is
+                // delivered to this host's own address on the LAN interface, and the index names the
+                // interface that owns that address - what strong-host receive requires (RFC 1122
+                // §3.3.4.2) and what the v4 leg measured. SubIfIdx keeps its arrival value: it is the
+                // sub-interface within that index, not a second copy of it.
+                var (lanHi, lanLo) = lan.Raw;
+                WriteV6(ip6->DestinationAddress, lanHi, lanLo);
+                addr->IfIdx = lan.IfIdx;
+            }
+            else
+            {
+                WriteV6(ip6->DestinationAddress, srcHi, srcLo);
+                _local.Handle.CalcOutboundFlag((void*)capture.Packet, addr);
+            }
         }
 
-        _local.Handle.CalcChecksums((void*)capture.Packet, recvLen, (Address*)capture.Addr);
-        _local.Handle.Send((void*)capture.Packet, recvLen, null, (Address*)capture.Addr);
+        _local.Handle.CalcChecksums((void*)capture.Packet, recvLen, addr);
+        var sent = _local.Handle.Send((void*)capture.Packet, recvLen, null, addr);
+        // Only the forwarded leg reports a line: a local v6 flow already names its endpoint on the
+        // accepted socket, and this is the leg whose delivery has no other evidence.
+        if (isSyn && !isLoopback && capture.Lan?.V6 is { } delivered)
+            Console.WriteLine($"[Redirector] Fwd v6 {new IPAddress(FlowState.RawV6Bytes(srcHi, srcLo))}:{srcPort}" +
+                              $"->{new IPAddress(FlowState.RawV6Bytes(dstHi, dstLo))}:{dstPort}" +
+                              $" to {delivered.Address} ifIdx={addr->IfIdx}/{addr->SubIfIdx}" +
+                              $" (arrived {arrivedIfIdx}/{arrivedSubIfIdx}) sent={sent}");
 
         if (isFinOrRst)
             entry.Closing = true;

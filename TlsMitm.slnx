@@ -5,6 +5,8 @@
     <Project Path="tests/flowcheck/flowcheck.csproj" />
     <Project Path="tests/fwcheck/fwcheck.csproj" />
     <Project Path="tests/natcheck/natcheck.csproj" />
+    <Project Path="tests/nat64check/nat64check.csproj" />
+    <Project Path="tests/v6check/v6check.csproj" />
     <Project Path="tests/quiccheck/quiccheck.csproj" />
     <Project Path="tests/servcheck/servcheck.csproj" />
     <Project Path="tests/starttlsprobe/starttlsprobe.csproj" />
@@ -12,7 +14,10 @@
   <Folder Name="/tools/">
     <Project Path="tools/abortcheck/abortcheck.csproj" />
     <Project Path="tools/apcheck/apcheck.csproj" />
+    <Project Path="tools/dns65check/dns65check.csproj" />
     <Project Path="tools/inject/inject.csproj" />
+    <Project Path="tools/pdprobe/pdprobe.csproj" />
+    <Project Path="tools/tcpwitness/tcpwitness.csproj" />
   </Folder>
   <Project Path="Router/Router.csproj" />
   <Project Path="TlsMitm/TlsMitm.csproj" />

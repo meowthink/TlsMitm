@@ -14,6 +14,7 @@
     <!-- Linked rather than referenced for the same reason natcheck links LanSide: this suite is about
          the packet parser, and a project reference would drag the whole application in with it. -->
     <Compile Include="..\..\TlsMitm\QuicSignature.cs" Link="QuicSignature.cs" />
+    <Compile Include="..\..\TlsMitm\Ipv6Chain.cs" Link="Ipv6Chain.cs" />
     <Compile Include="..\..\TlsMitm\WinDivertNative.cs" Link="WinDivertNative.cs" />
   </ItemGroup>
 

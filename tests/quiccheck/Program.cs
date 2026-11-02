@@ -78,10 +78,19 @@ Expect(!Judge(V4(17, 50000, 443, versionNegotiation, ihl: 5), out _),
 Expect(!Judge(V4(17, 50000, 443, new byte[] { 0x83, 0x00, 0x00, 0x00, 0x01, 0x08, 0, 1, 2, 3 }, ihl: 5), out _),
     "a long header with the fixed bit cleared is not QUIC");
 
-// RFC 8200 §4: the next header is the byte that says what follows the fixed header. An extension header
-// in front of the UDP header is not followed, so this datagram is left alone rather than judged from
-// the wrong offset.
-Expect(!Judge(V6(43, 443, v1), out _), "an IPv6 datagram with a routing header before UDP is not judged");
+// RFC 8200 §4.1 puts §4.3's hop-by-hop header in front of the transport, so the datagram §17.2 describes
+// is not always at octet 40. The walk the redirector swaps by (TlsMitm/Ipv6Chain.cs) is what finds it
+// here, which is the difference between blocking an HTTP/3 handshake and letting it walk past.
+ok = Judge(V6Chain(0, ExtHeader(17), 443, v1), out port);
+Expect(ok && port == 443,
+    "a QUIC Initial behind a hop-by-hop header is found, so the chain is walked and not just index 6 read");
+
+// The two chains this reader declines: §4.4's routing header, whose own contents are addresses the way
+// §4.6's options are not, and §4.5's fragment header, which says the datagram is not all here.
+Expect(!Judge(V6Chain(43, ExtHeader(17), 443, v1), out _),
+    "an IPv6 datagram whose chain carries a routing header is not judged");
+Expect(!Judge(V6Chain(44, ExtHeader(17), 443, v1), out _),
+    "and one whose chain carries a fragment header is not judged either");
 
 // --- what a short buffer must never do: read past it ---------------------------------------------
 
@@ -110,7 +119,7 @@ if (failures.Count > 0)
     Console.WriteLine($"\nquiccheck FAIL ({failures.Count})");
     return 1;
 }
-Console.WriteLine("\nquiccheck PASS - 20 cases");
+Console.WriteLine("\nquiccheck PASS - 22 cases");
 return 0;
 
 // --- datagram builders --------------------------------------------------------------------------
@@ -144,6 +153,29 @@ static byte[] V6(byte nextHeader, ushort dport, byte[] payload)
     payload.CopyTo(packet, 48);
     return packet;
 }
+
+// The same datagram with one of §4.1's headers in front of the UDP one. Its octets are the shape §4.3
+// and §4.6 and §4.4 all share - the number behind it, then the length in 8-octet units not counting the
+// first eight - and the base header's length counts it, because §3 puts extension headers "part of the
+// payload". What the walk has to do is find the UDP header behind them and read its port.
+static byte[] V6Chain(byte first, byte[] ext, ushort dport, byte[] payload)
+{
+    var packet = new byte[40 + ext.Length + 8 + payload.Length];
+    packet[0] = 0x60;
+    BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(4, 2), (ushort)(ext.Length + 8 + payload.Length));
+    packet[6] = first;
+    packet[7] = 64;
+    packet[8] = 0x20;
+    packet[23] = 1;
+    packet[24] = 0x20;
+    packet[39] = 2;
+    ext.CopyTo(packet, 40);
+    Udp(50000, dport, payload.Length).CopyTo(packet, 40 + ext.Length);
+    payload.CopyTo(packet, 48 + ext.Length);
+    return packet;
+}
+
+static byte[] ExtHeader(byte following) => [following, 0, 0, 0, 0, 0, 0, 0];
 
 static byte[] Udp(ushort sport, ushort dport, int payloadLen)
 {

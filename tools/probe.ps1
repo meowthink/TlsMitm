@@ -1,6 +1,6 @@
 param(
-    [string]$Ip = '39.com',
-    [string]$Host_ = 'gathub.com.cn',
+    [string]$Ip = 'github.com',
+    [string]$Host_ = 'github.com',
     [string]$Alpn = 'http/1.1',
     [int]$Port = 443
 )

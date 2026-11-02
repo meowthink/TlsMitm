@@ -11,18 +11,20 @@ namespace Router;
 public static class Services
 {
     // Bound here rather than inside the loop so a port already taken is reported to the console instead
-    // of faulting a task nobody awaits.
-    public static UdpClient? OpenListener(uint lanAddress, ushort port, bool forBroadcast)
+    // of faulting a task nobody awaits. The endpoint carries the family: the resolver listens on the LAN's
+    // IPv4 address and, once a delegation has installed one, on its IPv6 address too, and both are the
+    // same listener shape.
+    public static UdpClient? OpenListener(IPAddress address, ushort port, bool forBroadcast)
     {
         try
         {
-            var socket = new UdpClient(new IPEndPoint(Host.ToIpAddress(lanAddress), port));
+            var socket = new UdpClient(new IPEndPoint(address, port));
             if (forBroadcast) socket.EnableBroadcast = true;
             return socket;
         }
         catch (SocketException ex)
         {
-            Console.WriteLine($"[Router] Cannot bind {NatTable.FormatAddress(lanAddress)}:{port} - {ex.Message}");
+            Console.WriteLine($"[Router] Cannot bind {address}:{port} - {ex.Message}");
             return null;
         }
     }
@@ -101,12 +103,11 @@ public static class Services
         }
     }
 
-    public static async Task RunDns(UdpClient socket, DnsServer server, uint lanAddress,
-        LanProbe probe, CancellationToken token)
+    // Both of the resolver's listeners run this, so the query line is subscribed where the DnsServer is
+    // built rather than here: an event a loop attaches to is an event attached once per loop, and two
+    // loops on one server would print every query twice.
+    public static async Task RunDns(UdpClient socket, DnsServer server, LanProbe? probe, CancellationToken token)
     {
-        server.Queried += (name, type, client) =>
-            Console.WriteLine($"[Router] dns {NatTable.FormatAddress(client)} -> {name} type={type}");
-
         while (!token.IsCancellationRequested)
         {
             UdpReceiveResult request;
@@ -124,7 +125,7 @@ public static class Services
                 return;
             }
 
-            if (TookProbe(probe, request)) continue;
+            if (probe is { } witness && TookProbe(witness, request)) continue;
             // Same reason as in RunDhcp, and no cheaper to defer: an entry past its TTL is already not
             // served (TryRespond compares UsableUntil), so this only stops the table growing.
             server.Sweep();
@@ -142,7 +143,7 @@ public static class Services
         byte[]? reply;
         try
         {
-            if (!server.TryRespond(request.Buffer, Host.ToBigEndian(request.RemoteEndPoint.Address), out reply))
+            if (!server.TryRespond(request.Buffer, request.RemoteEndPoint.Address.ToString(), out reply))
                 return;
         }
         catch (Exception ex)
@@ -178,28 +179,29 @@ public static class Services
         }
     }
 
-    public static TcpListener? OpenTcpListener(uint lanAddress, ushort port)
+    public static TcpListener? OpenTcpListener(IPAddress address, ushort port)
     {
         try
         {
-            var listener = new TcpListener(Host.ToIpAddress(lanAddress), port);
+            var listener = new TcpListener(address, port);
             listener.Start();
             return listener;
         }
         catch (SocketException ex)
         {
-            Console.WriteLine($"[Router] Cannot bind TCP {NatTable.FormatAddress(lanAddress)}:{port} - {ex.Message}");
+            Console.WriteLine($"[Router] Cannot bind TCP {address}:{port} - {ex.Message}");
             return null;
         }
     }
 
     // The TCP half of the same resolver. A client that was handed a truncated UDP answer asks the same
     // question here, and RFC 1035 §4.2.2 is what makes this leg necessary rather than a nicety: "DNS
-    // servers that support UDP implementations MUST implement the TCP protocol".
-    public static async Task RunDnsTcp(TcpListener listener, DnsServer server, uint lanAddress,
+    // servers that support UDP implementations MUST implement the TCP protocol". `bound` is the address
+    // this listener holds, in the text the startup line prints.
+    public static async Task RunDnsTcp(TcpListener listener, DnsServer server, string bound,
         CancellationToken token)
     {
-        Console.WriteLine($"[Router] DNS on {NatTable.FormatAddress(lanAddress)}:{DnsPorts.ServerPort} over TCP too, " +
+        Console.WriteLine($"[Router] DNS on {bound}:{DnsPorts.ServerPort} over TCP too, " +
                           "for the retry a truncated UDP answer calls for");
         while (!token.IsCancellationRequested)
         {
@@ -233,7 +235,7 @@ public static class Services
             // connects and says nothing.
             client.ReceiveTimeout = 4000;
             client.SendTimeout = 4000;
-            var peer = Host.ToBigEndian(((IPEndPoint)client.Client.RemoteEndPoint!).Address);
+            var peer = ((IPEndPoint)client.Client.RemoteEndPoint!).Address.ToString();
             try
             {
                 var stream = client.GetStream();
@@ -241,7 +243,7 @@ public static class Services
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[Router] DNS over TCP from {NatTable.FormatAddress(peer)} failed: " +
+                Console.WriteLine($"[Router] DNS over TCP from {peer} failed: " +
                                   $"{ex.GetType().Name}: {ex.Message}");
             }
         }
@@ -251,14 +253,14 @@ public static class Services
     // integer specifying the length of the following message", and the 512-octet ceiling of §4.2.1 does
     // not apply - which is the whole reason a truncated answer goes this way. Split out from the
     // listener so tests/servcheck drives it over a MemoryStream with no socket.
-    public static void ServeDnsConnection(Stream input, Stream output, DnsServer server, uint clientAddress)
+    public static void ServeDnsConnection(Stream input, Stream output, DnsServer server, string client)
     {
         var prefix = new byte[2];
         if (!ReadExactly(input, prefix)) return;
         var query = new byte[BinaryPrimitives.ReadUInt16BigEndian(prefix)];
         if (!ReadExactly(input, query)) return;
 
-        if (!server.TryRespond(query, clientAddress, out byte[]? reply) || reply is null) return;
+        if (!server.TryRespond(query, client, out byte[]? reply) || reply is null) return;
         var framed = new byte[reply.Length + 2];
         BinaryPrimitives.WriteUInt16BigEndian(framed, (ushort)reply.Length);
         reply.CopyTo(framed.AsSpan(2));

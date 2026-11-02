@@ -16,9 +16,10 @@ namespace TlsMitm;
 /// session into a working one, and the captures show a refusal arriving as an alert in place of
 /// Finished, so the client leg's own outcome is the only evidence against a host. Silence is not
 /// evidence: §6.2.1 has a client with no configuration send GREASE ECH, and that is what Chrome and
-/// Edge send for a host that publishes no ech SvcParam (measured: cn.bing.com, sixteen hellos, sixteen
-/// different config_id bytes). Such a client finishes the terminated
-/// handshake and then sits idle, so a quiet connection says nothing about whether termination worked -
+/// Edge send for a host that publishes no ech SvcParam (measured on a search edge whose CNAME chain
+/// carries no HTTPS RR: sixteen hellos, sixteen different config_id bytes). Such a client finishes
+/// the terminated handshake and then sits idle, so a quiet connection says nothing about whether
+/// termination worked -
 /// scoring it as failure is what used to blind a host around every page load. Only a client leg that
 /// fails sends a host back to blind relay, because an experiment must not leave a site failing.
 /// </summary>

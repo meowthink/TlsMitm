@@ -21,7 +21,18 @@ public static class DnsFormat
 {
     public const int HeaderLength = 12;
     public const ushort ClassInternet = 1;
+    // RFC 1035 §3.2.2's TYPE values, and the three later RFCs that added the ones this server has to
+    // tell apart: RFC 3596 §2.1 for AAAA ("The IANA assigned value of the type is 28"), RFC 6672 §2.1
+    // for DNAME ("type code 39"), RFC 2782 for SRV ("whose DNS type code is 33").
     public const ushort TypeA = 1;
+    public const ushort TypeNs = 2;
+    public const ushort TypeCname = 5;
+    public const ushort TypeSoa = 6;
+    public const ushort TypePtr = 12;
+    public const ushort TypeMx = 15;
+    public const ushort TypeAaaa = 28;
+    public const ushort TypeSrv = 33;
+    public const ushort TypeDname = 39;
     public const ushort TypeSvcb = 64;
     public const ushort TypeHttps = 65;
     // RFC 9848 §3: the "ech" SvcParamKey "conveys the ECH configuration", and the RFC's IANA table
@@ -274,7 +285,12 @@ public static class DnsFormat
     // two-octet pointer whose low 14 bits are an offset back into the message. The offset has to come
     // back at the record's own fields, two octets past the pointer, rather than at the end of the name
     // the pointer led to - that is why this is not the same as reading one.
-    private static bool SkipName(ReadOnlySpan<byte> message, ref int offset)
+    private static bool SkipName(ReadOnlySpan<byte> message, ref int offset) => ReadName(message, ref offset, null);
+
+    // The same walk with the labels written out: `body` gets the length-prefixed labels and the closing
+    // zero octet, with every pointer resolved. A message being assembled does not have this one's layout,
+    // so a pointer copied across into it would name something else.
+    internal static bool ReadName(ReadOnlySpan<byte> message, ref int offset, List<byte>? body)
     {
         var resume = -1;
         var steps = 0;
@@ -283,6 +299,7 @@ public static class DnsFormat
             var length = message[offset];
             if (length == 0)
             {
+                body?.Add(0);
                 offset = resume >= 0 ? resume : offset + 1;
                 return offset <= message.Length;
             }
@@ -295,6 +312,13 @@ public static class DnsFormat
                 if (resume < 0) resume = offset + 2;
                 offset = target;
                 continue;
+            }
+            if (offset + 1 + length > message.Length) return false;
+            if (length > 63) return false;
+            if (body is not null)
+            {
+                body.Add(length);
+                body.AddRange(message.Slice(offset + 1, length));
             }
             offset += 1 + length;
             if (++steps > 128) return false;                              // a name cannot be that long
@@ -330,7 +354,27 @@ public static class DnsFormat
         answer.AddRange(ttlBytes);
         answer.AddRange([0x00, 0x04]);
         answer.AddRange(AddressBytes(address));
+        return Authoritative(query, questionEnd, answer);
+    }
 
+    // The same shape with a CNAME instead, whose RDATA is RFC 1035 §3.3.4's "A <domain-name> which
+    // specifies the canonical or primary name for the owner". The target is written as labels rather
+    // than as a pointer into this message: it names something the question does not.
+    public static byte[] BuildCnameAnswer(ReadOnlySpan<byte> query, int questionEnd, uint ttl, string target)
+    {
+        var answer = new List<byte> { 0xC0, 0x0C };
+        AddShort(answer, TypeCname);
+        AddShort(answer, ClassInternet);
+        AddUInt(answer, ttl);
+        var rdata = new List<byte>();
+        WriteName(rdata, target);
+        AddShort(answer, (ushort)rdata.Count);
+        answer.AddRange(rdata);
+        return Authoritative(query, questionEnd, answer);
+    }
+
+    private static byte[] Authoritative(ReadOnlySpan<byte> query, int questionEnd, List<byte> answer)
+    {
         var question = query[HeaderLength..questionEnd];
         var message = new byte[HeaderLength + question.Length + answer.Count];
         BinaryPrimitives.WriteUInt16BigEndian(message.AsSpan(0, 2),
@@ -371,6 +415,13 @@ public static class DnsFormat
         BinaryPrimitives.WriteUInt16BigEndian(bytes, value);
         body.AddRange(bytes);
     }
+
+    private static void AddUInt(List<byte> body, uint value)
+    {
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(bytes, value);
+        body.AddRange(bytes);
+    }
 }
 
 // The cache and the forwarding decision, with the local names that come out of the DHCP pool mixed in.
@@ -379,20 +430,22 @@ public sealed class DnsServer
     private readonly Func<byte[], bool, byte[]?> _transport;
     private readonly Func<DateTime> _now;
     private readonly Func<string, uint?> _localAddress;
+    private readonly Pref64Config? _pref64;
     private readonly Dictionary<string, (byte[] Message, DateTime UsableUntil)> _cache = new();
     private readonly object _gate = new();
     private int _nextUpstreamId;
 
-    // A local answer is about an address that can be rebound the moment a lease expires, so it is held
-    // for a short fixed time rather than the length of the lease.
+    // A local answer is held for a short fixed time: the address it names can be rebound the moment a
+    // lease expires, and the reverse mapping is only as current as the prefix it was derived from.
     public const uint LocalAnswerTtl = 30;
 
     public DnsServer(Func<byte[], bool, byte[]?> transport, Func<string, uint?> localAddress,
-        Func<DateTime>? now = null)
+        Func<DateTime>? now = null, Pref64Config? pref64 = null)
     {
         _transport = transport;
         _localAddress = localAddress;
         _now = now ?? (() => DateTime.UtcNow);
+        _pref64 = pref64;
     }
 
     public int CacheCount
@@ -400,15 +453,19 @@ public sealed class DnsServer
         get { lock (_gate) return _cache.Count; }
     }
 
-    public event Action<string, ushort, uint>? Queried;
+    public event Action<string, ushort, string>? Queried;
 
-    public bool TryRespond(ReadOnlySpan<byte> request, uint clientAddress, out byte[]? reply)
+    // The client is its address in text rather than the four-octet form the v4 side of this program uses
+    // everywhere else: one resolver answers both families, and the identity is only ever printed. Reading
+    // a v6 endpoint's first four octets as an address - which Host.ToBigEndian does without complaint -
+    // would put a number in the log that names nothing.
+    public bool TryRespond(ReadOnlySpan<byte> request, string client, out byte[]? reply)
     {
         reply = null;
         if (!DnsFormat.TryReadQuery(request, out var query)) return false;
 
         var question = query.Question;
-        Queried?.Invoke(question.Name, question.Type, clientAddress);
+        Queried?.Invoke(question.Name, question.Type, client);
 
         // A name this pool handed out is answered from the lease table and never leaves the host: that
         // is what makes a device addressable by the hostname it reported in option 12.
@@ -416,6 +473,16 @@ public sealed class DnsServer
         if (question.Type == DnsFormat.TypeA && _localAddress(first) is uint local)
         {
             reply = DnsFormat.BuildAnswer(request, query.QuestionEnd, LocalAnswerTtl, local);
+            return true;
+        }
+
+        // RFC 6147 §5.3.1: a PTR for an address inside our own Pref64::/n is answered here rather than
+        // sent upstream, whose reverse tree has never heard of that address. An address outside it is
+        // §5.3.1's other case and goes on its way untouched.
+        if (question.Type == DnsFormat.TypePtr && _pref64 is { } prefix
+            && Dns64.PtrTarget(question.Name, prefix) is { } target)
+        {
+            reply = DnsFormat.BuildCnameAnswer(request, query.QuestionEnd, LocalAnswerTtl, target);
             return true;
         }
 
@@ -434,7 +501,9 @@ public sealed class DnsServer
             }
         }
 
-        var upstream = AskUpstream(query);
+        var upstream = AskUpstream(question.Name, question.Type);
+        if (question.Type == DnsFormat.TypeAaaa && _pref64 is { } pref64)
+            upstream = SynthesizeAaaa(request, query, pref64, upstream);
         if (upstream is null) return false;
 
         // Before the cache, so the stored copy is the one with no configuration in it and a cache hit
@@ -455,12 +524,46 @@ public sealed class DnsServer
         return true;
     }
 
-    private byte[]? AskUpstream(DnsQuery query)
+    // RFC 6147 §5.1's whole decision, for the one query type it changes. `aaaa` is what came back for
+    // the client's own question, and it may be nothing at all: §5.1.3 turns a timeout into RCODE=2, and
+    // §5.1.2 turns any RCODE other than 3 into "as though the RCODE were 0 ... and the answer section
+    // were empty", which is a synthesis case like any other.
+    private byte[]? SynthesizeAaaa(ReadOnlySpan<byte> request, DnsQuery query, Pref64Config pref, byte[]? aaaa)
+    {
+        var verdict = aaaa is null ? Dns64.Verdict.Failed : Dns64.Classify(aaaa);
+        switch (verdict)
+        {
+            // §5.1.1: real AAAA data is returned "as per normal DNS semantics". §5.1.2: RCODE=3 "is
+            // handled according to normal DNS operation".
+            case Dns64.Verdict.Usable:
+            case Dns64.Verdict.NameError:
+                return aaaa;
+        }
+
+        // §5.1.4, with a usable record among the offending ones: the answer section built from what is
+        // left "is used in the assembly of a response as detailed in Section 5.4". §5.1.1 then keeps the
+        // A query from being asked at all - "MUST NOT synthesize AAAA RRs when real AAAA RRs exist" - and
+        // the records that remain are real ones.
+        if (verdict is Dns64.Verdict.Mixed)
+            return Dns64.WithoutExcluded(aaaa!) ?? aaaa;
+
+        // §5.1.4's other case, an answer of nothing but excluded addresses, "MUST [be treated] as though
+        // it were an empty answer", which is where §5.1.6 starts.
+        var basis = verdict is Dns64.Verdict.ExcludedOnly ? Dns64.WithoutExcluded(aaaa!) ?? aaaa : aaaa;
+
+        // §5.1.6: the A query is what the synthesis is based on, and an empty or unanswerable one leaves
+        // §5.4's rule in charge - "the DNS64 responds to the original querying client with the answer the
+        // DNS64 received to the original (initiator's) query".
+        if (AskUpstream(query.Question.Name, DnsFormat.TypeA) is not { } a) return basis;
+        return Dns64.Synthesize(request, query.QuestionEnd, basis, a, pref) ?? basis;
+    }
+
+    private byte[]? AskUpstream(string name, ushort type)
     {
         // Every caller draws from the same counter: the UDP and the TCP listener answer at once now, and
         // two queries carrying one id are the same question to the receive loop that dispatches by it.
         var id = (ushort)Interlocked.Increment(ref _nextUpstreamId);
-        var message = DnsFormat.BuildQuery(id, query.Question.Name, query.Question.Type);
+        var message = DnsFormat.BuildQuery(id, name, type);
         var answer = _transport(message, false);
 
         // Truncation on UDP is answered the way §4.2.1 points at: the same question over TCP, where

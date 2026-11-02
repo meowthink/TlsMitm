@@ -212,7 +212,8 @@ public class MitmProxy
         // kept using it, and a failed client leg is the §6.1.7 refusal. Neither is a timer, because a
         // GREASE-ECH connection (RFC 9849 §6.2.1) can finish the handshake and then sit idle.
         await MitmAsync(stream, rawBytes, serverStream, host, clientHello?.Alpn, dest,
-            ResolveTrust(identity, clientHello), identity.Pid, ct, echTerminate);
+            ResolveTrust(identity, clientHello), identity.Pid, ct, echTerminate,
+            earlyData: clientHello?.EarlyData == true);
     }
 
     private string ResolveTlsHost(ClientHelloInfo? hello, OriginalDest dest)
@@ -241,7 +242,7 @@ public class MitmProxy
     private async Task MitmAsync(
         Stream rawClientStream, byte[] replayedHello, Stream serverStream, string host,
         IReadOnlyList<string>? offeredAlpn, OriginalDest dest, ClientTrust trust, int pid,
-        CancellationToken ct, bool echProbe = false)
+        CancellationToken ct, bool echProbe = false, bool earlyData = false)
     {
         var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         // The probe's two proofs are read off this session: application bytes, reported after they
@@ -262,8 +263,8 @@ public class MitmProxy
         // told only the one the server agreed to. Choosing independently per leg is how an h2-capable
         // client ends up sending h2 frames into a server that settled on http/1.1: the byte relay
         // cannot translate, so both peers see a protocol violation. (Measured, not from RFC 7301:
-        // a TLS server that selects no protocol leaves HTTP clients on HTTP/1.1 - the baiduredge
-        // negotiates no ALPN even when offered h2 - so an empty list toward the client matches it.)
+        // a TLS server that selects no protocol leaves HTTP clients on HTTP/1.1 - a measured search
+        // edge negotiates no ALPN even when offered h2 - so an empty list toward the client matches it.)
         //
         // With no protocol to agree on, the client handshake stays first. A server may legitimately
         // delay its TLS answer until the application asks for the data - an FTPS data listener accepts
@@ -299,6 +300,17 @@ public class MitmProxy
         var capture = new HandshakeCapture();
         capture.Record(replayedHello, fromClient: true);
         var capturingClient = new CapturingStream(rawClientStream, capture);
+
+        // The capture has the whole first flight; the terminator reads the hello and nothing behind it.
+        // Those octets are the client's early data, which no key this handshake produces can open, so
+        // withholding them is what lets the session be terminated at all - see EarlyData.
+        var (helloRecord, withheld) = EarlyData.Split(replayedHello, earlyData);
+        if (withheld.Length > 0)
+        {
+            replayedHello = helloRecord;
+            Console.WriteLine($"[Proxy] Withheld {withheld.Length} octets of early data from {host}" +
+                " - terminating without it");
+        }
 
         var clientStream = new PrefixedStream(replayedHello, capturingClient);
         Stream sslClient;
@@ -551,7 +563,8 @@ public class MitmProxy
         // A STARTTLS upgrade negotiates no application protocol, so no ALPN is offered to either
         // peer; the client never asked for one.
         await MitmAsync(clientRaw, rawBytes, serverRaw, host, null, dest,
-            ResolveTrust(identity, clientHello), identity.Pid, ct);
+            ResolveTrust(identity, clientHello), identity.Pid, ct,
+            earlyData: clientHello?.EarlyData == true);
     }
 
     /// <summary>
@@ -1052,17 +1065,16 @@ public class MitmProxy
         /// <summary>
         /// Names the handshake shapes we cannot terminate, or null when we can. Relaying the bytes
         /// untouched keeps such a session alive end to end and still captures every packet; terminating
-        /// it would do neither. The three reasons are structural: ECH encrypts the inner ClientHello
-        /// to a key only the server holds (RFC 9849 §5); 0-RTT encrypts the early data under the
-        /// PSK, which a terminated handshake never learns (RFC 9846 §2.3, §4.3.10); and psk_ke(0)
-        /// supplies no key_share at all, leaving no ephemeral secret to obtain (RFC 9846 §4.3.9).
-        /// ECH is the one shape a caller may deliberately terminate instead, as the retry probe
-        /// <see cref="EchDowngrade"/> describes.
+        /// it would do neither. The two reasons are structural: ECH encrypts the inner ClientHello to a
+        /// key only the server holds (RFC 9849 §5), and psk_ke(0) supplies no key_share at all, leaving
+        /// no ephemeral secret to obtain (RFC 9846 §4.3.9). ECH is the one shape a caller may
+        /// deliberately terminate instead, as the retry probe <see cref="EchDowngrade"/> describes. A
+        /// hello offering early data is not on this list: <see cref="EarlyData.Split"/> keeps those
+        /// records off the terminator, which is what makes the session terminable.
         /// </summary>
         public string? CannotTerminate()
         {
             if (Ech) return "ECH - the inner hello is encrypted for the server's own key";
-            if (EarlyData && PskOffered) return "0-RTT - the client sends early data we cannot decrypt";
             if (PskOnly) return "PSK-only resumption - the client allows no ECDHE fallback";
             return null;
         }
