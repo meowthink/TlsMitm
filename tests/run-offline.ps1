@@ -14,11 +14,13 @@ if (Get-Process TlsMitm -ErrorAction SilentlyContinue) {
 # starttlsprobe runs any number of modes in one process, and what a mode costs before its
 # conversation even starts does not depend on the mode: root-store read, CRL build, cert engine
 # (~0.6s measured). Grouped by protocol family, so a group that hangs or crashes still names the
-# modes it covers.
+# modes it covers. The media group's last mode hands its session to a third-party client and skips
+# itself when TLSMITM_FFMPEG is unset, so the group stays green on a machine with no ffmpeg.
 $groups = @(
-    ,@('smtp', 'smtpsplit', 'imap', 'pop3', 'ftp', 'nntp', 'xmpp', 'xmpp-split', 'xmpp-nosni', 'xmpp-decline', 'xmpp-bad', 'reject', 'ldap', 'ldap-decline', 'ldap-bad')
+    ,@('smtp', 'smtpsplit', 'imap', 'pop3', 'ftp', 'nntp', 'xmpp', 'xmpp-split', 'xmpp-nosni', 'xmpp-decline', 'xmpp-bad', 'reject', 'ldap', 'ldap-decline', 'ldap-bad', 'sunrpc', 'sunrpc-split', 'sunrpc-unavail', 'sunrpc-decline', 'sunrpc-misuse', 'sunrpc-near', 'sunrpc-bad', 'sunrpc-wrong-token', 'sunrpc-wrong-flavor')
     ,@('ftps-pasv', 'ftps-epsv', 'ftps-active', 'ftps-active-split', 'ftps-active-clear')
     ,@('plain', 'implicit', 'implicit-ip', 'ipv6', 'early-data', 'https-close', 'alpn-fallback', 'alpn-h2', 'mtls-refused')
+    ,@('rtsps', 'rtmps', 'sips', 'rtmps-ffmpeg')
     ,@('ech-relay', 'ech-downgrade', 'emsign', 'auto', 'handshake-abort', 'grease', 'rootcheck', 'filter', 'early-refuse')
 )
 

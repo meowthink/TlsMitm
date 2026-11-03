@@ -49,12 +49,13 @@ per-client chain selection, a local CRL, and plain pcap output.
 
 Detection reads bytes, never ports: a connection whose first byte is `0x16` is implicit TLS whatever
 port it uses, a server-first text protocol is scanned for the upgrade command, and a client-first
-session is named by its own first octet — `0x30` for LDAP's BER, `<` for XMPP's XML. The protocol names
-below are what the mechanism covers; no port table is consulted.
+session is named by its own first octet — `0x30` for LDAP's BER, `<` for XMPP's XML, `0x00` or `0x80`
+for the high byte of an RPC record mark (RFC 5531 §11). The protocol names below are what the mechanism
+covers; no port table is consulted.
 
 | protocol | how the upgrade is granted | result |
 | --- | --- | --- |
-| HTTPS, FTPS, IMAPS, POP3S, LDAPS, NNTPS, IRCS, XMPP direct TLS, SIPS | none — TLS from the first byte | terminated and decrypted |
+| HTTPS, FTPS, IMAPS, POP3S, LDAPS, NNTPS, IRCS, XMPP direct TLS, SIPS, RTSPS, RTMPS | none — TLS from the first byte | terminated and decrypted |
 | SMTP | `STARTTLS` → `220` (RFC 3207 §4) | upgraded in place |
 | IMAP | `<tag> STARTTLS` → `<tag> OK` (RFC 9051 §6.2.1) | upgraded in place |
 | POP3 | `STLS` → `+OK` (RFC 2595 §4) | upgraded in place |
@@ -62,13 +63,14 @@ below are what the mechanism covers; no port table is consulted.
 | NNTP | `STARTTLS` → `382` (RFC 4642 §2.2) | upgraded in place |
 | LDAP | BER `ExtendedRequest` `1.3.6.1.4.1.1466.20037` → `ExtendedResponse` success (RFC 4511 §4.14) | upgraded in place |
 | XMPP | `<starttls/>` → `<proceed/>` (RFC 6120 §5.4.2, boundary at the `>` per §5.4.2.3) | upgraded in place |
+| RPC (NFS, rpcbind) | `AUTH_TLS` NULL probe → `MSG_ACCEPTED` whose verifier is `AUTH_NONE` over `"STARTTLS"` (RFC 9289 §4.1, flavor 7 per §7.1, ALPN `sunrpc` per §5 and §7.2) | upgraded in place |
 | any other TCP | — | relayed as it comes, not captured |
 
 A session this proxy cannot read is not a broken one either: the two sockets keep carrying bytes, so
 client and real server finish the handshake between themselves, and the plaintext simply stays inside
-the packets instead of coming out of them. `ldap-bad` and `xmpp-bad` are the offline modes that hold the
-proxy to that behaviour; `reject`, `ldap-decline` and `xmpp-decline` hold it to a server that really
-refuses.
+the packets instead of coming out of them. `ldap-bad`, `xmpp-bad` and `sunrpc-bad` are the offline modes
+that hold the proxy to that behaviour; `reject`, `ldap-decline`, `xmpp-decline` and `sunrpc-decline` hold
+it to a server that really refuses.
 
 ## Which chain, for which client
 
@@ -443,19 +445,24 @@ No admin and no WinDivert: the real `MitmProxy` is driven through `FakeRedirecto
 a loopback conversation the harness judges itself. Stop a live `TlsMitm` first — it intercepts the
 suite's own loopback traffic and turns passing modes into false failures.
 
-* `starttlsprobe` — 38 modes, run as four grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP and the
-  two element dialects, LDAP's BER and XMPP's XML, each with its split-write, refusal and unreadable-stream
-  cases, XMPP's nameless-hello leaf verdict, FTPS passive/active/clear, ALPN, IPv6, implicit TLS without
+* `starttlsprobe` — 51 modes, run as five grouped processes: STARTTLS for SMTP/IMAP/POP3/FTP/NNTP and the
+  three dialects that carry no line, LDAP's BER, XMPP's XML and RPC's records, each with its split-write,
+  refusal and unreadable-stream cases, RPC's near-probe records and its accepted replies that fail one clause
+  of the grant, XMPP's nameless-hello leaf verdict, FTPS passive/active/clear, ALPN including the `sunrpc`
+  identifier a granted RPC probe carries over both legs, IPv6, implicit TLS without
   SNI, emSign and per-process chains, 0-RTT, the same hello offered to each of the two terminators, the ECH
   hello terminated and relayed blind, close_notify
   via a strict Schannel client, a Node client that refuses the flight and must leave its handshake in an
   `*_aborted.pcap`, an upstream that refuses the composed hello and must leave the session to a blind
   relay, the process-scope decision table, and `rootcheck`, which
   compares the root the suite signs with against the one `RootCa` finds on its own and checks that
-  `--init-ca` produces the same shape. The emSign modes use Electron when `TLSMITM_ELECTRON` or the
-  default Electron install is available, then fall back to Node; `TLSMITM_NODE` overrides the Node
-  executable. The `live-ftps` mode is not in the grouped run: it names a real server through
-  `TLSMITM_LIVE_FTPS_HOST`, whose `TLSMITM_LIVE_FTPS_PORT` and `TLSMITM_LIVE_FTPS_PATH` default to `990`
+  `--init-ca` produces the same shape. The media group holds four modes: the RTSP, RTMP and SIP shapes the
+  harness speaks for itself, and `rtmps-ffmpeg`, which hands the session to the ffmpeg named by
+  `TLSMITM_FFMPEG` and skips with a note when it is unset. The emSign modes use Electron when
+  `TLSMITM_ELECTRON` or the default Electron install is available, then fall back to Node;
+  `TLSMITM_NODE` overrides the Node executable. The `live-ftps` mode is not in the grouped run: it names
+  a real server through `TLSMITM_LIVE_FTPS_HOST`, whose `TLSMITM_LIVE_FTPS_PORT` and
+  `TLSMITM_LIVE_FTPS_PATH` default to `990`
   and `/`, and it skips with a note when the host is unset.
   The chain the client is *presented* must name an emSign intermediate and the relay must complete;
   whether its own store trusts the legacy eMSign roots is recorded, not required. A single mode still

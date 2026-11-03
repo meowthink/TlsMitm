@@ -128,6 +128,11 @@ public class PcapWriter : IDisposable
         _writer.Write(ethIpTcp);
 
         _packetCount++;
+        // Hand the record to the operating system here rather than on Dispose: this file is read while the
+        // session is still running - a check judges a dialogue the moment it ends, and a live run is watched
+        // in Wireshark - and a record still sitting in this process's buffer is invisible to both. Flush
+        // without the flushBufferToDisk flag, so the octets leave the process without an fsync per packet.
+        _writer.Flush();
     }
 
     private (uint Seconds, uint Microseconds) Stamp()

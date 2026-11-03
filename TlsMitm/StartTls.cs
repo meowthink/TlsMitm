@@ -14,11 +14,14 @@ internal enum StartTlsOutcome
 /// reply, as each protocol defines them: SMTP "STARTTLS" answered by 220 (RFC 3207 §4), IMAP
 /// "&lt;tag&gt; STARTTLS" answered by a tagged OK (RFC 9051 §6.2.1), POP3 "STLS" answered by +OK
 /// (RFC 2595 §4), FTP "AUTH TLS" answered by 234 (RFC 4217 §4.2), NNTP "STARTTLS" answered by 382
-/// (RFC 4642 §2.2). Two dialects have no line to read. LDAP's StartTLS is an extended operation in BER,
+/// (RFC 4642 §2.2). Three dialects have no line to read. LDAP's StartTLS is an extended operation in BER,
 /// so a session whose first client octet is a SEQUENCE tag is handed to <see cref="LdapScanner"/>
 /// (RFC 4511 §4.14). XMPP's is an element inside an open XML stream, so a session whose first client
 /// octet is the '&lt;' that opens the stream negotiation is handed to <see cref="XmppScanner"/>
-/// (RFC 6120 §4.2, §5.4.2). Neither ever reaches the line scanner.
+/// (RFC 6120 §4.2, §5.4.2). RPC-over-TCP is the third: its records carry no line either, so a session whose
+/// first client octet is the high byte of an RFC 5531 §11 record mark is handed to <see cref="SunRpcScanner"/>,
+/// which looks for the AUTH_TLS probe of RFC 9289 §4.1 and the "STARTTLS" verifier that answers it. None of
+/// the three ever reaches the line scanner.
 /// The client pump stops reading once the command is forwarded. In all of these protocols the handshake
 /// begins only after the success reply: RFC 3207 §4 requires the client to start negotiating before
 /// issuing any other command, RFC 9051 §6.2.1 and RFC 2595 §4 both say the negotiation starts
@@ -26,7 +29,9 @@ internal enum StartTlsOutcome
 /// reply that grants AUTH TLS, RFC 4642 §2.2 makes 382 the reply that grants TLS negotiation,
 /// RFC 4511 §4.14.1 forbids the LDAP client any further PDU until the response arrives, and
 /// RFC 6120 §5.4.3.1 rule 1 forbids either XMPP entity "any further XML data until the TLS
-/// negotiation is complete".
+/// negotiation is complete". RFC 9289 §4.1 has the client send its ClientHello "on the same connection"
+/// once the reply grants the probe, and §5.1.1 gives a receiver nothing to do with bytes that appear
+/// between that probe and the handshake: it "MUST discard that data without response".
 /// No read is therefore in flight when both sockets are handed to SslStream.
 /// </summary>
 internal sealed class StartTlsSession
@@ -50,6 +55,8 @@ internal sealed class StartTlsSession
     private LdapScanner? _ldapServer;
     private XmppScanner? _xmppClient;
     private XmppScanner? _xmppServer;
+    private SunRpcScanner? _sunRpcClient;
+    private SunRpcScanner? _sunRpcServer;
     private bool _dialectDecided;
 
     public bool AwaitingReply => _awaitingReply;
@@ -100,9 +107,22 @@ internal sealed class StartTlsSession
                 _xmppClient = new XmppScanner(clientSide: true);
                 _xmppServer = new XmppScanner(clientSide: false);
             }
+            // RPC-over-TCP speaks first too, and its first octet is the high byte of the record mark RFC 5531
+            // §11 puts in front of every fragment: the last-fragment bit above a 31-bit length. The probe of RFC
+            // 9289 §4.1 is one record of one fragment and opens with 0x80; a record the client split opens with
+            // 0x00, because §11 lets a fragment be any size below 2^24 octets and that bit is all the high byte
+            // holds. Neither octet can start a line command or either element above, so a stream that begins with
+            // one of them is counted as records - and a stream with no probe in it is counted through and
+            // relayed untouched.
+            else if (data[0] is 0x00 or >= 0x80)
+            {
+                _sunRpcClient = new SunRpcScanner(clientSide: true);
+                _sunRpcServer = new SunRpcScanner(clientSide: false);
+            }
         }
 
         if (_ldapClient != null) return ScanClientLdap(data);
+        if (_sunRpcClient != null) return ScanClientSunRpc(data);
         return _xmppClient != null ? ScanClientXmpp(data) : ScanClientLines(data);
     }
 
@@ -122,6 +142,20 @@ internal sealed class StartTlsSession
         if (decision != LdapDecision.Requested) return data.Length;
 
         _ldapServer!.StartTlsMessageId = _ldapClient.StartTlsMessageId;
+        _awaitingReply = true;
+        ClientRemainder = data[end..].ToArray();
+        return end;
+    }
+
+    private int ScanClientSunRpc(ReadOnlySpan<byte> data)
+    {
+        var end = _sunRpcClient!.Scan(data, out var mark);
+        // Once this session has an outcome the plaintext RPC carries on for good (see ScanServerSunRpc), so a
+        // later probe is relayed as what it is: another record. Re-arming here would park the client pump on a
+        // decision that is already made and never read the rest of the stream.
+        if (mark != SunRpcMark.Probe || Result != null) return data.Length;
+
+        _sunRpcServer!.ProbeXid = _sunRpcClient.ProbeXid;
         _awaitingReply = true;
         ClientRemainder = data[end..].ToArray();
         return end;
@@ -215,13 +249,15 @@ internal sealed class StartTlsSession
     /// RFC 959 §4.2), so only the last line of one decides.
     /// The line dialects are only readable once a command is pending, so they are skipped until then, and
     /// so is XMPP's: its grant is recognised by the element itself, so nothing is lost by joining the
-    /// stream at the command. LDAP is read from its first octet instead: a BER walker that joins the
-    /// stream late cannot tell where one message ends, and losing that boundary loses the messageID the
-    /// grant is matched by.
+    /// stream at the command. LDAP and RPC are read from their first octet instead: a walker that joins the
+    /// stream late cannot tell where one message ends, and losing that boundary loses what the grant is
+    /// matched by - LDAP the messageID of RFC 4511 §4.1.1, RPC the fragment lengths of RFC 5531 §11 and the
+    /// xid that §9 has a reply carry.
     /// </summary>
     public int ScanServer(ReadOnlySpan<byte> data)
     {
         if (_ldapServer != null) return ScanServerLdap(data);
+        if (_sunRpcServer != null) return ScanServerSunRpc(data);
         if (_xmppServer != null) return _awaitingReply ? ScanServerXmpp(data) : data.Length;
         return _awaitingReply ? ScanServerLines(data) : data.Length;
     }
@@ -242,6 +278,30 @@ internal sealed class StartTlsSession
             return data.Length;
         }
 
+        ServerRemainder = data[end..].ToArray();
+        Complete(StartTlsOutcome.Upgrade);
+        return end;
+    }
+
+    private int ScanServerSunRpc(ReadOnlySpan<byte> data)
+    {
+        var end = _sunRpcServer!.Scan(data, out var mark);
+        if (mark is not (SunRpcMark.Granted or SunRpcMark.Declined)) return data.Length;
+
+        // RFC 9289 §4.1: a reply that is not MSG_ACCEPTED with the AUTH_NONE "STARTTLS" verifier rules out a
+        // ClientHello from the client, so the refusal is relayed and RPC carries on in plaintext. That outcome
+        // is fixed once: it was reached here or on an earlier record, and what follows is then only counted to
+        // keep the walk in step with the record boundaries, never acted on.
+        if (mark == SunRpcMark.Declined || Result != null)
+        {
+            Complete(StartTlsOutcome.Reject);
+            _sunRpcServer.Scan(data[end..], out _);
+            return data.Length;
+        }
+
+        // §4.1 has the ClientHello follow on the same connection, and §5.1.1 gives a receiver nothing to do
+        // with bytes that appear between the probe and the handshake, so the octets behind this record are the
+        // start of the TLS stream.
         ServerRemainder = data[end..].ToArray();
         Complete(StartTlsOutcome.Upgrade);
         return end;

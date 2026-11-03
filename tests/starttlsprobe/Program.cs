@@ -41,6 +41,15 @@ async Task<int> RunModeAsync(string mode)
         return 0;
     }
 
+    // The real-client media mode needs a media client, and this repo carries none: the person running it
+    // names their own ffmpeg, the one binary here that speaks rtmps://.
+    var ffmpegPath = mode == "rtmps-ffmpeg" ? Environment.GetEnvironmentVariable("TLSMITM_FFMPEG") : null;
+    if (mode == "rtmps-ffmpeg" && (ffmpegPath == null || !File.Exists(ffmpegPath)))
+    {
+        Console.WriteLine($"[Probe] {mode}: SKIPPED, set TLSMITM_FFMPEG to an ffmpeg binary that speaks TLS");
+        return 0;
+    }
+
     Console.WriteLine($"[Probe] mode={mode}");
 
     using var upstreamKey = RSA.Create(2048);
@@ -78,6 +87,18 @@ async Task<int> RunModeAsync(string mode)
     // length travels with the verdict: "no ECH here" is only evidence if some flight arrived at all.
     var echSeen = new TaskCompletionSource<(int Bytes, bool Ech)>(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    // The media dialects are judged at the far end of the session: what server name the proxy offered the
+    // upstream when it dialled, and which octets of the dialect arrived after TLS was terminated. The name
+    // is the whole question for a client that sends no server_name, because the leaf the client was served
+    // is named from the destination address instead.
+    var mediaSeen = new TaskCompletionSource<(string? Offered, byte[] First, byte[] Second)>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+
+    // The scripted media modes judge the same two questions, but after a whole dialogue instead of after one
+    // flight: which name the proxy offered upstream, and how many turns the far end read back.
+    var dialogueDone = new TaskCompletionSource<(string? Offered, string Protocol, int Turns)>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
+
     var serverTask = Task.Run(async () =>
     {
         if (isLive) return;
@@ -106,6 +127,21 @@ async Task<int> RunModeAsync(string mode)
             case "ldap": await ServeLdapAsync(stream, upstreamCert); break;
             case "ldap-decline": await ServeLdapDeclineAsync(stream); break;
             case "ldap-bad": await ServeLdapBadAsync(stream); break;
+            case "sunrpc":
+                await ServeSunRpcAsync(stream, upstreamCert, serverNotes, serverFailures, split: false,
+                    Rpc.Success); break;
+            case "sunrpc-split":
+                await ServeSunRpcAsync(stream, upstreamCert, serverNotes, serverFailures, split: true,
+                    Rpc.Success); break;
+            case "sunrpc-unavail":
+                await ServeSunRpcAsync(stream, upstreamCert, serverNotes, serverFailures, split: false,
+                    Rpc.ProgUnavail); break;
+            case "sunrpc-decline": await ServeSunRpcDeclineAsync(stream); break;
+            case "sunrpc-misuse": await ServeSunRpcMisuseAsync(stream, upstreamCert, serverNotes, serverFailures); break;
+            case "sunrpc-near": await ServeSunRpcNearAsync(stream, upstreamCert, serverNotes, serverFailures); break;
+            case "sunrpc-bad": await ServeSunRpcBadAsync(stream); break;
+            case "sunrpc-wrong-token": await ServeSunRpcWrongTokenAsync(stream); break;
+            case "sunrpc-wrong-flavor": await ServeSunRpcWrongFlavorAsync(stream); break;
             case "ftps-pasv": await ServeFtpDataAsync(stream, upstreamCert, dataTarget, false); break;
             case "ftps-epsv": await ServeFtpDataAsync(stream, upstreamCert, dataTarget, true); break;
             case "ftps-active":
@@ -128,6 +164,14 @@ async Task<int> RunModeAsync(string mode)
                 else await ServeImplicitAsync(stream, upstreamCert);
                 break;
             case "alpn-h2": await ServeImplicitH2Async(stream, upstreamCert); break;
+            case "rtsps": await ServeScriptedAsync(accepted, upstreamCert, Media.RtspScript(), "rtsps",
+                serverNotes, serverFailures); break;
+            case "rtmps": await ServeScriptedAsync(accepted, upstreamCert, Media.RtmpScript(), "rtmps",
+                serverNotes, serverFailures); break;
+            case "sips": await ServeScriptedAsync(accepted, upstreamCert, Media.SipScript(), "sips",
+                serverNotes, serverFailures); break;
+            case "rtmps-ffmpeg": await ServeMediaClientUpstreamAsync(accepted, upstreamCert, mediaSeen,
+                serverNotes, serverFailures); break;
             case "smtpsplit": await ServeSmtpSplitAsync(stream, upstreamCert); break;
             case "https-close": await ServeHttpsCloseAsync(stream, upstreamCert, serverNotes); break;
             // The first connection refuses the hello the proxy composed; the second is a normal
@@ -247,6 +291,13 @@ async Task<int> RunModeAsync(string mode)
             // and Schannel is the client that failed live. curl is the strict judge here.
             await RunCurlAsync(proxyPort, notes, failures).WaitAsync(TimeSpan.FromSeconds(30));
         }
+        else if (mode == "rtmps-ffmpeg")
+        {
+            // A third party's TLS stack, not this harness's: whether the product terminates a real
+            // rtmps:// session is judged from what the fake upstream ends up holding.
+            await RunFfmpegMediaClientAsync(mode, proxyPort, ffmpegPath!, mediaSeen, notes, failures)
+                .WaitAsync(TimeSpan.FromSeconds(60));
+        }
         else if (isLive)
         {
             await RunLiveFtpsAsync(proxyPort, rootPemPath!, liveHost!, livePort, livePath, notes, failures)
@@ -256,7 +307,11 @@ async Task<int> RunModeAsync(string mode)
         {
             using var tcp = new TcpClient();
             await tcp.ConnectAsync(loopbackIp, proxyPort);
-            await RunClientAsync(mode, tcp.GetStream(), notes).WaitAsync(TimeSpan.FromSeconds(20));
+            // A media mode runs a scripted dialogue, where every turn of the dialect is a round trip of its
+            // own and the RTMP handshake alone moves 4.5 KB; the one-exchange modes keep the shorter clock.
+            var budget = mode is "rtsps" or "rtmps" or "sips"
+                ? TimeSpan.FromSeconds(60) : TimeSpan.FromSeconds(20);
+            await RunClientAsync(mode, tcp.GetStream(), notes).WaitAsync(budget);
         }
 
         // A relay that completes proves the sockets span v6; only the file proves the capture does.
@@ -311,6 +366,15 @@ async Task<int> RunModeAsync(string mode)
             case "ldap": await ClientLdapAsync(s, notes, failures); break;
             case "ldap-decline": await ClientLdapDeclineAsync(s, notes); break;
             case "ldap-bad": await ClientLdapBadAsync(s, notes); break;
+            case "sunrpc": await ClientSunRpcAsync(s, notes, failures, split: false, Rpc.Success); break;
+            case "sunrpc-split": await ClientSunRpcAsync(s, notes, failures, split: true, Rpc.Success); break;
+            case "sunrpc-unavail": await ClientSunRpcAsync(s, notes, failures, split: false, Rpc.ProgUnavail); break;
+            case "sunrpc-decline": await ClientSunRpcDeclineAsync(s, notes); break;
+            case "sunrpc-misuse": await ClientSunRpcMisuseAsync(s, notes, failures); break;
+            case "sunrpc-near": await ClientSunRpcNearAsync(s, notes, failures); break;
+            case "sunrpc-bad": await ClientSunRpcBadAsync(s, notes); break;
+            case "sunrpc-wrong-token": await ClientSunRpcWrongTokenAsync(s, notes); break;
+            case "sunrpc-wrong-flavor": await ClientSunRpcWrongFlavorAsync(s, notes); break;
             case "ftps-pasv": await ClientFtpDataAsync(s, notes, failures, proxyPort, false); break;
             case "ftps-epsv": await ClientFtpDataAsync(s, notes, failures, proxyPort, true); break;
             case "ftps-active":
@@ -324,6 +388,12 @@ async Task<int> RunModeAsync(string mode)
             case "implicit-ip": await ClientImplicitAsync(s, "127.0.0.1", notes); break;
             case "ipv6": await ClientImplicitAsync(s, "probe.test", notes); break;
             case "alpn-fallback": await ClientAlpnAsync(s, "probe.test", notes); break;
+            case "rtsps":
+                await CheckSniVisibilityAsync(upstreamCert, notes, failures);
+                await ClientScriptedAsync(s, Media.RtspScript(), "rtsps", notes, failures);
+                break;
+            case "rtmps": await ClientScriptedAsync(s, Media.RtmpScript(), "rtmps", notes, failures); break;
+            case "sips": await ClientScriptedAsync(s, Media.SipScript(), "sips", notes, failures); break;
             case "alpn-h2": await ClientAlpnH2Async(s, "probe.test", notes); break;
             case "smtpsplit": await ClientSmtpSplitAsync(s, notes); break;
             case "mtls-refused": await ClientAfterRefusalAsync(s, "probe.test", notes, failures); break;
@@ -467,6 +537,168 @@ async Task<int> RunModeAsync(string mode)
         await Task.Delay(150);
         await SendBytesAsync(s, request[20..]);
     }
+
+    // The RPC-with-TLS grant half (RFC 9289 §4.1). A NULL call with no credential goes first and is answered
+    // like any other call, so the only octet set that can end the plaintext session is the probe's AUTH_TLS
+    // flavor. `split` sends both the first call and the probe as one record of three fragments arriving in
+    // separate writes - one of them empty, which §11 allows, and for the probe the last of them cut in two -
+    // which is what the record walk has to reassemble. `grantStat` is the accept_stat of the grant, and §4.1 has
+    // the client start TLS whatever that says.
+    static async Task ClientSunRpcAsync(NetworkStream s, List<string> notes, List<string> failures,
+        bool split, uint grantStat)
+    {
+        if (split)
+        {
+            // One record in three fragments written separately, so each boundary falls between reads rather
+            // than inside one (§11 lets a record carry any number of fragments, and a fragment of no octets).
+            foreach (var fragment in Rpc.CallFragments(0x1111))
+            {
+                await SendBytesAsync(s, fragment);
+                await Task.Delay(150);
+            }
+        }
+        else
+        {
+            await SendBytesAsync(s, Rpc.NullCall(0x1111));
+        }
+        await ExpectBytesAsync(s, Rpc.AcceptedReply(0x1111), "reply to the first call");
+
+        // The probe's own record spread over fragments, the middle of them empty and the last of them cut by a
+        // write boundary: §11 makes a record "one or more record fragments" of "0 to (2**31) - 1 bytes" each, so
+        // the forty octets §4.1's probe is made of have to be reassembled from whatever the stream hands over.
+        if (split)
+        {
+            foreach (var fragment in Rpc.ProbeFragments(0x2222))
+            {
+                await SendBytesAsync(s, fragment);
+                await Task.Delay(150);
+            }
+        }
+        else
+        {
+            await SendBytesAsync(s, Rpc.Probe(0x2222));
+        }
+        // Two records that cannot settle the probe arrive before the grant does. The first is the probe echoed
+        // back: §9's rpc_msg union picks its arm by msgtype, so a CALL on the reply side is not an answer to
+        // anything whatever its xid. The second carries the §4.1 token but the xid of a call that is not the
+        // probe, and §9 has a REPLY answer the CALL it matches, so it is not the grant either.
+        await ExpectBytesAsync(s, Rpc.Probe(0x2222), "the probe echoed back on the reply side");
+        await ExpectBytesAsync(s, Rpc.Grant(0x9999, Rpc.Success), "a grant whose xid matches no call");
+        await ExpectBytesAsync(s, Rpc.Grant(0x2222, grantStat), "grant");
+        var tls = await ClientSunRpcTunnelAsync(s, notes, failures);
+        notes.Add("sunrpc: a call with no credential was answered, the probe's own octets and a token-bearing " +
+            "reply for another xid were both passed by, the grant that matched the probe was followed, and RPC " +
+            $"records round-tripped inside the tunnel (TLS={tls})");
+    }
+
+    // The tunnel both this mode and `sunrpc-misuse` have to finish: §4.1 has the ClientHello arrive on this
+    // same connection and §5 requires it to carry the §7.2 identifier, which the proxy has to copy into the
+    // hello it composes for the upstream.
+    static async Task<SslProtocols> ClientSunRpcTunnelAsync(Stream s, List<string> notes, List<string> failures)
+    {
+        var ssl = await UpgradeAsync(s, "probe.test", notes, offer: [Rpc.Alpn]);
+        if (ssl.NegotiatedApplicationProtocol != Rpc.Alpn)
+            failures.Add($"the client leg answered '{ssl.NegotiatedApplicationProtocol}' although the upstream " +
+                $"selected '{Rpc.Alpn}'");
+
+        await SendBytesAsync(ssl, Rpc.NullCall(0x3333));
+        await ExpectBytesAsync(ssl, Rpc.AcceptedReply(0x3333), "post-TLS reply");
+        return ssl.SslProtocol;
+    }
+
+    // RFC 9289 §4.1 makes an AUTH_TLS credential on any other procedure a misuse the server must refuse, and a
+    // refusal is only about *that* probe: the client sends no ClientHello, then probes again as the section
+    // prescribes and this time the grant stands. A scanner that read the refused record as the probe would
+    // settle this session as refused and relay the granted one, so the client's hello would reach the upstream
+    // and its self-signed leaf would be the only answer.
+    static async Task ClientSunRpcMisuseAsync(NetworkStream s, List<string> notes, List<string> failures)
+    {
+        await SendBytesAsync(s, Rpc.AuthTlsCall(0x1111, 11));
+        await ExpectBytesAsync(s, Rpc.Denial(0x1111), "refusal of the misuse");
+
+        // The same 44 octets but for the procedure and the xid, so only §4.1's NULL-procedure test separates
+        // this record from the one the server just refused.
+        await SendBytesAsync(s, Rpc.Probe(0x2222));
+        await ExpectBytesAsync(s, Rpc.Grant(0x2222, Rpc.Success), "grant after the refusal");
+        await ClientSunRpcTunnelAsync(s, notes, failures);
+        notes.Add("sunrpc-misuse: AUTH_TLS on proc 11 was refused, the probe on proc 0 that followed was " +
+            "granted and the tunnel it opened carried RPC records");
+    }
+
+    // The near-miss half. Every one of these records has an AUTH_TLS credential on the NULL procedure, so what
+    // stops it from being the probe is a single word. None of them may move this socket into TLS, and the walk
+    // has to stay in step with the record boundaries after each, because the probe that follows them is what
+    // opens the tunnel.
+    static async Task ClientSunRpcNearAsync(NetworkStream s, List<string> notes, List<string> failures)
+    {
+        foreach (var (xid, record) in Rpc.NearProbes())
+        {
+            await SendBytesAsync(s, record);
+            await ExpectBytesAsync(s, Rpc.AcceptedReply(xid), $"reply to near-probe 0x{xid:X4}");
+        }
+        await SendBytesAsync(s, Rpc.Probe(0x2222));
+        await ExpectBytesAsync(s, Rpc.Grant(0x2222, Rpc.Success), "grant after the near-probes");
+        await ClientSunRpcTunnelAsync(s, notes, failures);
+        notes.Add("sunrpc-near: six records that read like the AUTH_TLS probe were answered as the ordinary " +
+            "calls they are, and the probe that followed still opened the tunnel");
+    }
+
+    // The refusal half. RFC 9289 §4.1 prescribes MSG_DENIED / AUTH_ERROR / AUTH_BADCRED for an AUTH_TLS
+    // credential on any procedure other than the NULL procedure, and a server with no RPC-with-TLS answers the
+    // probe as the credential it does not know. Neither grants anything, so after each the client sends no
+    // ClientHello and the records either side exchanges next have to arrive whole.
+    static async Task ClientSunRpcDeclineAsync(NetworkStream s, List<string> notes)
+    {
+        await SendBytesAsync(s, Rpc.AuthTlsCall(0x1111, 11));
+        await ExpectBytesAsync(s, Rpc.Denial(0x1111), "refusal of the misuse");
+
+        // 44 octets whose every field but the xid and the procedure matches the record just refused, so this
+        // pair pins the NULL-procedure test rather than the flavor, the lengths or the program fields.
+        await SendBytesAsync(s, Rpc.Probe(0x2222));
+        await ExpectBytesAsync(s, Rpc.Denial(0x2222), "refusal of the probe");
+
+        await SendBytesAsync(s, Rpc.NullCall(0x3333));
+        await ExpectBytesAsync(s, Rpc.AcceptedReply(0x3333), "plaintext reply after the refusals");
+        notes.Add("sunrpc-decline: AUTH_TLS on proc 11 and then on proc 0 were both refused and the session " +
+            "carried on in plaintext");
+    }
+
+    // The shape of a MSG_ACCEPTED that is not a grant: the probe is answered, no ClientHello follows, and the
+    // records either side exchanges next have to arrive whole. Each of the three modes below hands this helper
+    // the one reply that fails exactly one clause of §4.1's grant predicate.
+    static async Task ClientSunRpcNoGrantAsync(NetworkStream s, List<string> notes, byte[] answer,
+        string label, string note)
+    {
+        await SendBytesAsync(s, Rpc.Probe(0x2222));
+        await ExpectBytesAsync(s, answer, $"{label} answer to the probe");
+        await SendBytesAsync(s, Rpc.NullCall(0x3333));
+        await ExpectBytesAsync(s, Rpc.AcceptedReply(0x3333), $"plaintext reply after the {label} answer");
+        notes.Add(note);
+    }
+
+    // A server that knows the program but not RPC-with-TLS answers the probe as the plain NULL call it is, with
+    // an AUTH_NONE verifier of no octets at all.
+    static Task ClientSunRpcBadAsync(NetworkStream s, List<string> notes) =>
+        ClientSunRpcNoGrantAsync(s, notes, Rpc.AcceptedReply(0x2222), "no-token",
+            "sunrpc-bad: a MSG_ACCEPTED whose verifier carries no octets was read as no grant and the session " +
+            "carried on in plaintext");
+
+    // The reply that is only wrong in its eight octets: MSG_ACCEPTED, AUTH_NONE, a verifier of exactly eight,
+    // and none of them spelling "STARTTLS". §4.1's "does not contain the token" clause is the only thing that
+    // keeps this from being a grant, so this mode is the only thing that holds the token comparison itself.
+    static Task ClientSunRpcWrongTokenAsync(NetworkStream s, List<string> notes) =>
+        ClientSunRpcNoGrantAsync(s, notes, Rpc.NotGrant(0x2222), "wrong-token",
+            "sunrpc-wrong-token: an AUTH_NONE verifier of eight octets that do not spell STARTTLS was " +
+            "read as no grant and the session carried on in plaintext");
+
+    // The same eight octets spelled correctly and filed under the wrong flavor: §4.1 has "The flavor value of
+    // the verifier in the RPC Reply message received from the server MUST be AUTH_NONE" before it speaks of the
+    // token at all. This is the only mode that separates the verifier's flavor from its body, so a scanner that
+    // looked only for the token would upgrade here.
+    static Task ClientSunRpcWrongFlavorAsync(NetworkStream s, List<string> notes) =>
+        ClientSunRpcNoGrantAsync(s, notes, Rpc.WrongFlavor(0x2222), "wrong-flavor",
+            "sunrpc-wrong-flavor: an AUTH_SYS verifier spelling STARTTLS was read as no grant and the session " +
+            "carried on in plaintext");
 
     static async Task ClientFtpDataAsync(NetworkStream s, List<string> notes, List<string> failures, int proxyPort, bool epsv)
     {
@@ -809,7 +1041,8 @@ async Task<int> RunModeAsync(string mode)
         notes.Add("alpn-h2: relay works on the agreed protocol");
     }
 
-    static async Task<SslStream> UpgradeAsync(Stream raw, string host, List<string> notes, bool acceptAny = false)
+    static async Task<SslStream> UpgradeAsync(Stream raw, string host, List<string> notes, bool acceptAny = false,
+        List<SslApplicationProtocol>? offer = null)
     {
         var ssl = new SslStream(raw, false, (_, cert, chain, errors) =>
         {
@@ -820,7 +1053,11 @@ async Task<int> RunModeAsync(string mode)
             notes.Add($"upgrade leaf='{leaf?.Subject}' errors={errors} chainDepth={chain?.ChainElements.Count ?? 0} root='{root}'");
             return acceptAny || errors == SslPolicyErrors.None;
         });
-        await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions { TargetHost = host });
+        await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+        {
+            TargetHost = host,
+            ApplicationProtocols = offer
+        });
         notes.Add($"upgrade TLS={ssl.SslProtocol} alpn='{ssl.NegotiatedApplicationProtocol}'");
         return ssl;
     }
@@ -1122,6 +1359,106 @@ async Task<int> RunModeAsync(string mode)
         await ExpectAsync(s, "PING");
         await SendAsync(s, "PONG\r\n");
     }
+
+    // The grant path seen from the server. The call ahead of the probe is an ordinary one and is answered
+    // ordinarily, so only the probe's own octets can move this socket into TLS, and the socket becomes TLS
+    // after the reply that carries the probe's xid (RFC 9289 §4.1, RFC 5531 §9).
+    static async Task ServeSunRpcAsync(NetworkStream s, X509Certificate2 cert, List<string> notes,
+        List<string> failures, bool split, uint grantStat)
+    {
+        await ExpectBytesAsync(s, split ? Rpc.FragmentedCall(0x1111) : Rpc.NullCall(0x1111), "first call");
+        await SendBytesAsync(s, Rpc.AcceptedReply(0x1111));
+        await ExpectBytesAsync(s, split ? Rpc.FragmentedProbe(0x2222) : Rpc.Probe(0x2222), "AUTH_TLS probe");
+        // The probe's own octets thrown back on the reply side, then a grant for a call this session never
+        // made. Only the third record is the answer to the probe.
+        await SendBytesAsync(s, Rpc.Probe(0x2222));
+        await SendBytesAsync(s, Rpc.Grant(0x9999, Rpc.Success));
+        await SendBytesAsync(s, Rpc.Grant(0x2222, grantStat));
+        await ServeSunRpcTunnelAsync(s, cert, notes, failures);
+    }
+
+    // §4.1 refuses AUTH_TLS on any other procedure, and the refusal is about that record alone: the probe the
+    // client sends next, on the NULL procedure, is granted and opens the tunnel.
+    static async Task ServeSunRpcMisuseAsync(NetworkStream s, X509Certificate2 cert, List<string> notes,
+        List<string> failures)
+    {
+        await ExpectBytesAsync(s, Rpc.AuthTlsCall(0x1111, 11), "AUTH_TLS on a non-NULL procedure");
+        await SendBytesAsync(s, Rpc.Denial(0x1111));
+        await ExpectBytesAsync(s, Rpc.Probe(0x2222), "AUTH_TLS probe after the refusal");
+        await SendBytesAsync(s, Rpc.Grant(0x2222, Rpc.Success));
+        await ServeSunRpcTunnelAsync(s, cert, notes, failures);
+    }
+
+    // The same six records seen from the server: each arrives whole and in order and is answered as the call
+    // it claims to be, so the proxy has handed over nothing but octets before the probe opens the tunnel.
+    static async Task ServeSunRpcNearAsync(NetworkStream s, X509Certificate2 cert, List<string> notes,
+        List<string> failures)
+    {
+        foreach (var (xid, record) in Rpc.NearProbes())
+        {
+            await ExpectBytesAsync(s, record, $"near-probe 0x{xid:X4}");
+            await SendBytesAsync(s, Rpc.AcceptedReply(xid));
+        }
+        await ExpectBytesAsync(s, Rpc.Probe(0x2222), "AUTH_TLS probe after the near-probes");
+        await SendBytesAsync(s, Rpc.Grant(0x2222, Rpc.Success));
+        await ServeSunRpcTunnelAsync(s, cert, notes, failures);
+    }
+
+    static async Task ServeSunRpcTunnelAsync(NetworkStream s, X509Certificate2 cert, List<string> notes,
+        List<string> failures)
+    {
+        using var ssl = new SslStream(s, false);
+        // §5 has the server put only the §7.2 identifier in its ServerHello, so the fixture offers nothing
+        // else, and the proxy asked for exactly what its client offered.
+        await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+        {
+            ServerCertificate = cert,
+            EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+            ApplicationProtocols = [Rpc.Alpn]
+        });
+        if (ssl.NegotiatedApplicationProtocol != Rpc.Alpn)
+            failures.Add($"sunrpc(upstream): the handshake carried '{ssl.NegotiatedApplicationProtocol}' " +
+                $"instead of '{Rpc.Alpn}'");
+        // Measured: this host's Schannel has no TLS 1.3, so what arrives here is 1.2 even though §5 rules out
+        // anything below 1.3. The proxy sets no version floor on either leg, so the version is this fixture's
+        // stack talking and not the product's.
+        notes.Add($"sunrpc(upstream): TLS={ssl.SslProtocol} alpn='{ssl.NegotiatedApplicationProtocol}'");
+
+        await ExpectBytesAsync(ssl, Rpc.NullCall(0x3333), "post-TLS call");
+        await SendBytesAsync(ssl, Rpc.AcceptedReply(0x3333));
+    }
+
+    // Both refusals are ordinary RPC records, so the session stays in plaintext and this server goes on
+    // reading calls (RFC 9289 §4.1: operation "may continue, depending on local policy, but without
+    // confidentiality, integrity, or peer authentication protection from (D)TLS").
+    static async Task ServeSunRpcDeclineAsync(NetworkStream s)
+    {
+        await ExpectBytesAsync(s, Rpc.AuthTlsCall(0x1111, 11), "AUTH_TLS on a non-NULL procedure");
+        await SendBytesAsync(s, Rpc.Denial(0x1111));
+        await ExpectBytesAsync(s, Rpc.Probe(0x2222), "AUTH_TLS probe");
+        await SendBytesAsync(s, Rpc.Denial(0x2222));
+        await ExpectBytesAsync(s, Rpc.NullCall(0x3333), "plaintext call after the refusals");
+        await SendBytesAsync(s, Rpc.AcceptedReply(0x3333));
+    }
+
+    // The server half of a reply that is MSG_ACCEPTED without being a grant: the probe is answered, then the
+    // session goes on with plaintext records, which only holds if no upgrade was read into that answer.
+    static async Task ServeSunRpcNoGrantAsync(NetworkStream s, byte[] answer, string label)
+    {
+        await ExpectBytesAsync(s, Rpc.Probe(0x2222), $"AUTH_TLS probe answered with the {label} answer");
+        await SendBytesAsync(s, answer);
+        await ExpectBytesAsync(s, Rpc.NullCall(0x3333), $"plaintext call after the {label} answer");
+        await SendBytesAsync(s, Rpc.AcceptedReply(0x3333));
+    }
+
+    static Task ServeSunRpcBadAsync(NetworkStream s) =>
+        ServeSunRpcNoGrantAsync(s, Rpc.AcceptedReply(0x2222), "no-token");
+
+    static Task ServeSunRpcWrongTokenAsync(NetworkStream s) =>
+        ServeSunRpcNoGrantAsync(s, Rpc.NotGrant(0x2222), "wrong-token");
+
+    static Task ServeSunRpcWrongFlavorAsync(NetworkStream s) =>
+        ServeSunRpcNoGrantAsync(s, Rpc.WrongFlavor(0x2222), "wrong-flavor");
 
     // --- LDAP fixtures. Both ends build the same octets, so every read is a byte-exact comparison
     //     instead of a second BER parser that could repeat the first one's mistake. WhoamiRequest and
@@ -2049,6 +2386,285 @@ async Task<int> RunModeAsync(string mode)
         catch (Exception ex) when (ex is IOException or AuthenticationException) { }
     }
 
+    // --- the media dialects that begin with TLS --------------------------------------------------------
+    //
+    // RFC 7826 §4.2: the scheme "rtsps" identifies "a reliable transport using secure transport (TLS
+    // [RFC5246])" and "if no port number is provided in the authority part of the URI ... the TCP port 322
+    // MUST be used". RFC 3261 §5 Table 1 note (1): the default port "is 5061 for sip: using TLS over TCP and
+    // sips: over TCP". Neither protocol has an in-band upgrade, so both arrive in the shape `implicit-ip`
+    // already covers - first octet 0x16, and the client leg answered first because no ALPN was offered. What
+    // is new is the payload behind the tunnel, and each of these three modes now carries a whole session
+    // scripted in Media: RTSP's DESCRIBE/SETUP/PLAY with interleaved blocks on the channels the server's own
+    // answer chose, RTMP's chunk stream after the three handshake blocks, and SIP's registration and dialog
+    // progressions with bodies, a provisional response before the 200, and a bare-CRLF keep-alive. Every turn
+    // of every dialect is then judged by each end of the tunnel and again from the file the product wrote.
+
+    // The scripted media upstreams all answer the same way: terminate TLS with the fixture's own leaf, run
+    // this half of the script, then report the server name the proxy offered when it dialled, the protocol
+    // the client leg settled on, and how many turns arrived whole. The turn count travels with the verdict:
+    // a session that stopped at turn 3 of 17 is a different answer from one that never got past turn 1.
+    async Task ServeScriptedAsync(TcpClient accepted, X509Certificate2 cert, List<MediaTurn> script,
+        string label, List<string> serverNotes, List<string> serverFailures)
+    {
+        var options = new SslServerAuthenticationOptions { ServerCertificate = cert };
+        using var ssl = new SslStream(accepted.GetStream(), false);
+        string? offered = null;
+        var protocol = "";
+        var turns = 0;
+        try
+        {
+            await ssl.AuthenticateAsServerAsync(options).WaitAsync(TimeSpan.FromSeconds(25));
+            offered = ssl.TargetHostName;
+            protocol = ssl.SslProtocol.ToString();
+            serverNotes.Add($"{label}(upstream): terminated {protocol} offered name '{OfferedName(offered)}'");
+            turns = await Media.RunDialogue(ssl, script, asClient: false, $"{label}(upstream)",
+                serverNotes, serverFailures);
+        }
+        catch (Exception ex) when (ex is IOException or AuthenticationException or TimeoutException
+                                       or OperationCanceledException or EndOfStreamException)
+        {
+            serverNotes.Add($"{label}(upstream): ended after {turns} turn(s) " +
+                            $"({ex.GetType().Name}: {ex.Message})");
+        }
+        dialogueDone.TrySetResult((offered, protocol, turns));
+    }
+
+    // The client half of the same script, so the two ends cannot disagree about what was sent. What is pinned
+    // here is what this end saw: the tunnel came up with no server_name, so the leaf has to be named from the
+    // destination address; each turn of the far half is read where its own dialect says the message ends; and
+    // the capture the product wrote for the session holds the dialogue decrypted in order per direction. The
+    // "(none)" in the naming note is made meaningful by CheckSniVisibilityAsync, run before this for rtsps.
+    async Task ClientScriptedAsync(NetworkStream s, List<MediaTurn> script, string label,
+        List<string> notes, List<string> failures)
+    {
+        var ssl = await UpgradeWithoutSniAsync(s, notes, label);
+        var turns = await Media.RunDialogue(ssl, script, asClient: true, label, notes, failures);
+        CheckAddressLeaf(ssl, label, notes, failures);
+        var (offered, protocol, upstreamTurns) = await dialogueDone.Task.WaitAsync(TimeSpan.FromSeconds(20));
+        notes.Add($"{label}: upstream was offered name '{OfferedName(offered)}' and terminated {protocol}; it " +
+                  $"read {upstreamTurns} of {script.Count} turns, this end completed {turns}");
+        if (upstreamTurns != script.Count)
+            failures.Add($"{label}: the upstream read only {upstreamTurns} of {script.Count} turns");
+        await Capture.CheckDialogueAsync(capturesBefore, upstreamPort, script, label, notes, failures);
+    }
+
+    // The fake upstream for a real media client. It cannot be handed a fixed flight, because nothing here
+    // dictates what a third-party client puts on the wire, so it answers the dialect's own exchanges one
+    // block at a time and keeps the first two for the client side to judge. RTMP has no header at all,
+    // only the fixed block sizes.
+    async Task ServeMediaClientUpstreamAsync(TcpClient accepted, X509Certificate2 cert,
+        TaskCompletionSource<(string? Offered, byte[] First, byte[] Second)> mediaSeen,
+        List<string> serverNotes, List<string> serverFailures)
+    {
+        var options = new SslServerAuthenticationOptions { ServerCertificate = cert };
+        using var ssl = new SslStream(accepted.GetStream(), false);
+        string? offered = null;
+        byte[] first = Array.Empty<byte>(), second = Array.Empty<byte>();
+        try
+        {
+            await ssl.AuthenticateAsServerAsync(options).WaitAsync(TimeSpan.FromSeconds(25));
+            offered = ssl.TargetHostName;
+            serverNotes.Add($"{mode}(upstream): terminated {ssl.SslProtocol} for name '{OfferedName(offered)}'");
+            (first, second) = await ServeRtmpClientHandshakeAsync(ssl, serverNotes, serverFailures, mode);
+        }
+        catch (Exception ex) when (ex is IOException or AuthenticationException or TimeoutException
+                                       or OperationCanceledException or EndOfStreamException)
+        {
+            serverNotes.Add($"{mode}(upstream): ended ({ex.GetType().Name}: {ex.Message})");
+        }
+        mediaSeen.TrySetResult((offered, first, second));
+    }
+
+    async Task<(byte[] First, byte[] Second)> ServeRtmpClientHandshakeAsync(SslStream ssl,
+        List<string> serverNotes, List<string> serverFailures, string label)
+    {
+        // The client's first block is 1537 octets with no structure a reader could stop on, so the fixture
+        // is driven by size alone: one block in, its own version byte plus random back, the client's answer,
+        // and S2 to close the handshake - a client that never gets it stays inside the handshake and puts no
+        // chunk stream on the wire (measured 2026-11-03: with three blocks served, the octets after C2 were
+        // the beginning of the connect command taken as S2).
+        var s0s1 = await Media.ReadUpTo(ssl, 1537, TimeSpan.FromSeconds(25));
+        if (s0s1.Length != 1537 || s0s1[0] != 0x03)
+            serverFailures.Add($"{label}(upstream): the client's first block arrived as {s0s1.Length} octets " +
+                               $"beginning 0x{(s0s1.Length > 0 ? s0s1[0].ToString("x2") : "??")}");
+        var reply = new byte[1537];
+        reply[0] = 0x03;
+        RandomNumberGenerator.Fill(reply.AsSpan(1));
+        await ssl.WriteAsync(reply);
+        await ssl.FlushAsync();
+
+        var c2 = await Media.ReadUpTo(ssl, 1536, TimeSpan.FromSeconds(10));
+        if (c2.Length < 1536)
+            serverFailures.Add($"{label}(upstream): the client answered with {c2.Length} octets, fewer than " +
+                               "the 1536 its second handshake block holds");
+        // S2 echoes the client's own C1, which is what a real server puts there.
+        await ssl.WriteAsync(s0s1.AsMemory(1, 1536));
+        await ssl.FlushAsync();
+
+        // Point the reader that judges the fixture's own dialogue at a third party's bytes. What the client
+        // puts on the wire after the handshake closes has to frame as a message under the vendor's chunk
+        // layout, and only its first command names itself: a reader both ends of one fixture wrote could
+        // agree on a framing this does not expose.
+        var reader = new RtmpChunks(ssl);
+        var framed = new List<RtmpMessage>();
+        using var chunkClock = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        string? method = null;
+        try
+        {
+            while (method == null)
+            {
+                var arrived = await reader.ReadUntil(1).WaitAsync(chunkClock.Token);
+                var message = arrived.Messages[0];
+                framed.Add(message);
+                if (message.Type == Media.RtmpCommand)
+                    method = Media.AmfMethod(message.Body) ??
+                             $"(a command whose body opens {Convert.ToHexString(message.Body[..Math.Min(message.Body.Length, 8)])})";
+            }
+        }
+        catch (Exception ex) when (ex is IOException or EndOfStreamException or OperationCanceledException
+                                       or InvalidDataException)
+        {
+            serverNotes.Add($"{label}(upstream): its chunk stream stopped after {framed.Count} message(s) " +
+                            $"({ex.GetType().Name}: {ex.Message})");
+        }
+        if (method != null)
+            serverNotes.Add($"{label}(upstream): the client's first command framed as '{method}' on chunk stream " +
+                            $"{framed[^1].Csid}, stream {framed[^1].StreamId}, {framed[^1].Body.Length} body octets, " +
+                            $"{framed.Count} message(s) in all");
+        return (s0s1, c2);
+    }
+
+    // The media client that is not this harness: a foreign TLS stack, its own handshake octets, and a second
+    // process for the product to attribute by pid. rtsps:// is not driven from here - that path asks its lower
+    // transport for a socket handle before writing any RTSP octet, and the tls transport has none to give, so
+    // the run ends with "Operation not permitted" having sent nothing, the product in the path or out
+    // (measured). The RTSP dialect itself is pinned by the rtsps mode, which needs no third-party binary.
+    static async Task RunFfmpegMediaClientAsync(string mode, int proxyPort, string ffmpeg,
+        TaskCompletionSource<(string? Offered, byte[] First, byte[] Second)> mediaSeen,
+        List<string> notes, List<string> failures)
+    {
+        // The client dials the proxy's listener exactly as every other mode's client does; the fake
+        // redirector still decides where the proxy's upstream leg lands.
+        var url = $"rtmps://127.0.0.1:{proxyPort}/live/stream";
+        var arguments = $"-hide_banner -loglevel info -f lavfi -i color=c=black:s=16x16:r=1 -t 1 -f flv {url}";
+        var psi = new ProcessStartInfo(ffmpeg, arguments)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        Process process;
+        try
+        {
+            process = Process.Start(psi) ?? throw new InvalidOperationException("could not start ffmpeg");
+        }
+        catch (System.ComponentModel.Win32Exception ex)
+        {
+            failures.Add($"{mode}: TLSMITM_FFMPEG does not name a runnable binary ({ex.Message})");
+            return;
+        }
+
+        using (process)
+        {
+            var log = process.StandardError.ReadToEndAsync();
+            (string? Offered, byte[] First, byte[] Second) seen;
+            try
+            {
+                seen = await mediaSeen.Task.WaitAsync(TimeSpan.FromSeconds(45));
+            }
+            catch (TimeoutException)
+            {
+                failures.Add($"{mode}: the real client's session never reached the fake upstream");
+                await ReportFfmpegLogAsync(log, process, notes, failures, mode, kill: true);
+                return;
+            }
+
+            notes.Add($"{mode}: the upstream leg was dialled for name '{OfferedName(seen.Offered)}' and the " +
+                      $"client's first two blocks were {seen.First.Length} then {seen.Second.Length} octets");
+            if (seen.First.Length != 1537 || seen.First[0] != 0x03)
+                failures.Add($"{mode}: the client's handshake block reached the upstream as {seen.First.Length} " +
+                             "octets, not the 1537 the RTMP client sends first");
+            else notes.Add($"{mode}: the client's block arrived whole, 1537 octets opening with the version byte");
+
+            await ReportFfmpegLogAsync(log, process, notes, failures, mode, kill: false);
+        }
+    }
+
+    // The fixture is a control-plane server, not a media source, so what ffmpeg decides to do with the rest
+    // of the session is recorded rather than required - except a process that never ends on its own, which
+    // is reported as a failure because that is what a relay that swallowed a block looks like from here.
+    static async Task ReportFfmpegLogAsync(Task<string> log, Process process, List<string> notes,
+        List<string> failures, string mode, bool kill)
+    {
+        var ended = false;
+        try
+        {
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(20));
+            ended = true;
+        }
+        catch (TimeoutException) { }
+        if (kill || !ended)
+        {
+            try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+        }
+        if (!ended) failures.Add($"{mode}: ffmpeg was still running 20s after its session ended upstream");
+        var text = await log;
+        foreach (var line in text.Split('\n', StringSplitOptions.RemoveEmptyEntries).TakeLast(4))
+            notes.Add($"{mode}(ffmpeg): {line.Trim()}");
+    }
+
+    // The media modes report what the far end was told, so the channel carrying that answer needs a positive
+    // control: a name a client does send must be what the server reads back. Without it, the "(none)" a media
+    // mode reports says nothing about the client and everything about the harness.
+    static async Task CheckSniVisibilityAsync(X509Certificate2 cert, List<string> notes, List<string> failures)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var client = new TcpClient();
+        var accepted = listener.AcceptTcpClientAsync();
+        await client.ConnectAsync(IPAddress.Loopback, ((IPEndPoint)listener.LocalEndpoint).Port);
+        var serverSide = new SslStream((await accepted).GetStream(), false);
+        var clientSide = new SslStream(client.GetStream(), false);
+        await Task.WhenAll(
+            serverSide.AuthenticateAsServerAsync(new SslServerAuthenticationOptions { ServerCertificate = cert }),
+            clientSide.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+            {
+                TargetHost = "probe.test",
+                RemoteCertificateValidationCallback = (_, _, _, _) => true
+            }));
+        notes.Add($"sni-control: a client that sent 'probe.test' was read back as " +
+                  $"'{OfferedName(serverSide.TargetHostName)}'");
+        if (serverSide.TargetHostName != "probe.test")
+            failures.Add("sni-control: the server side could not read back the name the client sent, so the " +
+                         "'(none)' a media mode reports is not evidence about the client");
+        serverSide.Dispose();
+        clientSide.Dispose();
+        listener.Stop();
+    }
+
+    // SslStream reports an empty string for a hello that carried no server_name; naming it in one place keeps
+    // the log readable and the difference from a real name unambiguous.
+    static string OfferedName(string? name) => string.IsNullOrEmpty(name) ? "(none)" : name;
+
+    // A session with no server_name is named from the address the client was dialling: SNI carries domain
+    // names only (RFC 6066 §3; RFC 9525 §7.4), and the reference identifier for an IP-dialing client is an
+    // iP-ID, which RFC 9525 §6.2 matches solely against iPAddress SAN entries, octet-for-octet (§6.4). A DNS
+    // name on this leaf would therefore be a certificate no client of that shape can accept.
+    static void CheckAddressLeaf(SslStream ssl, string label, List<string> notes, List<string> failures)
+    {
+        if (ssl.RemoteCertificate is not X509Certificate2 leaf)
+        {
+            failures.Add($"{label}: no certificate reached the client, so the naming decision is unseen");
+            return;
+        }
+        var dns = string.Join(",", DnsNames(leaf));
+        var ip = string.Join(",", IpNames(leaf));
+        notes.Add($"{label}: leaf subject='{leaf.Subject}' SAN dns=[{dns}] ip=[{ip}]");
+        if (dns.Length > 0 || !ip.Contains("127.0.0.1"))
+            failures.Add($"{label}: a session with no server_name was named dns=[{dns}] ip=[{ip}] instead of " +
+                         "the destination address");
+    }
+
     // The mirror image of alpn-fallback, and the case that was missing while the ALPN bug shipped: the
     // real servers (bing, bilibili) do select h2, so the client leg has to be told h2 as well.
     static async Task ServeImplicitH2Async(NetworkStream s, X509Certificate2 cert)
@@ -2102,14 +2718,7 @@ async Task<int> RunModeAsync(string mode)
     // frame. Reading the first record is enough to tell which network layer the writer emitted.
     static async Task CheckIpv6CaptureAsync(string[] before, List<string> notes, List<string> failures)
     {
-        string? path = null;
-        for (var i = 0; i < 50 && path == null; i++)
-        {
-            path = Directory.Exists("captures")
-                ? Directory.GetFiles("captures").FirstOrDefault(f => !before.Contains(f) && new FileInfo(f).Length > 0)
-                : null;
-            if (path == null) await Task.Delay(100);
-        }
+        var path = await Capture.FindAsync(before, _ => true);
         if (path == null)
         {
             failures.Add("ipv6: no capture file was written");
@@ -2117,7 +2726,7 @@ async Task<int> RunModeAsync(string mode)
         }
 
         const int frame = 24 + 16;
-        var bytes = await File.ReadAllBytesAsync(path);
+        var bytes = await Capture.ReadAsync(path);
         if (bytes.Length < frame + 14 + 40)
         {
             failures.Add($"ipv6: capture {Path.GetFileName(path)} is too short ({bytes.Length} bytes)");
@@ -2402,42 +3011,15 @@ async Task<int> RunModeAsync(string mode)
     static async Task CheckAbortedCaptureAsync(string[] before, int upstreamPort,
         List<string> notes, List<string> failures)
     {
-        string? path = null;
-        for (var i = 0; i < 50 && path == null; i++)
-        {
-            path = Directory.Exists("captures")
-                ? Directory.GetFiles("captures").FirstOrDefault(f => !before.Contains(f)
-                      && f.EndsWith("_aborted.pcap", StringComparison.Ordinal) && new FileInfo(f).Length > 0)
-                : null;
-            if (path == null) await Task.Delay(100);
-        }
+        var path = await Capture.FindAsync(before,
+            f => f.EndsWith("_aborted.pcap", StringComparison.Ordinal));
         if (path == null)
         {
             failures.Add("handshake-abort: the aborted client leg wrote no *_aborted.pcap");
             return;
         }
 
-        // pcap framing: a 24-byte global header, then a 16-byte record header (inclusion length at
-        // offset 8) and the frame this writer builds - 14 Ethernet, 20 or 40 IP, 20 TCP. The frame's
-        // source port tells which peer sent it, so a one-sided recording cannot pass for an exchange.
-        var bytes = await File.ReadAllBytesAsync(path);
-        var frames = new List<(bool FromServer, byte[] Payload, byte Flags)>();
-        for (var off = 24; off + 16 <= bytes.Length; off += 16)
-        {
-            var incl = (int)BitConverter.ToUInt32(bytes.AsSpan(off + 8, 4));
-            if (incl < 55 || off + 16 + incl > bytes.Length) break;
-            var frame = bytes.AsSpan(off + 16, incl);
-            var ipv6 = frame[12] == 0x86 && frame[13] == 0xDD;
-            var ipLen = ipv6 ? 40 : 20;
-            var tcp = 14 + ipLen;
-            // The IP length fields bound the TCP payload: an Ethernet frame under 60 bytes is padded,
-            // and that padding is outside the IP datagram.
-            var ipTotal = ipv6 ? (frame[18] << 8) | frame[19] : (frame[16] << 8) | frame[17];
-            var payloadLength = Math.Max(0, ipTotal - (tcp - 14) - 20);
-            frames.Add((((frame[tcp] << 8) | frame[tcp + 1]) == upstreamPort,
-                frame.Slice(tcp + 20, payloadLength).ToArray(), frame[tcp + 13]));
-            off += incl;   // the next record header follows this frame, not these 16 bytes
-        }
+        var frames = await Capture.FramesAsync(path, upstreamPort);
 
         // The file opens with the writer's synthesized three-way handshake, so the TLS records start
         // after it. A capture whose first frame is a bare SYN from the client is what Wireshark needs
@@ -2909,4 +3491,999 @@ sealed class FakeRedirector : IRedirector
     public void UnregisterFlowExemption(int sourcePort, IPAddress destination, int destinationPort) { }
 
     public void RegisterLocalService(int dstPort) { }
+}
+
+// --- the scripted media dialogues -----------------------------------------------------------------
+//
+// A media mode drives both ends of its session from one script, so the octets the harness's client writes
+// and the octets the fake upstream expects cannot drift apart. Each turn names the framing rule its reader
+// uses to find the message's end, because that is the whole question for a relay: for RTSP and SIP an empty
+// line ends only the headers, and the body is the octet count Content-Length declares (RFC 7826 §5.4 and
+// §18.17, RFC 3261 §7.5); an RTSP interleaved block puts no delimiter between its four-octet header and its
+// payload (RFC 7826 §14); a SIP keep-alive is a bare CRLF pair that is an exchange in itself (RFC 5626
+// §4.4.1); and an RTMP message declares its length in its own header and is then cut again by the chunk
+// size. A turn also says whether its octets are one write or several, because a real server sends a header
+// block and then a body and a real client does not keep its messages inside one buffer.
+enum MediaRead
+{
+    Text,     // start-line, headers to the empty line, then the Content-Length octets
+    Frame,    // RTSP's interleaved block: '$', channel, two-octet length, payload
+    Exact,    // a fixed octet count, for the octets that declare no length at all
+    Chunks    // RTMP's chunk framing, reassembled by the message's declared length
+}
+
+sealed record RtmpMessage(int Csid, byte Type, uint Timestamp, uint StreamId, byte[] Body);
+
+sealed record MediaTurn(string Label, bool FromClient, byte[] Bytes, MediaRead Shape,
+    int[]? Splits = null, RtmpMessage[]? Decoded = null)
+{
+    public static MediaTurn Text(string label, bool fromClient, string message, params int[] splits) =>
+        new(label, fromClient, Encoding.ASCII.GetBytes(message), MediaRead.Text, Split(splits));
+
+    public static MediaTurn Block(string label, bool fromClient, byte channel, byte[] payload,
+        params int[] splits) =>
+        new(label, fromClient, Media.InterleavedFrame(channel, payload), MediaRead.Frame, Split(splits));
+
+    public static MediaTurn Octets(string label, bool fromClient, byte[] bytes, params int[] splits) =>
+        new(label, fromClient, bytes, MediaRead.Exact, Split(splits));
+
+    public static MediaTurn Chunks(string label, bool fromClient, int chunkSize, int[]? splits,
+        params RtmpMessage[] messages) =>
+        new(label, fromClient, Media.RtmpWire(chunkSize, messages), MediaRead.Chunks, splits, messages);
+
+    static int[]? Split(int[] splits) => splits.Length == 0 ? null : splits;
+}
+
+static class Media
+{
+    // RFC 7826 §14: "Stream data, such as RTP packets, is encapsulated by an ASCII dollar sign (36 decimal)
+    // followed by a one-octet channel identifier and the length of the encapsulated binary data as a binary,
+    // two-octet unsigned integer in network octet order", and "The stream data follows immediately
+    // afterwards, without a CRLF". The payload is shaped like an RTP header and carries a CRLF pair inside
+    // it, so a relay that looked for a message boundary would corrupt the block rather than pass it.
+    public static byte[] InterleavedFrame(byte channel, byte[] payload)
+    {
+        var frame = new byte[4 + payload.Length];
+        frame[0] = 0x24;
+        frame[1] = channel;
+        frame[2] = (byte)(payload.Length >> 8);
+        frame[3] = (byte)payload.Length;
+        payload.CopyTo(frame, 4);
+        return frame;
+    }
+
+    public static byte[] InterleavedPayload(int sequence) => new byte[]
+    {
+        0x80, 0x20, (byte)(sequence >> 8), (byte)sequence, 0x00, 0x00, 0x00, 0x2a,
+        0x0d, 0x0a, 0x0d, 0x0a, 0x80, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+
+    // Measured 2026-11-03 from a media client's own bytes on a raw socket: the first flight on an rtmp://
+    // connection is 1537 octets - 0x03, a four-octet timestamp, four zero octets and 1528 arbitrary ones -
+    // and on rtmps:// the same octets arrive after the ClientHello. Nothing there has a line structure, so
+    // the fixture plants a CRLF pair in the filler: that is what a relay which waited for a blank line
+    // before forwarding would stop on. The 1536-octet form is a block with no version byte in front of it,
+    // which is what C2 and S2 both are - the client sends its after the server's S0+S1, the server sends
+    // its after the client's C2.
+    public static byte[] BuildRtmpFlight(byte fill, bool withVersion)
+    {
+        var flight = new byte[withVersion ? 1537 : 1536];
+        var body = new Span<byte>(flight, withVersion ? 1 : 0, 1536);
+        body[3] = 0x2c;
+        for (var i = 8; i < body.Length; i++) body[i] = (byte)(i + fill);
+        body[600] = 0x0d; body[601] = 0x0a; body[602] = 0x0d; body[603] = 0x0a;
+        if (withVersion) flight[0] = 0x03;
+        return flight;
+    }
+
+    // Reads a fixed number of octets, or whatever arrived before the window closed or the peer stopped.
+    // The shortfall is a verdict the caller makes, not an exception here: a flight that never completed is
+    // exactly what a relay that withheld part of it looks like from the far end.
+    public static async Task<byte[]> ReadUpTo(Stream s, int length, TimeSpan limit)
+    {
+        var buffer = new byte[length];
+        var got = 0;
+        using var cts = new CancellationTokenSource(limit);
+        try
+        {
+            while (got < length)
+            {
+                var n = await s.ReadAsync(buffer.AsMemory(got), cts.Token);
+                if (n == 0) break;
+                got += n;
+            }
+        }
+        catch (OperationCanceledException) { }
+        return buffer[..got];
+    }
+
+    public static int FirstDifference(byte[] arrived, byte[] sent)
+    {
+        var shared = Math.Min(arrived.Length, sent.Length);
+        for (var i = 0; i < shared; i++) if (arrived[i] != sent[i]) return i;
+        return shared;
+    }
+
+    // The octet count is computed here, so a body and the length its own headers declare cannot disagree.
+    // RFC 7826 §18.17: "Unlike HTTP, it MUST be included in all messages that carry a message body beyond
+    // the header portion of the RTSP message. If it is missing, a default value of zero is assumed."
+    public static string Message(string startLine, string[] headers, string body,
+        string lengthHeader = "Content-Length")
+    {
+        var sb = new StringBuilder(startLine).Append("\r\n");
+        foreach (var header in headers) sb.Append(header).Append("\r\n");
+        return sb.Append(lengthHeader).Append(": ").Append(Encoding.ASCII.GetByteCount(body))
+            .Append("\r\n\r\n").Append(body).ToString();
+    }
+
+    // Where the body begins, which is the offset a real server puts a write boundary at.
+    public static int BodyAt(string message) =>
+        message.IndexOf("\r\n\r\n", StringComparison.Ordinal) + 4;
+
+    // The control plane of RFC 7826: DESCRIBE answers with SDP, SETUP is answered with the channels the
+    // server actually chose, and media then arrives on those. §18.54: "The channel number given in the
+    // request is only a guidance from the client to the server on what channel number(s) to use. The server
+    // MAY set any valid channel number in the response. The declared channels are bidirectional, so both end
+    // parties MAY send data on the given channel." The request asks for 0-1 and the answer is 5-6, which is
+    // the RFC's own example (§14), so the blocks that follow are only correct if the reader took the answer
+    // and not the request. §14 adds that RTCP "MUST be sent on the first available channel that is higher
+    // than the RTP channel", hence channel 6. The keep-alive is §13.8's: GET_PARAMETER "can also be used
+    // without a message body or any header that requests parameters for keep-alive purposes".
+    public static List<MediaTurn> RtspScript()
+    {
+        const string uri = "rtsp://probe.test:322/media";
+        // The body ends in a CRLF pair of its own, so the message holds a blank line that is not its end -
+        // §5.4 puts the length of the body in Content-Length and §9.2 leaves no transfer coding that could
+        // say anything else.
+        var sdp = "v=0\r\no=probe 1 1 IN IP4 127.0.0.1\r\ns=Rtsps fixture\r\nt=0 0\r\n" +
+                  "m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:trackID=1\r\n\r\n";
+        var describe = Message("RTSP/2.0 200 OK",
+            new[] { "CSeq: 2", "Content-Type: application/sdp", $"Content-Base: {uri}/" }, sdp);
+
+        return
+        [
+            MediaTurn.Text("OPTIONS", true,
+                Message($"OPTIONS {uri} RTSP/2.0", new[] { "CSeq: 1", "User-Agent: probe" }, "")),
+            MediaTurn.Text("200 to OPTIONS", false,
+                Message("RTSP/2.0 200 OK", new[]
+                {
+                    "CSeq: 1", "Public: OPTIONS, DESCRIBE, SETUP, PLAY, GET_PARAMETER, TEARDOWN"
+                }, "")),
+            MediaTurn.Text("DESCRIBE", true,
+                Message($"DESCRIBE {uri} RTSP/2.0", new[] { "CSeq: 2", "Accept: application/sdp" }, "")),
+            MediaTurn.Text("200 with the SDP body, headers and body as two writes", false, describe,
+                BodyAt(describe)),
+            MediaTurn.Text("SETUP asks for channels 0-1", true,
+                Message($"SETUP {uri}/trackID=1 RTSP/2.0",
+                    new[] { "CSeq: 3", "Transport: RTP/AVP/TCP;unicast;interleaved=0-1" }, "")),
+            MediaTurn.Text("200 answers channels 5-6 and the session", false,
+                Message("RTSP/2.0 200 OK", new[]
+                {
+                    "CSeq: 3", "Transport: RTP/AVP/TCP;unicast;interleaved=5-6",
+                    "Session: 12345678;timeout=60"
+                }, "")),
+            MediaTurn.Text("PLAY", true,
+                Message($"PLAY {uri} RTSP/2.0",
+                    new[] { "CSeq: 4", "Session: 12345678", "Range: npt=0.000-" }, "")),
+            MediaTurn.Text("200 with RTP-Info", false,
+                Message("RTSP/2.0 200 OK", new[]
+                {
+                    "CSeq: 4", "Session: 12345678", $"RTP-Info: url={uri}/trackID=1;seq=42;rtptime=1234"
+                }, "")),
+            MediaTurn.Block("RTP on channel 5, block header and payload as two writes", false, 5,
+                InterleavedPayload(1), 4),
+            MediaTurn.Block("RTCP on channel 6", false, 6, InterleavedPayload(2)),
+            MediaTurn.Block("the client's RTCP on channel 6", true, 6, InterleavedPayload(3)),
+            MediaTurn.Block("the client's RTP on channel 5", true, 5, InterleavedPayload(4)),
+            MediaTurn.Text("GET_PARAMETER keep-alive between media blocks", true,
+                Message($"GET_PARAMETER {uri} RTSP/2.0", new[] { "CSeq: 5", "Session: 12345678" }, "")),
+            MediaTurn.Text("200 to the keep-alive", false,
+                Message("RTSP/2.0 200 OK", new[] { "CSeq: 5", "Session: 12345678" }, "")),
+            MediaTurn.Block("RTP on channel 5 after the text exchange", false, 5, InterleavedPayload(5)),
+            MediaTurn.Text("TEARDOWN", true,
+                Message($"TEARDOWN {uri} RTSP/2.0", new[] { "CSeq: 6", "Session: 12345678" }, "")),
+            MediaTurn.Text("200 to TEARDOWN", false, Message("RTSP/2.0 200 OK", new[] { "CSeq: 6" }, "")),
+        ];
+    }
+
+    // RFC 3261 over TLS (§5 Table 1 note (1): "5061 for sip: using TLS over TCP and sips: over TCP"). Every
+    // request carries Max-Forwards (§8.1.1.6: "A UAC MUST insert a Max-Forwards header field into each
+    // request it originates with a value that SHOULD be 70") and a Via branch that is unique for each
+    // request (§7.3.3.1: "The branch parameter value MUST be unique across space and time for all requests
+    // sent by the UA"). The REGISTER body is two CRLF pairs, so only its Content-Length keeps it from being
+    // read as an empty line ending the message. The INVITE's 100 and 180 are provisional and the 200 is the
+    // final answer (§21.1.1, §21.1.2), the ACK repeats the original request's Call-ID, From, top Via and
+    // CSeq number and takes the To from the response it acknowledges (§17.1.1.3), and the 200's own
+    // content-length is spelled in lower case because "When comparing header fields, field names are always
+    // case-insensitive" (§7.3.1). Finally RFC 5626 §4.4.1: the client's "ping" is a double CRLF and the
+    // server's "pong" a single one, they "need to be sent between SIP messages and cannot be sent in the
+    // middle of a SIP message", and "If sending over TLS, the CRLFs are sent inside the TLS protected
+    // channel".
+    public static List<MediaTurn> SipScript()
+    {
+        const string callId = "probe-call-1@127.0.0.1";
+        const string from = "From: <sips:alice@probe.test>;tag=cli-1";
+        const string toRegister = "To: <sips:alice@probe.test>";
+        const string toInvite = "To: <sips:bob@probe.test>";
+        const string toAnswered = "To: <sips:bob@probe.test>;tag=srv-1";
+        var sdp = "v=0\r\no=alice 1 1 IN IP4 127.0.0.1\r\ns=Sips fixture\r\nt=0 0\r\n" +
+                  "m=audio 49170 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        string Via(int branch) => $"Via: SIP/2.0/TLS 127.0.0.1:5061;branch=z9hG4bK-probe{branch}";
+
+        var invite = Message("INVITE sips:bob@probe.test SIP/2.0", new[]
+        {
+            Via(3), from, toInvite, $"Call-ID: {callId}", "CSeq: 6 INVITE", "Max-Forwards: 70",
+            "Contact: <sips:alice@127.0.0.1:5061>", "Content-Type: application/sdp",
+            "Allow: INVITE, ACK, BYE, CANCEL, OPTIONS"
+        }, sdp);
+        var answered = Message("SIP/2.0 200 OK", new[]
+        {
+            Via(3), from, toAnswered, $"Call-ID: {callId}", "CSeq: 6 INVITE",
+            "Contact: <sips:bob@127.0.0.1:5061>", "Content-Type: application/sdp"
+        }, sdp, "content-length");
+
+        return
+        [
+            MediaTurn.Text("REGISTER whose body is two CRLF pairs", true,
+                Message("REGISTER sips:probe.test SIP/2.0", new[]
+                {
+                    Via(1), from, toRegister, $"Call-ID: {callId}", "CSeq: 1 REGISTER",
+                    "Max-Forwards: 70", "Contact: <sips:alice@127.0.0.1:5061>"
+                }, "\r\n\r\n\r\n\r\n")),
+            MediaTurn.Text("100 Trying", false,
+                Message("SIP/2.0 100 Trying",
+                    new[] { Via(1), from, toRegister, $"Call-ID: {callId}", "CSeq: 1 REGISTER" }, "")),
+            MediaTurn.Text("200 OK to REGISTER", false,
+                Message("SIP/2.0 200 OK", new[]
+                {
+                    Via(1), from, toRegister, $"Call-ID: {callId}", "CSeq: 1 REGISTER",
+                    "Contact: <sips:alice@127.0.0.1:5061>;expires=3600"
+                }, "")),
+            MediaTurn.Text("INVITE with SDP, one write ending inside the body", true, invite,
+                BodyAt(invite) + 20),
+            MediaTurn.Text("180 Ringing", false,
+                Message("SIP/2.0 180 Ringing", new[]
+                {
+                    Via(3), from, toInvite, $"Call-ID: {callId}", "CSeq: 6 INVITE",
+                    "Contact: <sips:bob@127.0.0.1:5061>"
+                }, "")),
+            MediaTurn.Text("200 OK with SDP, headers and body as two writes", false, answered,
+                BodyAt(answered)),
+            MediaTurn.Text("ACK as 17.1.1.3 requires", true,
+                Message("ACK sips:bob@probe.test SIP/2.0", new[]
+                {
+                    Via(3), from, toAnswered, $"Call-ID: {callId}", "CSeq: 6 INVITE", "Max-Forwards: 70",
+                    "Content-Type: application/sdp"
+                }, "")),
+            MediaTurn.Octets("keep-alive ping: double CRLF", true, new byte[] { 0x0d, 0x0a, 0x0d, 0x0a }),
+            MediaTurn.Octets("keep-alive pong: single CRLF", false, new byte[] { 0x0d, 0x0a }),
+            MediaTurn.Text("BYE", true,
+                Message("BYE sips:bob@probe.test SIP/2.0", new[]
+                {
+                    Via(4), from, toAnswered, $"Call-ID: {callId}", "CSeq: 7 BYE", "Max-Forwards: 70",
+                    "Reason: Q854;cause=16;text=\"Normal clearing\""
+                }, "")),
+            MediaTurn.Text("200 OK to BYE", false,
+                Message("SIP/2.0 200 OK",
+                    new[] { Via(4), from, toAnswered, $"Call-ID: {callId}", "CSeq: 7 BYE" }, "")),
+        ];
+    }
+
+    // RTMP's chunk framing is a vendor's specification, so every number this script writes was read back
+    // from the fixture's own decrypted capture with a packet dissector (measured 2026-11-03, Wireshark's
+    // Real Time Messaging Protocol dissector over the rtmps mode's pcap): the one-octet basic header's high
+    // two bits are the format and the low six the chunk stream id; format 0 adds a 24-bit timestamp, a
+    // 24-bit message length, a one-octet message type and a 32-bit little-endian message stream id; a
+    // timestamp field of 0xFFFFFF is followed by a 32-bit one; and the body is dealt out in pieces of at
+    // most the chunk size, each later piece repeating only the basic header. Message type 1 is Set Chunk
+    // Size, which the reader has to adopt before it can slice anything after it. Type 20 is an AMF0 command
+    // and 8 an audio message.
+    public const byte RtmpSetChunkSize = 1;
+    public const byte RtmpAudio = 8;
+    public const byte RtmpCommand = 20;
+    public const uint RtmpExtendedTimestamp = 0xFFFFFF;
+    private const int RtmpDefaultChunkSize = 128;
+
+    // The handshake's four blocks come in this order and in no other (measured 2026-11-03: a session that
+    // sent only the first three had the following 1536 octets of the server's chunk stream taken for the
+    // fourth block, and every chunk header after that was dissected garbled).
+    public static List<MediaTurn> RtmpScript()
+    {
+        var connectBody = Amf(
+            AmfString("connect"),
+            AmfNumber(1),
+            AmfObject(
+                ("app", AmfString("live")),
+                ("flashVer", AmfString("FMP/6,0,0,0")),
+                ("tcUrl", AmfString("rtmps://probe.test/live")),
+                ("fp", AmfString("Adobe fmp 6,0,0,0")),
+                ("audioCodecs", AmfNumber(4071)),
+                ("videoCodecs", AmfNumber(252)),
+                ("videoFunction", AmfNumber(1)),
+                ("pageUrl", AmfString("https://probe.test/player")),
+                ("swfUrl", AmfString("https://probe.test/player.swf"))));
+        var clientAudio = RtmpAudioBody(300);
+        var serverAudio = RtmpAudioBody(5000);
+
+        return
+        [
+            MediaTurn.Octets("C0+C1, 1537 octets with nothing a reader could stop on", true,
+                BuildRtmpFlight(0x11, true)),
+            MediaTurn.Octets("S0+S1", false, BuildRtmpFlight(0x22, true)),
+            MediaTurn.Octets("C2", true, BuildRtmpFlight(0x33, false)),
+            MediaTurn.Octets("S2, the block that closes the handshake", false, BuildRtmpFlight(0x44, false)),
+            MediaTurn.Chunks("connect at the default chunk size, so two chunks written in three pieces",
+                true, RtmpDefaultChunkSize,
+                new[] { 13, 12 + RtmpDefaultChunkSize },
+                new RtmpMessage(3, RtmpCommand, 0, 0, connectBody)),
+            MediaTurn.Chunks("the client raises its chunk size to 4096", true, RtmpDefaultChunkSize, null,
+                new RtmpMessage(2, RtmpSetChunkSize, 0, 0, new byte[] { 0x00, 0x00, 0x10, 0x00 })),
+            MediaTurn.Chunks("the server raises its chunk size to 4096", false, RtmpDefaultChunkSize, null,
+                new RtmpMessage(2, RtmpSetChunkSize, 0, 0, new byte[] { 0x00, 0x00, 0x10, 0x00 })),
+            MediaTurn.Chunks("_result for connect", false, 4096, null,
+                new RtmpMessage(3, RtmpCommand, 0, 0, Amf(
+                    AmfString("_result"), AmfNumber(1),
+                    AmfObject(("fmsVer", AmfString("FMS/3,5,3,888")), ("capabilities", AmfNumber(31))),
+                    AmfObject(
+                        ("level", AmfString("status")),
+                        ("code", AmfString("NetConnection.Connect.Success")),
+                        ("description", AmfString("Connection succeeded.")),
+                        ("objectEncoding", AmfNumber(0)))))),
+            MediaTurn.Chunks("createStream", true, 4096, null,
+                new RtmpMessage(3, RtmpCommand, 0, 0,
+                    Amf(AmfString("createStream"), AmfNumber(2), AmfNull()))),
+            MediaTurn.Chunks("_result naming stream 1", false, 4096, null,
+                new RtmpMessage(3, RtmpCommand, 0, 0,
+                    Amf(AmfString("_result"), AmfNumber(2), AmfNull(), AmfNumber(1)))),
+            MediaTurn.Chunks("publish, with a timestamp past the 24-bit field", true, 4096, null,
+                new RtmpMessage(4, RtmpCommand, RtmpExtendedTimestamp + 1, 1,
+                    Amf(AmfString("publish"), AmfNumber(3), AmfNull(), AmfString("stream-name")))),
+            MediaTurn.Chunks("onStatus", false, 4096, null,
+                new RtmpMessage(5, RtmpCommand, 0, 1, Amf(
+                    AmfString("onStatus"), AmfNumber(0), AmfNull(),
+                    AmfObject(
+                        ("level", AmfString("status")),
+                        ("code", AmfString("NetStream.Publish.Start")),
+                        ("description", AmfString("Start publishing")))))),
+            MediaTurn.Chunks("audio from the client", true, 4096, new[] { 20 },
+                new RtmpMessage(6, RtmpAudio, 40, 1, clientAudio)),
+            MediaTurn.Chunks("5000 octets of audio from the server, across two chunks in three pieces",
+                false, 4096, new[] { 12 + 4096, 12 + 4096 + 400 },
+                new RtmpMessage(6, RtmpAudio, 0, 1, serverAudio)),
+        ];
+    }
+
+    // An audio message body: two-octet sound header then filler that holds a CRLF pair, so a reader that
+    // wanted a line ending inside the body would find one that means nothing.
+    static byte[] RtmpAudioBody(int length)
+    {
+        var body = new byte[length];
+        body[0] = 0xaf; body[1] = 0x00; body[2] = 0x00; body[3] = 0x00; body[4] = 0x00;
+        for (var i = 5; i < length; i++) body[i] = (byte)i;
+        if (length > 120) { body[100] = 0x0d; body[101] = 0x0a; body[102] = 0x0d; body[103] = 0x0a; }
+        return body;
+    }
+
+    static byte[] Amf(params byte[][] parts)
+    {
+        var all = new MemoryStream();
+        foreach (var part in parts) all.Write(part);
+        return all.ToArray();
+    }
+
+    static byte[] AmfString(string value)
+    {
+        var text = Encoding.UTF8.GetBytes(value);
+        var outBytes = new byte[3 + text.Length];
+        outBytes[0] = 0x02;
+        outBytes[1] = (byte)(text.Length >> 8);
+        outBytes[2] = (byte)text.Length;
+        text.CopyTo(outBytes, 3);
+        return outBytes;
+    }
+
+    static byte[] AmfNumber(double value)
+    {
+        var bytes = BitConverter.GetBytes(value);
+        if (BitConverter.IsLittleEndian) Array.Reverse(bytes);
+        return new byte[] { 0x00 }.Concat(bytes).ToArray();
+    }
+
+    // The mirror of AmfString, for reading a message this harness did not write: an AMF0 string is its
+    // marker, a 16-bit big-endian length and then the octets, and a command body opens with the method name.
+    public static string? AmfMethod(byte[] body)
+    {
+        if (body.Length < 3 || body[0] != 0x02) return null;
+        var length = body[1] << 8 | body[2];
+        return body.Length < 3 + length ? null : Encoding.UTF8.GetString(body, 3, length);
+    }
+
+    static byte[] AmfNull() => [0x05];
+
+    static byte[] AmfObject(params (string Key, byte[] Value)[] entries)
+    {
+        var body = new MemoryStream();
+        body.WriteByte(0x03);
+        foreach (var (key, value) in entries)
+        {
+            var text = Encoding.UTF8.GetBytes(key);
+            body.WriteByte((byte)(text.Length >> 8));
+            body.WriteByte((byte)text.Length);
+            body.Write(text);
+            body.Write(value);
+        }
+        body.Write(new byte[] { 0x00, 0x00, 0x09 });
+        return body.ToArray();
+    }
+
+    public static byte[] RtmpWire(int chunkSize, params RtmpMessage[] messages)
+    {
+        var wire = new MemoryStream();
+        foreach (var message in messages)
+        {
+            var extended = message.Timestamp >= RtmpExtendedTimestamp;
+            var stamp = extended ? RtmpExtendedTimestamp : message.Timestamp;
+            var offset = 0;
+            do
+            {
+                var piece = Math.Min(chunkSize, message.Body.Length - offset);
+                wire.WriteByte((byte)(((offset == 0 ? 0 : 3) << 6) | message.Csid));
+                if (offset == 0)
+                {
+                    WriteBe24(wire, stamp);
+                    WriteBe24(wire, (uint)message.Body.Length);
+                    wire.WriteByte(message.Type);
+                    WriteLe32(wire, message.StreamId);
+                }
+                if (extended) WriteBe32(wire, message.Timestamp);
+                wire.Write(message.Body, offset, piece);
+                offset += piece;
+            }
+            while (offset < message.Body.Length);
+        }
+        return wire.ToArray();
+    }
+
+    static void WriteBe24(Stream s, uint value)
+    {
+        s.WriteByte((byte)(value >> 16));
+        s.WriteByte((byte)(value >> 8));
+        s.WriteByte((byte)value);
+    }
+
+    static void WriteBe32(Stream s, uint value)
+    {
+        s.WriteByte((byte)(value >> 24));
+        s.WriteByte((byte)(value >> 16));
+        s.WriteByte((byte)(value >> 8));
+        s.WriteByte((byte)value);
+    }
+
+    static void WriteLe32(Stream s, uint value)
+    {
+        s.WriteByte((byte)value);
+        s.WriteByte((byte)(value >> 8));
+        s.WriteByte((byte)(value >> 16));
+        s.WriteByte((byte)(value >> 24));
+    }
+
+    public static uint Be24(byte[] bytes, int at) => (uint)((bytes[at] << 16) | (bytes[at + 1] << 8) | bytes[at + 2]);
+    public static uint Be32(byte[] bytes) => (uint)((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]);
+    public static uint Le32(byte[] bytes, int at = 0) =>
+        (uint)(bytes[at] | (bytes[at + 1] << 8) | (bytes[at + 2] << 16) | (bytes[at + 3] << 24));
+
+    static async Task<byte> ReadOctet(Stream s)
+    {
+        var one = new byte[1];
+        await s.ReadExactlyAsync(one);
+        return one[0];
+    }
+
+    public static async Task<byte[]> ReadOctets(Stream s, int count)
+    {
+        var buffer = new byte[count];
+        await s.ReadExactlyAsync(buffer);
+        return buffer;
+    }
+
+    // The reader stops where the dialect says the message stops, not where a write happened to end: empty
+    // lines before a start-line are ignored (RFC 7826 §5.1, and RFC 3261 §7.5 puts the same duty on SIP),
+    // the header block ends at the empty line, and the body is then the declared number of octets whatever
+    // it contains. Content-Length is matched without regard to case (RFC 3261 §7.3.1) and assumed zero when
+    // it is missing (RFC 7826 §18.17).
+    static async Task<byte[]> ReadTextMessage(Stream s)
+    {
+        var message = new MemoryStream();
+        var line = new StringBuilder();
+        var sawStartLine = false;
+        var bodyLength = 0;
+        while (true)
+        {
+            var b = await ReadOctet(s);
+            message.WriteByte(b);
+            if (b != (byte)'\n')
+            {
+                if (b != (byte)'\r') line.Append((char)b);
+                continue;
+            }
+
+            var text = line.ToString();
+            line.Clear();
+            if (text.Length == 0)
+            {
+                if (!sawStartLine)
+                {
+                    message.SetLength(0);
+                    continue;
+                }
+                break;
+            }
+
+            sawStartLine = true;
+            var colon = text.IndexOf(':');
+            if (colon <= 0 ||
+                !text.Substring(0, colon).Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (int.TryParse(text.Substring(colon + 1).Trim(), out var declared)) bodyLength = declared;
+        }
+
+        if (bodyLength > 0) message.Write(await ReadOctets(s, bodyLength));
+        return message.ToArray();
+    }
+
+    // RFC 7826 §14 makes the length field the only thing that says where a block ends, so the reader takes
+    // it on faith and then that many octets - which is also what survives a relay that re-chunked the file.
+    static async Task<byte[]> ReadFrame(Stream s)
+    {
+        var head = await ReadOctets(s, 4);
+        var payload = await ReadOctets(s, (head[2] << 8) | head[3]);
+        return head.Concat(payload).ToArray();
+    }
+
+    // One turn of the script, either way. A write boundary is a property of the fixture's own discipline,
+    // so a boundary that is not inside the message is a script bug and says so rather than quietly sending
+    // the turn as one write.
+    static async Task WriteTurn(Stream ssl, MediaTurn turn)
+    {
+        var at = 0;
+        foreach (var split in turn.Splits ?? Array.Empty<int>())
+        {
+            if (split <= at || split >= turn.Bytes.Length)
+                throw new InvalidOperationException($"turn '{turn.Label}' names a write boundary at {split}, " +
+                                                   $"which is not inside it past {at}");
+            await ssl.WriteAsync(turn.Bytes.AsMemory(at, split - at));
+            await ssl.FlushAsync();
+            at = split;
+        }
+        await ssl.WriteAsync(turn.Bytes.AsMemory(at));
+        await ssl.FlushAsync();
+    }
+
+    static async Task ReadTurn(Stream ssl, MediaTurn turn, RtmpChunks inbound, string label,
+        List<string> failures)
+    {
+        if (turn.Shape == MediaRead.Chunks)
+        {
+            var (wire, messages) = await inbound.ReadUntil(turn.Bytes.Length);
+            if (!wire.AsSpan().SequenceEqual(turn.Bytes))
+            {
+                failures.Add($"{label}: turn '{turn.Label}' arrived as {wire.Length} octets with the first " +
+                             $"difference at {FirstDifference(wire, turn.Bytes)}, not the " +
+                             $"{turn.Bytes.Length} sent");
+                return;
+            }
+            var mismatch = RtmpDifference(messages, turn.Decoded!);
+            if (mismatch != null)
+                failures.Add($"{label}: turn '{turn.Label}' unframed as {mismatch} from {wire.Length} wire " +
+                            $"octets opening {Convert.ToHexString(wire[..Math.Min(wire.Length, 24)])}");
+            return;
+        }
+
+        var arrived = turn.Shape switch
+        {
+            MediaRead.Text => await ReadTextMessage(ssl),
+            MediaRead.Frame => await ReadFrame(ssl),
+            _ => await ReadOctets(ssl, turn.Bytes.Length)
+        };
+        if (!arrived.AsSpan().SequenceEqual(turn.Bytes))
+            failures.Add($"{label}: turn '{turn.Label}' arrived as {arrived.Length} octets with the first " +
+                         $"difference at {FirstDifference(arrived, turn.Bytes)}, not the " +
+                         $"{turn.Bytes.Length} sent");
+    }
+
+    static string? RtmpDifference(List<RtmpMessage> arrived, RtmpMessage[] sent)
+    {
+        if (arrived.Count != sent.Length)
+            return $"{arrived.Count} message(s) [{string.Join("; ", arrived.Select(Describe))}] instead of " +
+                   $"{sent.Length} [{string.Join("; ", sent.Select(Describe))}]";
+        for (var i = 0; i < arrived.Count; i++)
+        {
+            if (arrived[i].Csid != sent[i].Csid || arrived[i].Type != sent[i].Type ||
+                arrived[i].Timestamp != sent[i].Timestamp || arrived[i].StreamId != sent[i].StreamId ||
+                !arrived[i].Body.AsSpan().SequenceEqual(sent[i].Body))
+                return $"message {i} as {Describe(arrived[i])} instead of {Describe(sent[i])}";
+        }
+        return null;
+    }
+
+    static string Describe(RtmpMessage m) =>
+        $"csid {m.Csid} type {m.Type} timestamp {m.Timestamp} stream {m.StreamId} body {m.Body.Length}";
+
+    /// <summary>Runs one end of a script: writes the turns belonging to this side, reads and judges the rest.</summary>
+    public static async Task<int> RunDialogue(Stream ssl, List<MediaTurn> script, bool asClient, string label,
+        List<string> notes, List<string> failures)
+    {
+        var inbound = new RtmpChunks(ssl);
+        var turns = 0;
+        var toServer = 0;
+        var toClient = 0;
+        foreach (var turn in script)
+        {
+            var sending = turn.FromClient == asClient;
+            try
+            {
+                if (sending) await WriteTurn(ssl, turn).WaitAsync(TurnLimit);
+                else await ReadTurn(ssl, turn, inbound, label, failures).WaitAsync(TurnLimit);
+            }
+            catch (Exception ex) when (ex is TimeoutException or IOException or EndOfStreamException
+                                           or InvalidDataException or InvalidOperationException)
+            {
+                failures.Add($"{label}: turn '{turn.Label}' {(sending ? "was never written" : "never arrived whole")} " +
+                             $"({ex.GetType().Name}: {ex.Message})");
+                return turns;
+            }
+
+            turns++;
+            if (turn.FromClient) toServer += turn.Bytes.Length; else toClient += turn.Bytes.Length;
+        }
+
+        notes.Add($"{label}: all {turns} turns carried both ways, {toServer} octets client to server and " +
+                  $"{toClient} back, each read where the dialect says its message ends");
+        if (script.Any(t => t.Shape == MediaRead.Chunks))
+            notes.Add($"{label}: the chunk reader ended holding an inbound chunk size of {inbound.ChunkSize}");
+        return turns;
+    }
+
+    private static readonly TimeSpan TurnLimit = TimeSpan.FromSeconds(10);
+}
+
+// Reads an RTMP chunk stream the way the framing is written: the basic header's format bits say how much
+// of the message header repeats, the message header says how long the whole message is, and the chunk size
+// says how much of it this piece may carry. A Set Chunk Size message changes that for everything after it,
+// which is the one rule a relay-inside fixture cannot fake its way past.
+sealed class RtmpChunks(Stream socket)
+{
+    private readonly MemoryStream _raw = new();
+    private readonly Dictionary<int, OpenMessage> _open = new();
+    private readonly Dictionary<int, MemoryStream> _parts = new();
+
+    public int ChunkSize { get; private set; } = 128;
+
+    record struct OpenMessage(uint Timestamp, uint Length, uint Received, byte Type, uint StreamId,
+        bool Extended);
+
+    public async Task<(byte[] Wire, List<RtmpMessage> Messages)> ReadUntil(int octets)
+    {
+        var messages = new List<RtmpMessage>();
+        // The tally this reader keeps spans the session, so the stop condition is octets arrived since this
+        // call began - compared against the running total, every turn after the first would return at once.
+        var start = (int)_raw.Length;
+        while (_raw.Length - start < octets)
+        {
+            var basic = await Take(1);
+            var fmt = basic[0] >> 6;
+            var csid = basic[0] & 0x3f;
+            uint stamp, length, streamId;
+            byte type;
+            switch (fmt)
+            {
+                case 0:
+                {
+                    var head = await Take(11);
+                    stamp = Media.Be24(head, 0);
+                    length = Media.Be24(head, 3);
+                    type = head[6];
+                    streamId = Media.Le32(head, 7);
+                    break;
+                }
+                case 1:
+                {
+                    var head = await Take(7);
+                    stamp = Media.Be24(head, 0);
+                    length = Media.Be24(head, 3);
+                    type = head[6];
+                    streamId = Need(csid).StreamId;
+                    break;
+                }
+                case 2:
+                {
+                    var head = await Take(3);
+                    stamp = Media.Be24(head, 0);
+                    var previous = Need(csid);
+                    length = previous.Length;
+                    type = previous.Type;
+                    streamId = previous.StreamId;
+                    break;
+                }
+                default:
+                {
+                    var previous = Need(csid);
+                    stamp = previous.Extended ? Media.RtmpExtendedTimestamp : previous.Timestamp;
+                    length = previous.Length;
+                    type = previous.Type;
+                    streamId = previous.StreamId;
+                    break;
+                }
+            }
+
+            var extended = stamp == Media.RtmpExtendedTimestamp;
+            var timestamp = extended ? Media.Be32(await Take(4)) : stamp;
+
+            var received = fmt == 3 ? Need(csid).Received : 0u;
+            var piece = (int)Math.Min(ChunkSize, length - received);
+            // A message longer than the chunk size arrives as several pieces, and the message the reader
+            // hands back is their concatenation - the declared length covers all of them, not this piece.
+            var parts = fmt == 3 ? _parts[csid] : (_parts[csid] = new MemoryStream());
+            parts.Write(await Take(piece));
+            received += (uint)piece;
+            _open[csid] = new OpenMessage(timestamp, length, received, type, streamId, extended);
+            if (received < length) continue;
+
+            _open.Remove(csid);
+            _parts.Remove(csid);
+            var body = parts.ToArray();
+            if (type == Media.RtmpSetChunkSize) ChunkSize = (int)(Media.Be32(body) & 0x7fffffff);
+            messages.Add(new RtmpMessage(csid, type, timestamp, streamId, body));
+        }
+        var all = _raw.ToArray();
+        return (all[start..], messages);
+    }
+
+    private OpenMessage Need(int csid) =>
+        _open.TryGetValue(csid, out var open) ? open
+        : throw new InvalidDataException($"chunk stream {csid} continues a message this reader never started");
+
+    private async Task<byte[]> Take(int count)
+    {
+        var bytes = await Media.ReadOctets(socket, count);
+        _raw.Write(bytes);
+        return bytes;
+    }
+}
+
+// --- what the product wrote to disk -----------------------------------------------------------------
+
+static class Capture
+{
+    public static async Task<string?> FindAsync(string[] before, Func<string, bool> match)
+    {
+        for (var i = 0; i < 50; i++)
+        {
+            var path = Directory.Exists("captures")
+                ? Directory.GetFiles("captures").FirstOrDefault(f => !before.Contains(f) && match(f))
+                : null;
+            if (path != null && new FileInfo(path).Length > 0) return path;
+            await Task.Delay(100);
+        }
+        return null;
+    }
+
+    // The writer holds the capture open for the whole session, so reading it needs a share mask that permits
+    // that handle's write access - which is what File.ReadAllBytesAsync's own FileShare.Read does not.
+    public static async Task<byte[]> ReadAsync(string path)
+    {
+        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        var buffer = new byte[stream.Length];
+        await stream.ReadExactlyAsync(buffer);
+        return buffer;
+    }
+
+    // pcap framing: a 24-byte global header, then per packet a 16-byte record header (inclusion length at
+    // offset 8) and the frame this writer builds - 14 Ethernet, 20 or 40 IP, 20 TCP. The IP length fields
+    // bound the TCP payload, because an Ethernet frame under 60 octets is padded and that padding is not
+    // part of the datagram. The frame's source port tells which peer sent it, so a one-sided recording
+    // cannot pass for an exchange, and the TCP flags octet says what kind of segment it was.
+    public static async Task<List<(bool FromServer, byte[] Payload, byte Flags)>> FramesAsync(
+        string path, int upstreamPort) => Frames(await ReadAsync(path), upstreamPort);
+
+    public static List<(bool FromServer, byte[] Payload, byte Flags)> Frames(byte[] bytes, int upstreamPort)
+    {
+        var frames = new List<(bool FromServer, byte[] Payload, byte Flags)>();
+        for (var off = 24; off + 16 <= bytes.Length; off += 16)
+        {
+            var incl = (int)BitConverter.ToUInt32(bytes.AsSpan(off + 8, 4));
+            if (incl < 55 || off + 16 + incl > bytes.Length) break;
+            var frame = bytes.AsSpan(off + 16, incl);
+            var ipv6 = frame[12] == 0x86 && frame[13] == 0xDD;
+            var ipLen = ipv6 ? 40 : 20;
+            var tcp = 14 + ipLen;
+            var ipTotal = ipv6 ? (frame[18] << 8) | frame[19] : (frame[16] << 8) | frame[17];
+            var payloadLength = Math.Max(0, ipTotal - (tcp - 14) - 20);
+            frames.Add((((frame[tcp] << 8) | frame[tcp + 1]) == upstreamPort,
+                frame.Slice(tcp + 20, payloadLength).ToArray(), frame[tcp + 13]));
+            off += incl;   // the next record header follows this frame, not these 16 bytes
+        }
+        return frames;
+    }
+
+    static byte[] Joined(IEnumerable<byte[]> parts)
+    {
+        var all = new MemoryStream();
+        foreach (var part in parts) all.Write(part);
+        return all.ToArray();
+    }
+
+    /// <summary>
+    /// Judges the file the proxy wrote for the session against the script it just carried. The writer
+    /// records the payload of each relay chunk it was handed, so the octets of a direction joined in file
+    /// order have to be exactly that direction's turns - the tunnel decrypted, in order, with nothing
+    /// dropped and nothing inserted. It polls because the last turn may still be on its way into the file
+    /// when the dialogue ends.
+    /// </summary>
+    public static async Task CheckDialogueAsync(string[] before, int upstreamPort, List<MediaTurn> script,
+        string label, List<string> notes, List<string> failures)
+    {
+        var path = await FindAsync(before, f => f.EndsWith(".pcap", StringComparison.Ordinal) &&
+                                                !f.EndsWith("_aborted.pcap", StringComparison.Ordinal) &&
+                                                !f.Contains("_blind_", StringComparison.Ordinal));
+        if (path == null)
+        {
+            failures.Add($"{label}: the session wrote no capture file to judge the tunnel against");
+            return;
+        }
+
+        var wanted = new Dictionary<bool, byte[]>
+        {
+            [false] = Joined(script.Where(t => t.FromClient).Select(t => t.Bytes)),
+            [true] = Joined(script.Where(t => !t.FromClient).Select(t => t.Bytes))
+        };
+        List<(bool FromServer, byte[] Payload, byte Flags)> frames = [];
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            frames = await FramesAsync(path, upstreamPort);
+            if (wanted.All(w => Joined(frames.Where(f => f.FromServer == w.Key)
+                        .Select(f => f.Payload)).AsSpan().SequenceEqual(w.Value)))
+                break;
+            await Task.Delay(100);
+        }
+
+        foreach (var (fromServer, bytes) in wanted)
+        {
+            var arrived = Joined(frames.Where(f => f.FromServer == fromServer).Select(f => f.Payload));
+            if (arrived.AsSpan().SequenceEqual(bytes)) continue;
+            failures.Add($"{label}: capture {Path.GetFileName(path)} holds {arrived.Length} octets " +
+                         $"{(fromServer ? "from the server" : "to the server")} where the script sent " +
+                         $"{bytes.Length}, first difference at " +
+                         $"{Media.FirstDifference(arrived, bytes)}");
+            return;
+        }
+        notes.Add($"{label}: capture {Path.GetFileName(path)} holds the whole dialogue, " +
+                  $"{wanted[false].Length} octets to the server and {wanted[true].Length} back, in " +
+                  $"{frames.Count} frames");
+    }
+}
+
+// RPC records as RFC 5531 §9 lays them out and §11 frames them: a 4-octet mark whose high bit says the
+// fragment behind it ends the record and whose remaining 31 bits count that fragment's octets. Both ends of
+// every sunrpc fixture build the same octets, so each read stays a byte-exact comparison instead of a second
+// parser that could repeat the first one's mistake.
+static class Rpc
+{
+    // RFC 5531 §9; AUTH_TLS is the flavor RFC 9289 §7.1 assigns for the probe.
+    public const uint AuthNone = 0, AuthSys = 1, AuthTls = 7;
+    public const uint MsgAccepted = 0, MsgDenied = 1;
+    public const uint RejectAuthError = 1, StatBadCred = 1;
+    public const uint Success = 0, ProgUnavail = 1;
+    private const uint Program = 100000, Version = 4;   // the rpcbind program of RFC 1833
+    private const uint MsgCall = 0, MsgReply = 1, RpcVersion = 2;
+    private const uint NullProc = 0;      // §12.1's PINGPROC_NULL, the procedure §4.1's probe is sent on
+
+    public static readonly SslApplicationProtocol Alpn = new("sunrpc");   // RFC 9289 §7.2
+
+    public static byte[] Probe(uint xid) => AuthTlsCall(xid, 0);
+
+    // RFC 9289 §4.1 gives the probe its meaning from two words: an AUTH_TLS credential carrying no octets and
+    // an AUTH_NONE verifier carrying none. Any other procedure under that credential is a misuse instead.
+    public static byte[] AuthTlsCall(uint xid, uint proc) =>
+        Record(Call(xid, proc, (AuthTls, []), (AuthNone, [])));
+
+    public static byte[] NullCall(uint xid) => Record(Call(xid, 0, (AuthNone, []), (AuthNone, [])));
+
+    // Records that read like the probe and are not, each differing from it in exactly one of the words that
+    // define it. RFC 5531 §9 makes rpcvers 2 the only version - "rpcvers MUST be equal to 2" - and lets msgtype
+    // pick between the call and the reply arms; §4.1 makes the credential carry no octets and the verifier be
+    // AUTH_NONE of no octets. The three in the middle are not records a conforming client could send, one
+    // carrying four octets more than the probe's forty and two declaring an opaque of four while carrying none,
+    // so the proxy has to answer each as the ordinary record it claims to be rather than open a tunnel on
+    // octets that mean no upgrade. The last is conforming but no probe: an AUTH_SYS verifier behind the
+    // AUTH_TLS credential, which §4.1's "MUST be an AUTH_NONE verifier" rules out.
+    public static (uint Xid, byte[] Record)[] NearProbes() =>
+    [
+        (0xA001, Record(CallAt(0xA001, MsgCall, 1, NullProc, (AuthTls, []), (AuthNone, [])))),
+        (0xA002, Record(CallAt(0xA002, MsgReply, RpcVersion, NullProc, (AuthTls, []), (AuthNone, [])))),
+        (0xA003, Record([.. Call(0xA003, NullProc, (AuthTls, []), (AuthNone, [])), 0, 0, 0, 0])),
+        (0xA004, Record([.. Call(0xA004, NullProc, (AuthTls, []), (AuthNone, []))[..28],
+            0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0])),
+        (0xA005, Record([.. Call(0xA005, NullProc, (AuthTls, []), (AuthNone, []))[..36], 0, 0, 0, 4])),
+        (0xA006, Record(Call(0xA006, NullProc, (AuthTls, []), (AuthSys, [])))),
+    ];
+
+    // A record cut in three so two fragment boundaries fall between reads (§11 lets a record carry any number
+    // of fragments). The AUTH_SYS credential of Appendix A supplies octets worth cutting, and §11's fragments
+    // run from 0 octets up, so the empty one in the middle is what the walk has to step over without losing
+    // the record's own length.
+    public static byte[][] CallFragments(uint xid)
+    {
+        var body = Call(xid, 11, (AuthSys, AuthSysCredential()), (AuthNone, []));
+        return [Fragment(false, body[..34]), Fragment(false, []), Fragment(true, body[34..])];
+    }
+
+    public static byte[] FragmentedCall(uint xid) => Concat(CallFragments(xid));
+
+    // The probe's own record spread over three fragments, the middle of them empty: §11 makes a record "one or
+    // more record fragments" and lets each carry "0 to (2**31) - 1 bytes", so the forty octets §4.1's probe is
+    // made of may arrive over any number of them. The writes cut one of the fragments in two as well, so a
+    // fragment boundary and a read boundary fall inside the same record.
+    public static byte[][] ProbeFragments(uint xid)
+    {
+        var body = Call(xid, NullProc, (AuthTls, []), (AuthNone, []));
+        var last = Fragment(true, body[20..]);
+        return [Fragment(false, body[..20]), Fragment(false, []), last[..16], last[16..]];
+    }
+
+    public static byte[] FragmentedProbe(uint xid) => Concat(ProbeFragments(xid));
+
+    private static byte[] Concat(byte[][] parts)
+    {
+        var whole = new List<byte>();
+        foreach (var part in parts) whole.AddRange(part);
+        return [.. whole];
+    }
+
+    // RFC 9289 §4.1: the grant is the verifier's eight octets spelling "STARTTLS".
+    public static byte[] Grant(uint xid, uint acceptStat) =>
+        Record(Accepted(xid, (AuthNone, "STARTTLS"u8.ToArray()), acceptStat));
+
+    public static byte[] AcceptedReply(uint xid) => Record(Accepted(xid, (AuthNone, []), Success));
+
+    // §4.1 withholds the grant from a reply whose verifier does not contain the "STARTTLS" token. Eight octets
+    // of AUTH_NONE that are not those eight are the one reply shape the token comparison alone separates from a
+    // grant, so this is the fixture's stand-in for it.
+    public static byte[] NotGrant(uint xid) => Record(Accepted(xid, (AuthNone, "TLSNOTOK"u8.ToArray()), Success));
+
+    // §4.1 requires the reply's verifier flavor to be AUTH_NONE before it requires anything of that verifier's
+    // octets, so this record has the token in the wrong place: an accepted reply whose eight octets spell
+    // STARTTLS under an AUTH_SYS flavor.
+    public static byte[] WrongFlavor(uint xid) =>
+        Record(Accepted(xid, (AuthSys, "STARTTLS"u8.ToArray()), Success));
+
+    public static byte[] Denial(uint xid) => Record(Denied(xid));
+
+    private static byte[] Call(uint xid, uint proc, (uint Flavor, byte[] Body) cred,
+        (uint Flavor, byte[] Body) verf) => CallAt(xid, MsgCall, RpcVersion, proc, cred, verf);
+
+    private static byte[] CallAt(uint xid, uint msgType, uint rpcvers, uint proc,
+        (uint Flavor, byte[] Body) cred, (uint Flavor, byte[] Body) verf) =>
+        [.. Be(xid), .. Be(msgType), .. Be(rpcvers), .. Be(Program), .. Be(Version), .. Be(proc),
+            .. Be(cred.Flavor), .. Be((uint)cred.Body.Length), .. cred.Body,
+            .. Be(verf.Flavor), .. Be((uint)verf.Body.Length), .. verf.Body];
+
+    private static byte[] Accepted(uint xid, (uint Flavor, byte[] Body) verf, uint acceptStat) =>
+        [.. Be(xid), .. Be(MsgReply), .. Be(MsgAccepted), .. Be(verf.Flavor),
+            .. Be((uint)verf.Body.Length), .. verf.Body, .. Be(acceptStat)];
+
+    // §9 puts the verifier only in the MSG_ACCEPTED arm, so a refusal is five words and no more.
+    private static byte[] Denied(uint xid) =>
+        [.. Be(xid), .. Be(MsgReply), .. Be(MsgDenied), .. Be(RejectAuthError), .. Be(StatBadCred)];
+
+    private static byte[] AuthSysCredential() =>
+        [.. Be(0), .. Be(5), .. "probe"u8.ToArray(), 0, 0, 0, .. Be(1000), .. Be(1000), .. Be(0)];
+
+    private static byte[] Record(byte[] body) => Fragment(true, body);
+
+    private static byte[] Fragment(bool last, byte[] data) =>
+        [.. Be((last ? 0x8000_0000u : 0u) | (uint)data.Length), .. data];
+
+    private static byte[] Be(uint value) =>
+        [(byte)(value >> 24), (byte)(value >> 16), (byte)(value >> 8), (byte)value];
 }

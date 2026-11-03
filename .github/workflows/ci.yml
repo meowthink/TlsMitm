@@ -26,7 +26,7 @@ jobs:
         run: pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./tests/make-test-root.ps1
 
       # Debug is what the local runs use, so this step checks the binaries developers actually test.
-      # Builds every project, then runs the starttlsprobe modes in four grouped processes, the ECH
+      # Builds every project, then runs the starttlsprobe modes in five grouped processes, the ECH
       # state-machine check, the router's NAT check and its DHCP/DNS check, and the ClientHello parser
       # test. chainprobe is built but not run: it needs real endpoints.
       - name: Offline suites
@@ -37,8 +37,14 @@ jobs:
           TLSMITM_CI_ROOT_STORE: LocalMachine
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./tests/run-offline.ps1
 
-      - name: Publish a self-contained build
+      # The release job is the only thing that ships Router, and it runs on a tag alone: publishing both
+      # here puts a broken Router build in front of a PR instead of in front of a release. Two steps
+      # because a runner checks only the last exit code of a pwsh script.
+      - name: Publish the proxy
         run: dotnet publish TlsMitm -c Debug -r win-x64 --self-contained -o out/publish
+
+      - name: Publish the router
+        run: dotnet publish Router -c Debug -r win-x64 --self-contained -o out/publish
 
       - uses: actions/upload-artifact@v4
         with:

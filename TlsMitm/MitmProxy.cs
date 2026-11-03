@@ -560,9 +560,11 @@ public class MitmProxy
             return;
         }
 
-        // A STARTTLS upgrade negotiates no application protocol, so no ALPN is offered to either
-        // peer; the client never asked for one.
-        await MitmAsync(clientRaw, rawBytes, serverRaw, host, null, dest,
+        // What the upgraded hello offered is carried through, because some protocols require it: RFC 9289 §5
+        // makes an RPC-with-TLS client put ALPN with the §7.2 "sunrpc" identifier in its ClientHello and the
+        // server answer with only that identifier, and rules out the session if it does so incorrectly. A
+        // hello that offered nothing leaves the client handshake first, as before.
+        await MitmAsync(clientRaw, rawBytes, serverRaw, host, clientHello?.Alpn, dest,
             ResolveTrust(identity, clientHello), identity.Pid, ct,
             earlyData: clientHello?.EarlyData == true);
     }

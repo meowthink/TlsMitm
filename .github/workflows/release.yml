@@ -17,8 +17,14 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Publish
+      # One directory for both programs, so one archive carries both exes: the self-contained runtime is
+      # the same for the same RID. Two steps rather than two lines in one, because a runner checks only
+      # the last exit code of a pwsh script and a half-published directory must not reach the zip.
+      - name: Publish the proxy
         run: dotnet publish TlsMitm -c Release -r win-x64 --self-contained -o out/publish
+
+      - name: Publish the router
+        run: dotnet publish Router -c Release -r win-x64 --self-contained -o out/publish
 
       - name: Zip
         run: |
