@@ -11,6 +11,7 @@ chainprobe client <port>                               Schannel client against o
 chainprobe emsign <certsDir>                           real emSign leaf over SslStream, one connection
 chainprobe emserve <certsDir> <port> [shape] [caIndex] real emSign leaf over the libssl leg
 chainprobe fiddler <host> <port> [variant]             real CertEngine Fiddler leaf over SslStream
+chainprobe floor                                       version floor of the libssl terminator
 ```
 
 `shape` = `full` | `no-anchor` | `no-intermediate` | `leaf`; `variant` = `plain` | `served` | `cdp` |
@@ -18,6 +19,14 @@ chainprobe fiddler <host> <port> [variant]             real CertEngine Fiddler l
 `emserve` is the mode that matches production for an emSign chain: it drives `OpenSslServerStream`,
 the same leg MitmProxy uses, and pins one CA via `caIndex` so a wire shape is reproducible per run.
 `run-emsign.sh` and `run-matrix.sh` wrap the comparisons that need a server and a client together.
+
+`floor` is the mode the offline suite runs. It hands `OpenSslServerStream` hellos assembled by
+`tools/hellofingerprint` that differ only in the version they offer, then one real `SslStream` client
+that has to finish and be served, and reads the terminator's first reply record. It passes when 1.2 and
+1.3 get a ServerHello and 1.0 and 1.1 get an alert; each row prints the alert number and the error text
+libssl queued, so a refusal names the layer that produced it. An accepted row also prints that reply's
+JA4S and JA3S, which is how a client of ours sees this terminator. The leaf is self-signed and in no
+store.
 
 ## Measured verdicts (2026-10-25, this host)
 

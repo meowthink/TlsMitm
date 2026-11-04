@@ -27,9 +27,9 @@ $groups = @(
 $failed = New-Object System.Collections.Generic.List[string]
 
 # One solution build rather than one per project: every project references TlsMitm, so building them
-# separately restores and evaluates the same graph again for each. chainprobe and tools/abortcheck are
-# in the solution and built here but not run below - they need real endpoints - which is what catches
-# API drift in them.
+# separately restores and evaluates the same graph again for each. tools/abortcheck and chainprobe's
+# emsign, emserve and fiddler modes are in the solution and built here but not run below - they need
+# real endpoints - which is what catches API drift in them.
 $t0 = [DateTime]::UtcNow
 dotnet build (Join-Path $root 'TlsMitm.slnx') -c $Configuration --nologo | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'build failed' }
@@ -93,6 +93,30 @@ $quic = Join-Path $root "tests\quiccheck\bin\$Configuration\net10.0\quiccheck.ex
 $out = & $quic 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { $failed.Add('quiccheck'); Write-Host $out } else { Write-Host 'ok   quiccheck' }
 
+# hellofingerprint check judges both decoders against vectors that the algorithms' own publishers computed
+# from the same hellos: JA3 and JA4 for a client hello, JA3S and JA4S for a server hello. No capture, no
+# tshark and no network is needed here. The read of real captures is what the decoder is used for, and is
+# checked against Wireshark's dissector by hand; the vectors are what says it has not drifted.
+$hello = Join-Path $root "tools\hellofingerprint\bin\$Configuration\net10.0\hellofingerprint.exe"
+$out = & $hello check 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('hellofingerprint'); Write-Host $out } else { Write-Host 'ok   hellofingerprint check' }
+
+# tlsstackcheck assert keeps the two things the proxy's SChannel legs cannot work without: the options they
+# set are taken, and a loopback pair agrees on one version the proxy terminates at, with TLS 1.2 alone still
+# terminable. Which of 1.2 and 1.3 a 1.2|1.3 pair lands on is the host's answer, so it is not asserted. The
+# versions matrix and the registry policy around it are reports, not assertions, so they stay out of the suite.
+$stack = Join-Path $root "tools\tlsstackcheck\bin\$Configuration\net10.0-windows\tlsstackcheck.exe"
+$out = & $stack assert 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('tlsstackcheck'); Write-Host $out } else { Write-Host 'ok   tlsstackcheck assert' }
+
+# chainprobe floor drives the embedded libssl terminator with hellos that differ only in the version they
+# offer, on loopback with a leaf in no store. It keeps the floor itself: 1.2 and 1.3 terminate, 1.0 and
+# 1.1 are refused. The library is the one that answers, so an OpenSSL upgrade that moves the floor is
+# caught here rather than discovered in a live run.
+$floor = Join-Path $root "tests\chainprobe\bin\$Configuration\net10.0\chainprobe.exe"
+$out = & $floor floor 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('chainprobe floor'); Write-Host $out } else { Write-Host 'ok   chainprobe floor' }
+
 $noSni = Join-Path $PSScriptRoot 'no-sni-test.ps1'
 if (-not (Get-Command pwsh -ErrorAction SilentlyContinue)) {
     throw 'no-sni-test needs PowerShell 7 (pwsh); Windows PowerShell cannot load a net10.0 assembly'
@@ -106,4 +130,4 @@ if ($failed.Count -gt 0) {
     exit 1
 }
 $modeCount = ($groups | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
-Write-Host "`n[run-offline] PASS - $modeCount starttlsprobe modes in $($groups.Count) processes + echcheck + natcheck + nat64check + flowcheck + fwcheck + servcheck + v6check + quiccheck + no-sni-test"
+Write-Host "`n[run-offline] PASS - $modeCount starttlsprobe modes in $($groups.Count) processes + echcheck + natcheck + nat64check + flowcheck + fwcheck + servcheck + v6check + quiccheck + hellofingerprint + tlsstackcheck + chainprobe floor + no-sni-test"

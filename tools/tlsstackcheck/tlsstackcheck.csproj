@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>tlsstackcheck</AssemblyName>
+    <RootNamespace>TlsStackCheck</RootNamespace>
+    <!-- Reading what the stack does with TLS 1.0 and 1.1 is the whole point of the versions matrix, and
+         the enum members that name them are the ones the framework marks obsolete. -->
+    <NoWarn>SYSLIB0039</NoWarn>
+  </PropertyGroup>
+
+</Project>

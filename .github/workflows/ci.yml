@@ -27,8 +27,12 @@ jobs:
 
       # Debug is what the local runs use, so this step checks the binaries developers actually test.
       # Builds every project, then runs the starttlsprobe modes in five grouped processes, the ECH
-      # state-machine check, the router's NAT check and its DHCP/DNS check, and the ClientHello parser
-      # test. chainprobe is built but not run: it needs real endpoints.
+      # state-machine check, the router's NAT check and its DHCP/DNS check, the hello decoder's
+      # tools/hellofingerprint check — the JA3/JA4 and JA3S/JA4S vectors, which need no capture and no
+      # tshark — tools/tlsstackcheck assert, which keeps the SChannel options the proxy's legs set and a
+      # loopback pair that terminates at a version the proxy handles (1.2 on its own too), and chainprobe
+      # floor, which keeps the version floor of the libssl terminator. chainprobe's emsign, emserve and
+      # fiddler modes are built but not run: they need real endpoints.
       - name: Offline suites
         # CurrentUser\Root is consent-gated on hosted runners, so the fixture is machine-wide. This
         # test-only switch selects it without changing production RootCa discovery; the rootcheck mode

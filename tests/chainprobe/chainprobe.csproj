@@ -10,5 +10,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\TlsMitm\TlsMitm.csproj" />
+    <!-- floor sends hellos assembled by the same builder the JA3/JA4 check judges, so the bytes this
+         mode feeds the terminator are the bytes that decoder is known to read correctly. -->
+    <ProjectReference Include="..\..\tools\hellofingerprint\hellofingerprint.csproj" />
   </ItemGroup>
 </Project>

@@ -15,9 +15,11 @@
     <Project Path="tools/abortcheck/abortcheck.csproj" />
     <Project Path="tools/apcheck/apcheck.csproj" />
     <Project Path="tools/dns65check/dns65check.csproj" />
+    <Project Path="tools/hellofingerprint/hellofingerprint.csproj" />
     <Project Path="tools/inject/inject.csproj" />
     <Project Path="tools/pdprobe/pdprobe.csproj" />
     <Project Path="tools/tcpwitness/tcpwitness.csproj" />
+    <Project Path="tools/tlsstackcheck/tlsstackcheck.csproj" />
   </Folder>
   <Project Path="Router/Router.csproj" />
   <Project Path="TlsMitm/TlsMitm.csproj" />

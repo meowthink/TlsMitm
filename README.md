@@ -545,11 +545,14 @@ suite's own loopback traffic and turns passing modes into false failures.
   crossed tuple, §4.2's type and code rows, RFC 1624 §2's update of the quoted checksum, the error-in-error,
   foreign-quote and truncated-quote refusals; §3.5.3's identifier, §3.4's fragment records and their DoS ceiling,
   §3.8's hairpin, and every discard naming the clause it obeys.
+* `chainprobe floor` — the version floor the libssl terminator runs with, read from the first record it
+  sends back to hellos that differ only in the version they offer: 1.2 and 1.3 must reach a ServerHello,
+  1.0 and 1.1 must reach an alert, and a real `SslStream` client must terminate and be served.
 * `no-sni-test.ps1` — the ClientHello parser and the leaf SAN type, by reflection (needs `pwsh`;
   Windows PowerShell cannot reflect over a net10.0 assembly).
 
 `tests/chainprobe` serves our real chains on loopback to strict clients and records the verdicts; its
-README has the modes.
+README has the modes, of which only `floor` is in the suite above — the others need real endpoints.
 `tools/` holds the remaining manual probes: `ftps-upstream-probe.ps1`, which takes `-Host_` with no default
 because reaching a FTPS server needs an account and its login and password stay in `.netrc`; `probe.ps1`,
 `read-proc-env.ps1`, and `tools\apcheck`, which prints what the wireless driver reports about hosted
@@ -570,6 +573,18 @@ and stopped on the way out).
   interface and prints every message of the exchange. No driver, no elevation.
 * `tools\tcpwitness [seconds] [port]` — the IPv4 connection-table rows a relay's inbound probe judges itself
   against, read from outside the elevated process.
+* `tools\hellofingerprint check | self [h2,http/1.1] | listen <port> [n] | pcap <file> [n]` — decode a
+  hello in either direction: a ClientHello into JA3 and JA4, the ServerHello a client gets into JA3S and
+  JA4S. `pcap` reads a classic-pcap capture of Ethernet frames — ours included — and reports every hello
+  in it; `listen` prints the hello a client sends to the port; `self` fingerprints this machine's SChannel
+  client using the options the proxy's upstream leg sets; `check` judges both decoders against the vectors
+  each algorithm's publishers computed from the same hellos, which is what the offline suite runs.
+* `tools\tlsstackcheck [policy|knobs|versions|assert]` — the SChannel stack under the proxy's legs.
+  `policy` prints the registry's per-protocol keys, `knobs` which `SslStream` options the stack takes,
+  `versions` what a loopback pair of legs negotiates at 1.0, 1.1, 1.2, 1.3 and with an ephemeral-key
+  certificate. `assert` keeps the answers the proxy depends on — the options its legs set, and a loopback
+  pair that agrees on one version the proxy terminates at, with 1.2 alone still terminable — and is what the
+  offline suite runs; the rest is a report, since a host may disable a version.
 * `sabotage.sh` — the other kind of tool: `--source <file> --test <csproj> --artifact <dll> --run <exe>
   --cases <file>` mutates one anchor at a time and reports what the suite turned red, so an assertion that
   never bites is named instead of counted as passing. `tools\sabotage\siit.cases.sh` is the case list for
