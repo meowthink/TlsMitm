@@ -891,6 +891,45 @@ var udpRequest = V6(17, ClientA, E6(Server), UdpSeg(ClientA, E6(Server), true, 4
     }
 }
 
+{
+    // The sweep and the packet path share one gate, so a session a reply just renewed is judged from that
+    // renewal. Pinned here rather than raced: from outside the table a sweep may legitimately delete an
+    // expired session and a reply arriving afterwards looks the same, so a counted race would be timing
+    // noise - the same shape was measured on TlsMitm's FlowTable, where the writer re-adds.
+    var t = NewNat();
+    t.Translate(udpRequest, path);
+    clock.Advance((int)Nat64.UdpDefault.TotalSeconds - 10);
+    t.Translate(V4(17, Server, Wan, UdpSeg(Server, Wan, false, 443, Nat64.PortFirst, eight)), path);
+    // Past the original expiry: only the renewal can keep the session here, so a sweep that ignored the
+    // renewal would delete it.
+    clock.Advance(20);
+    t.Sweep();
+    Expect(t.SessionCount == 1, "a reply ten seconds before the lifetime keeps the session through a sweep past the original expiry");
+    clock.Advance(20);
+    t.Sweep();
+    Expect(t.SessionCount == 1, "and the lifetime runs from the renewal, not from the first datagram");
+    clock.Advance((int)Nat64.UdpDefault.TotalSeconds);
+    t.Sweep();
+    Expect(t.SessionCount == 0, "a full lifetime after the last reply is what ends it");
+}
+
+{
+    // Refresh is the fragmented-TCP renewal: a first fragment carries the transport header but is not advanced
+    // as a whole packet, so it keeps the session alive under the same gate the sweep judges that expiry by.
+    var t = NewNat();
+    t.Translate(V6(6, ClientA, E6(Server), TcpSeg(ClientA, E6(Server), true, 4000, 443, 0x02, none)), path);
+    clock.Advance((int)Nat64.TcpTransitory.TotalSeconds - 10);
+    var frag = V6(44, ClientA, E6(Server),
+        [.. FragHead(6, 0, true, 0x3344), .. TcpSeg(ClientA, E6(Server), true, 4000, 443, 0x10, none)]);
+    Expect(Forwarded(t.Translate(frag, path)), "a fragmented first fragment on a live session forwards");
+    clock.Advance(20);
+    t.Sweep();
+    Expect(t.SessionCount == 1, "and its renewal keeps the session through a sweep past the original expiry");
+    clock.Advance((int)Nat64.TcpTransitory.TotalSeconds);
+    t.Sweep();
+    Expect(t.SessionCount == 0, "a full transitory lifetime after the last fragment is what ends it");
+}
+
 foreach (var failure in failures) Console.WriteLine($"FAIL {failure}");
 if (failures.Count > 0)
 {

@@ -27,8 +27,12 @@ per-client chain selection, a local CRL, and plain pcap output.
    the server's readiness reply the same TCP connection is upgraded in place.
 3. For TLS the ClientHello is parsed (SNI, ALPN, `early_data`, PSK, ECH, GREASE), the signing chain
    is chosen by the process that owns the client socket, and the session is terminated toward the
-   client and re-originated toward the server. A hello the real server refuses is not fatal: the
-   client's own hello is replayed on a fresh connection and that session goes blind.
+   client and re-originated toward the server. When the client offered ALPN the upstream is negotiated
+   first, and a hello the real server refuses is not fatal: the client's own hello is replayed on a fresh
+   connection and that session goes blind. With no ALPN the client leg is terminated first (a server may
+   delay its TLS answer until the application asks for the data, as an FTPS data listener does), so an
+   upstream refusal there closes the connection instead — the client's TLS state is already bound to the
+   forged leaf, and there is no blind fallback to take.
 4. ECH hellos are terminated with a leaf for the public name, which is what makes Chromium either
    keep the session or retry without ECH. Only a failed client leg convicts the host: an idle
    terminated session proves nothing, because a GREASE-ECH client (RFC 9849 §6.2.1) finishes the
@@ -153,6 +157,8 @@ TlsMitm\bin\Debug\net10.0\TlsMitm.exe [--emsign | --emsign-only | --rotate] [--n
 | `--lan <ipv4>` | also intercept TCP a forwarded client sends from this address's subnet |
 | `--lan6 <ipv6>` | with `--lan`: also intercept forwarded IPv6, which is delivered to this address |
 | `--allow-relay-in` | with `--lan`: add the inbound allow rule for the relay port, and remove it when the run ends |
+| `--max-sessions <n>` | cap concurrent proxy sessions (default 1024). When full, a new flow is passed through unintercepted rather than reset; a socket that reaches the relay port anyway is closed |
+| `--setup-budget <s>` | seconds each setup phase may take (default 10): the first byte, the ClientHello, each handshake. The relay is not under it, so an idle established session is never timed out |
 
 Scoping is decided at the SYN that starts a flow, so an excluded process is passed through whole —
 its packets are never rewritten, rather than half-intercepted. Each pair names a process by pid or by
@@ -478,6 +484,26 @@ suite's own loopback traffic and turns passing modes into false failures.
   It references `Router.csproj`, so the core is tested without a driver, without admin and without a
   second interface; and it compiles the proxy's LAN capture filters, IPv4-only and dual-stack, with the
   driver's own parser at the layer they are opened at.
+* `swapcheck` — the redirector's byte-level rewrite on crafted packets: the forward and reverse legs'
+  address/port writes for both families, loopback left alone, forwarded v6 delivered to the LAN address,
+  and a retransmitted packet rewriting to the same bytes. The rewrite is split from the WinDivert send
+  (`PacketRewrite`) so it can be judged without a driver; `FakeRedirector` never swaps a packet, so this is
+  the only check that touches the rewrite itself.
+* `dns64check` — the router's DNS64 on crafted DNS messages: the RFC 6147 §5.1 verdict (usable / mixed /
+  excluded-only / empty / name-error / failed), the §5.1.4 IPv4-mapped exclusion, §5.4 AAAA synthesis from
+  A with the §5.1.7 TTL ceiling (600s, or the negative answer's SOA), the §5.1.5 CNAME chain, and the
+  §5.3.1 PTR redirect into in-addr.arpa. No resolver; the expected addresses are written out by hand.
+* `dnsechcheck` — the packet-level ECH strip (`DnsEch.TryNeutralize`): finding the DNS answer inside a
+  v4/v6 UDP/TCP packet by its source port, rewriting the HTTPS/SVCB "ech" SvcParam in place across all four
+  shapes, and leaving a query, a fragment, a no-ech record or a truncated datagram alone. The message-level
+  rewrite and its checksums are servcheck's subject; this is the framing around it.
+* `pcapcheck` — the capture writer round-tripped: write a dialogue, read the file back, and assert the
+  synthesized three-way opening, the seq/ack progression a dissector reassembles on, the ports/addresses
+  and the checksums Wireshark validates. Pins the sequence-number fix that a constant seq would undo.
+* `certcheck` — leaf issuance from an in-memory root (nothing installed in any store): the SAN type per
+  reference identifier (dNSName vs iPAddress, RFC 9525 §6.2), the wildcard's base-domain coverage, the
+  CA/Browser Forum validity ceiling, the leaf-not-CA constraints, caching, and that the leaf chains to the
+  root. Chain trust across stores is chainprobe's subject, not this one.
 * `servcheck` — the router's DHCP pool and resolver: DISCOVER/OFFER/REQUEST/ACK, the two NAK cases,
   option 61 as the client's identity, the broadcast-flag rule for the reply's destination, the relayed
   half (`giaddr` matched to a scope, the reply to `giaddr:67`, a scope's options 1/3/6/28/51/54, an

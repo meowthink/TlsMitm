@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using static TlsMitm.WinDivertPInvoke;
+using static TlsMitm.PacketRewrite;
 
 namespace TlsMitm;
 
@@ -13,13 +14,16 @@ public interface IRedirector
     /// What an intercepted connection was really aimed at, and who sent it. The rewrite leaves the
     /// accepted socket holding the local endpoint it was delivered to and a source port that is the
     /// flow's token, so the client's own address and port only exist here. Asking names the caller the
-    /// session that will relay this flow, until <see cref="ReleaseFlow"/> says otherwise.
-    OriginalDest? LookupOriginalDest(IPAddress deliveredTo, int token, IPAddress serverAddr);
+    /// session that will relay this flow, until <see cref="ReleaseFlow"/> says otherwise. The generation
+    /// it returns is this claim's own: a reconnect may reuse the token, and only this number's release
+    /// ends this claim.
+    OriginalDest? LookupOriginalDest(IPAddress deliveredTo, int token, IPAddress serverAddr, out int generation);
 
     /// The session that looked the flow up is over: hand it back to the redirector's own closing clock,
     /// which is what carries its FIN out. An unanswered token is a flow no one is relaying, and silence
-    /// alone cannot be trusted to end one.
-    void ReleaseFlow(int token);
+    /// alone cannot be trusted to end one. A generation that is no longer the flow's current one is a
+    /// superseded claim and ends nothing.
+    void ReleaseFlow(int token, int generation);
 
     // A listening socket this process owns (the CRL endpoint): its port is stable for the whole run,
     // so the port alone names the traffic to leave alone.
@@ -48,6 +52,11 @@ public class PacketRedirector : IRedirector, IDisposable
     private readonly int _relayPort;
     private readonly ProcessFilter? _filter;
     private readonly FlowTable _flows = new();
+
+    /// <summary>Asked before a flow is named. When the proxy has no slot left the flow is passed through
+    /// unintercepted, which is the same path a full token pool takes, rather than swapped into a socket
+    /// the proxy would then reset.</summary>
+    public Func<bool>? Saturated { get; set; }
     private readonly ConcurrentDictionary<int, byte> _exemptPorts = new();
     private readonly ConcurrentDictionary<V4ExemptKey, byte> _v4ExemptFlows = new();
     private readonly ConcurrentDictionary<V6ExemptKey, byte> _v6ExemptFlows = new();
@@ -84,20 +93,24 @@ public class PacketRedirector : IRedirector, IDisposable
         }
     }
 
-    public OriginalDest? LookupOriginalDest(IPAddress deliveredTo, int token, IPAddress serverAddr)
+    public OriginalDest? LookupOriginalDest(IPAddress deliveredTo, int token, IPAddress serverAddr, out int generation)
     {
         // The token is the whole key: it is handed out one connection at a time, so no two live flows -
         // in either family - carry it. The two addresses are in the signature for an implementation
         // with no packet state of its own, which has to read them off the socket it was handed.
         var state = _flows.ByToken(unchecked((ushort)token));
-        if (state == null) return null;
+        if (state == null)
+        {
+            generation = 0;
+            return null;
+        }
         // A session has this flow: its end is the answer to "when is this connection over", and a quiet
-        // minute is not.
-        state.Session = true;
+        // minute is not. The claim takes a generation so a reconnect's later claim supersedes this one.
+        generation = _flows.ClaimSession(state);
         return new OriginalDest(state.OrigDstAddr, state.OrigDstPort, state.ClientAddr, state.ClientPort);
     }
 
-    public void ReleaseFlow(int token) => _flows.EndSession(unchecked((ushort)token));
+    public void ReleaseFlow(int token, int generation) => _flows.EndSession(unchecked((ushort)token), generation);
 
     /// Send the relay's inbound reachability probe: one SYN from inside the LAN subnet to this host's own
     /// relay port, put in exactly the way a client's rewritten packet is put in. Returns the port the probe
@@ -149,15 +162,6 @@ public class PacketRedirector : IRedirector, IDisposable
     {
         var bytes = addr.GetAddressBytes();
         return (BitConverter.ToUInt64(bytes.AsSpan(0, 8)), BitConverter.ToUInt64(bytes.AsSpan(8, 8)));
-    }
-
-    private static unsafe (ulong Hi, ulong Lo) ReadV6(byte* addr) =>
-        (BitConverter.ToUInt64(new ReadOnlySpan<byte>(addr, 8)), BitConverter.ToUInt64(new ReadOnlySpan<byte>(addr + 8, 8)));
-
-    private static unsafe void WriteV6(byte* addr, ulong hi, ulong lo)
-    {
-        BitConverter.TryWriteBytes(new Span<byte>(addr, 8), hi);
-        BitConverter.TryWriteBytes(new Span<byte>(addr + 8, 8), lo);
     }
 
     public void RegisterExemption(int sourcePort)
@@ -374,10 +378,11 @@ public class PacketRedirector : IRedirector, IDisposable
                 capture.Handle.Send((void*)capture.Packet, recvLen, null, (Address*)capture.Addr);
                 return;
             }
-            var opened = _flows.Open(key, intercept: true);
+            var saturated = Saturated?.Invoke() == true;
+            var opened = _flows.Open(key, intercept: !saturated);
             Console.WriteLine($"[Redirector] NEW v4 {clientIp}:{srcPort} -> {destination}:{dstPort} token={opened.Token}" +
                               (capture.Lan is { } side ? $" (forwarded, delivered to {side.Address})" : "") +
-                              (opened.Bypassed ? " (pool full, passed through)" : ""));
+                              (opened.Bypassed ? (saturated ? " (proxy saturated, passed through)" : " (pool full, passed through)") : ""));
         }
 
         if (_flows.Follow(key) is not { } entry)
@@ -391,18 +396,17 @@ public class PacketRedirector : IRedirector, IDisposable
 
         if (entry.Bypassed)
         {
-            entry.LastSeen = DateTime.UtcNow;
+            _flows.Touch(entry);
             capture.Handle.Send((void*)capture.Packet, recvLen, null, (Address*)capture.Addr);
             return;
         }
 
-        entry.LastSeen = DateTime.UtcNow;
+        _flows.Touch(entry);
 
         // The token replaces the client's own source port on the way in, so the accepted socket carries
         // a number that names exactly one connection. The client never sees it: the reply leg puts its
         // real port back.
-        tcp->SrcPort = HostToNet(entry.Token);
-        tcp->DstPort = HostToNet((ushort)_relayPort);
+        PacketRewrite.ForwardV4(ip4, tcp, dstAddr, localEndpoint, entry.Token, (ushort)_relayPort, isLoopback);
 
         var addr = (Address*)capture.Addr;
         var calcOk = false;
@@ -411,8 +415,6 @@ public class PacketRedirector : IRedirector, IDisposable
         var arrivedSubIfIdx = addr->SubIfIdx;
         if (!isLoopback)
         {
-            ip4->SrcAddr = dstAddr;
-            ip4->DstAddr = localEndpoint;
             // Which way an injected packet goes is this field alone, not the addresses inside it, and
             // this one is now addressed to this host.
             addr->Flags &= ~AddressFlag.Outbound;
@@ -449,7 +451,7 @@ public class PacketRedirector : IRedirector, IDisposable
         {
             // Keep translating after a FIN/RST: the peer still owes ACKs, and releasing the
             // proxy's reply to the real server makes it answer with an RST onto the live client socket.
-            entry.Closing = true;
+            _flows.MarkClosing(entry);
         }
     }
 
@@ -468,22 +470,11 @@ public class PacketRedirector : IRedirector, IDisposable
             return;
         }
 
-        conn.LastSeen = DateTime.UtcNow;
+        _flows.Touch(conn);
 
         var isLoopback = IsIPv4Loopback(srcAddr) && IsIPv4Loopback(dstAddr);
 
-        if (!isLoopback)
-        {
-            ip4->SrcAddr = dstAddr;
-            // The client's own address rather than the local endpoint: a forwarded flow has to go back
-            // out to the client, while its local endpoint was this host.
-            ip4->DstAddr = conn.ClientRaw;
-        }
-
-        // Both ports come from the state now: the one the proxy answered is the token, and the client
-        // has to see the pair it sent.
-        tcp->SrcPort = HostToNet((ushort)conn.OrigDstPort);
-        tcp->DstPort = HostToNet((ushort)conn.ClientPort);
+        PacketRewrite.ReverseV4(ip4, tcp, dstAddr, conn.ClientRaw, (ushort)conn.OrigDstPort, (ushort)conn.ClientPort, isLoopback);
 
         _local.Handle.CalcChecksums((void*)capture.Packet, recvLen, (Address*)capture.Addr);
         var sent = _local.Handle.Send((void*)capture.Packet, recvLen, null, (Address*)capture.Addr);
@@ -494,7 +485,7 @@ public class PacketRedirector : IRedirector, IDisposable
 
         if (isFinOrRst)
         {
-            conn.Closing = true;
+            _flows.MarkClosing(conn);
             // The line the n<=3 window above never reaches: this is our close leaving for the client, which
             // is what the closing clock a released flow hands over to exists to carry.
             Console.WriteLine($"[Redirector] Rev v4 k={dstPort} closing {conn.ClientAddr}:{conn.ClientPort}" +
@@ -552,10 +543,11 @@ public class PacketRedirector : IRedirector, IDisposable
                 capture.Handle.Send((void*)capture.Packet, recvLen, null, (Address*)capture.Addr);
                 return;
             }
-            var opened = _flows.Open(key, intercept: true);
+            var saturated = Saturated?.Invoke() == true;
+            var opened = _flows.Open(key, intercept: !saturated);
             Console.WriteLine($"[Redirector] NEW v6 {srcAddr}:{srcPort} -> {dstAddr}:{dstPort} token={opened.Token}" +
                               (capture.Lan?.V6 is { } side ? $" (forwarded, delivered to {side.Address})" : "") +
-                              (opened.Bypassed ? " (pool full, passed through)" : ""));
+                              (opened.Bypassed ? (saturated ? " (proxy saturated, passed through)" : " (pool full, passed through)") : ""));
         }
 
         if (_flows.Follow(key) is not { } entry)
@@ -570,24 +562,24 @@ public class PacketRedirector : IRedirector, IDisposable
 
         if (entry.Bypassed)
         {
-            entry.LastSeen = DateTime.UtcNow;
+            _flows.Touch(entry);
             capture.Handle.Send((void*)capture.Packet, recvLen, null, (Address*)capture.Addr);
             return;
         }
 
-        entry.LastSeen = DateTime.UtcNow;
+        _flows.Touch(entry);
 
-        tcp->SrcPort = HostToNet(entry.Token);
-        tcp->DstPort = HostToNet((ushort)_relayPort);
+        // The server's address goes in the source, exactly as in the v4 leg: the rewritten packet is one
+        // the server sends to this process. The destination is this host's LAN address for a forwarded
+        // client, or the client's own address for a local one.
+        var (deliverHi, deliverLo) = capture.Lan?.V6 is { } side6 ? side6.Raw : (srcHi, srcLo);
+        PacketRewrite.ForwardV6(ip6, tcp, dstHi, dstLo, deliverHi, deliverLo, entry.Token, (ushort)_relayPort, isLoopback);
 
         var addr = (Address*)capture.Addr;
         var arrivedIfIdx = addr->IfIdx;
         var arrivedSubIfIdx = addr->SubIfIdx;
         if (!isLoopback)
         {
-            // The server's address goes in the source, exactly as in the v4 leg: the rewritten packet is
-            // one the server sends to this process, and that is the peer the accepted socket reports.
-            WriteV6(ip6->SourceAddress, dstHi, dstLo);
             // Which way an injected packet goes is this field alone, not the addresses inside it, and
             // this one is now addressed to this host.
             addr->Flags &= ~AddressFlag.Outbound;
@@ -598,13 +590,10 @@ public class PacketRedirector : IRedirector, IDisposable
                 // interface that owns that address - what strong-host receive requires (RFC 1122
                 // §3.3.4.2) and what the v4 leg measured. SubIfIdx keeps its arrival value: it is the
                 // sub-interface within that index, not a second copy of it.
-                var (lanHi, lanLo) = lan.Raw;
-                WriteV6(ip6->DestinationAddress, lanHi, lanLo);
                 addr->IfIdx = lan.IfIdx;
             }
             else
             {
-                WriteV6(ip6->DestinationAddress, srcHi, srcLo);
                 _local.Handle.CalcOutboundFlag((void*)capture.Packet, addr);
             }
         }
@@ -620,7 +609,7 @@ public class PacketRedirector : IRedirector, IDisposable
                               $" (arrived {arrivedIfIdx}/{arrivedSubIfIdx}) sent={sent}");
 
         if (isFinOrRst)
-            entry.Closing = true;
+            _flows.MarkClosing(entry);
     }
 
     private unsafe void ReverseSwapV6(Capture capture, int recvLen, NativeIpv6Header* ip6, NativeTcpHeader* tcp,
@@ -637,25 +626,18 @@ public class PacketRedirector : IRedirector, IDisposable
             return;
         }
 
-        conn.LastSeen = DateTime.UtcNow;
+        _flows.Touch(conn);
 
         // The addresses come from the flow's own key rather than from the packet, because the packet
         // only carries the local endpoint this host answered on.
-        if (!isLoopback)
-        {
-            WriteV6(ip6->SourceAddress, conn.Key.ServerHi, conn.Key.ServerLo);
-            WriteV6(ip6->DestinationAddress, conn.Key.ClientHi, conn.Key.ClientLo);
-        }
-
-        tcp->SrcPort = HostToNet((ushort)conn.OrigDstPort);
-        tcp->DstPort = HostToNet((ushort)conn.ClientPort);
+        PacketRewrite.ReverseV6(ip6, tcp, conn.Key.ServerHi, conn.Key.ServerLo, conn.Key.ClientHi, conn.Key.ClientLo, (ushort)conn.OrigDstPort, (ushort)conn.ClientPort, isLoopback);
 
         _local.Handle.CalcChecksums((void*)capture.Packet, recvLen, (Address*)capture.Addr);
         _local.Handle.Send((void*)capture.Packet, recvLen, null, (Address*)capture.Addr);
 
         if (isFinOrRst)
         {
-            conn.Closing = true;
+            _flows.MarkClosing(conn);
             Console.WriteLine($"[Redirector] Rev v6 k={dstPort} closing {conn.ClientAddr}:{conn.ClientPort}" +
                               $" -> {conn.OrigDstAddr}:{conn.OrigDstPort} flags={tcp->Flags}");
         }

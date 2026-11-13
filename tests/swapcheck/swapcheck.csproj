@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>swapcheck</AssemblyName>
+    <RootNamespace>SwapCheck</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Linked rather than referenced: the rewrite is internal to TlsMitm, and a project reference would
+         bring the whole redirector (and its driver) into this assembly beside the driver-free one it builds. -->
+    <Compile Include="..\..\TlsMitm\PacketRewrite.cs" Link="PacketRewrite.cs" />
+    <Compile Include="..\..\TlsMitm\WinDivertNative.cs" Link="WinDivertNative.cs" />
+    <Compile Include="..\..\TlsMitm\FlowTable.cs" Link="FlowTable.cs" />
+  </ItemGroup>
+
+</Project>

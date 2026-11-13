@@ -35,6 +35,25 @@ var includeImages = ParseNames(Option("--process"));
 var excludedPids = ParseInts(Option("--exclude-pid"), "--exclude-pid");
 var excludedImages = ParseNames(Option("--exclude-process"));
 
+// Both are policy knobs, not protocol numbers: the session cap bounds what a stalled client can hold, and
+// the budget bounds how long one may hold it. The defaults are generous for a host or a small LAN.
+var maxSessions = 1024;
+var setupBudget = TimeSpan.FromSeconds(10);
+if (Option("--max-sessions") is { } ms && (!int.TryParse(ms, out maxSessions) || maxSessions < 1))
+{
+    Console.WriteLine("[Main] --max-sessions needs a positive integer");
+    Environment.Exit(2);
+}
+if (Option("--setup-budget") is { } sb)
+{
+    if (!double.TryParse(sb, out var seconds) || seconds <= 0)
+    {
+        Console.WriteLine("[Main] --setup-budget needs a positive number of seconds");
+        Environment.Exit(2);
+    }
+    setupBudget = TimeSpan.FromSeconds(seconds);
+}
+
 var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
 {
@@ -61,6 +80,8 @@ Console.WriteLine("[Main]   --exclude-pid / --exclude-process  intercept everyth
 Console.WriteLine("[Main]   --lan         also intercept TCP forwarded to clients on this address's subnet");
 Console.WriteLine("[Main]   --lan6        also intercept forwarded IPv6, whose packets are delivered to this address");
 Console.WriteLine("[Main]   --allow-relay-in  add the inbound allow rule the relay port needs for --lan, and remove it on exit");
+Console.WriteLine("[Main]   --max-sessions <n>  cap concurrent proxy sessions (default 1024); when full, a new flow passes through unintercepted");
+Console.WriteLine("[Main]   --setup-budget <s>  seconds per setup phase (default 10): first byte, ClientHello, each handshake; the relay is not under it");
 Console.WriteLine();
 
 X509Certificate2 rootCa;
@@ -205,7 +226,10 @@ if (crl != null)
     redirector.RegisterLocalService(crl.Port);
 }
 using var quicBlocker = new QuicBlocker(lan);
-var proxy = new MitmProxy(certEngine, redirector, ProxyPort, echDowngrade);
+var proxy = new MitmProxy(certEngine, redirector, ProxyPort, echDowngrade, setupBudget, maxSessions);
+// The redirector asks before it names a flow, so a saturated proxy passes traffic through instead of
+// swapping it into a socket that would then be reset.
+redirector.Saturated = () => proxy.Saturated;
 
 var redirectorTask = redirector.StartAsync();
 var quicBlockerTask = quicBlocker.StartAsync();

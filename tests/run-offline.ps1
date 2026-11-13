@@ -19,7 +19,7 @@ if (Get-Process TlsMitm -ErrorAction SilentlyContinue) {
 $groups = @(
     ,@('smtp', 'smtpsplit', 'imap', 'pop3', 'ftp', 'nntp', 'xmpp', 'xmpp-split', 'xmpp-nosni', 'xmpp-decline', 'xmpp-bad', 'reject', 'ldap', 'ldap-decline', 'ldap-bad', 'sunrpc', 'sunrpc-split', 'sunrpc-unavail', 'sunrpc-decline', 'sunrpc-misuse', 'sunrpc-near', 'sunrpc-bad', 'sunrpc-wrong-token', 'sunrpc-wrong-flavor')
     ,@('ftps-pasv', 'ftps-epsv', 'ftps-active', 'ftps-active-split', 'ftps-active-clear')
-    ,@('plain', 'implicit', 'implicit-ip', 'ipv6', 'early-data', 'https-close', 'alpn-fallback', 'alpn-h2', 'mtls-refused')
+    ,@('plain', 'implicit', 'implicit-ip', 'ipv6', 'early-data', 'https-close', 'alpn-fallback', 'alpn-h2', 'mtls-refused', 'stall', 'saturated')
     ,@('rtsps', 'rtmps', 'sips', 'rtmps-ffmpeg')
     ,@('ech-relay', 'ech-downgrade', 'emsign', 'auto', 'handshake-abort', 'grease', 'rootcheck', 'filter', 'early-refuse')
 )
@@ -53,12 +53,44 @@ $nat = Join-Path $root "tests\natcheck\bin\$Configuration\net10.0\natcheck.exe"
 $out = & $nat 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { $failed.Add('natcheck'); Write-Host $out } else { Write-Host 'ok   natcheck' }
 
+# dns64check judges the router's DNS64 on crafted DNS messages: the RFC 6147 verdict, the IPv4-mapped
+# exclusion, AAAA synthesis from A with the TTL ceiling and CNAME chain, and the PTR redirect. No resolver.
+$dns64 = Join-Path $root "tests\dns64check\bin\$Configuration\net10.0\dns64check.exe"
+$out = & $dns64 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('dns64check'); Write-Host $out } else { Write-Host 'ok   dns64check' }
+
+# dnsechcheck judges the packet-level ECH strip: finding the DNS answer inside v4/v6 UDP/TCP (source port
+# 53), rewriting the ech SvcParam in place, and leaving a query, a fragment or a truncated datagram alone.
+$dnsech = Join-Path $root "tests\dnsechcheck\bin\$Configuration\net10.0\dnsechcheck.exe"
+$out = & $dnsech 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('dnsechcheck'); Write-Host $out } else { Write-Host 'ok   dnsechcheck' }
+
+# pcapcheck writes a short dialogue and reads the capture back: the synthesized handshake, the seq/ack
+# progression a dissector reassembles on, the ports/addresses and the checksums. No driver, no socket.
+$pcap = Join-Path $root "tests\pcapcheck\bin\$Configuration\net10.0\pcapcheck.exe"
+$out = & $pcap 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('pcapcheck'); Write-Host $out } else { Write-Host 'ok   pcapcheck' }
+
+# certcheck issues leaves from an in-memory root (nothing installed): SAN type per reference identifier,
+# wildcard base-domain coverage, the validity ceiling, leaf-not-CA constraints, and the chain to the root.
+$cert = Join-Path $root "tests\certcheck\bin\$Configuration\net10.0\certcheck.exe"
+$out = & $cert 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('certcheck'); Write-Host $out } else { Write-Host 'ok   certcheck' }
+
 # flowcheck judges the redirector's flow table on synthetic keys: which connections share a state, what
 # token each one gets, what ageing frees. It is the only check that can name the two-LAN-clients-on-one-
 # port case, since a live run needs a second machine to produce it.
 $flow = Join-Path $root "tests\flowcheck\bin\$Configuration\net10.0\flowcheck.exe"
 $out = & $flow 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { $failed.Add('flowcheck'); Write-Host $out } else { Write-Host 'ok   flowcheck' }
+
+# swapcheck judges the redirector's byte-level rewrite on crafted packets: the address/port writes the
+# forward and reverse legs apply, both families, loopback and forwarded delivery, and that a retransmitted
+# packet rewrites to the same bytes. FakeRedirector never swaps a packet, so this is the only check that
+# touches the rewrite itself.
+$swap = Join-Path $root "tests\swapcheck\bin\$Configuration\net10.0-windows\swapcheck.exe"
+$out = & $swap 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { $failed.Add('swapcheck'); Write-Host $out } else { Write-Host 'ok   swapcheck' }
 
 # fwcheck pins what the inbound reachability probe is made of: the SYN's own header octets, the address
 # it claims to come from, a token no live flow holds, and which rule port fields name the relay port.
@@ -130,4 +162,4 @@ if ($failed.Count -gt 0) {
     exit 1
 }
 $modeCount = ($groups | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
-Write-Host "`n[run-offline] PASS - $modeCount starttlsprobe modes in $($groups.Count) processes + echcheck + natcheck + nat64check + flowcheck + fwcheck + servcheck + v6check + quiccheck + hellofingerprint + tlsstackcheck + chainprobe floor + no-sni-test"
+Write-Host "`n[run-offline] PASS - $modeCount starttlsprobe modes in $($groups.Count) processes + echcheck + natcheck + dns64check + dnsechcheck + nat64check + flowcheck + swapcheck + pcapcheck + certcheck + fwcheck + servcheck + v6check + quiccheck + hellofingerprint + tlsstackcheck + chainprobe floor + no-sni-test"

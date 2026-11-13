@@ -31,6 +31,11 @@ internal sealed class FlowState
     // forgetting it would answer its next packet with a reset.
     public bool Session;
 
+    // Which claim of this flow is the current one. A fast reconnect can reuse the four fields - and so the
+    // token - while the previous session is still draining; each claim takes the next number, and a release
+    // only ends the claim that carries its own number, so the old session cannot close the new one's flow.
+    public int Generation;
+
     // A flow nothing downstream may rewrite: one the process scope excluded, or one that found the
     // token pool full. It stays known so its later packets are not reported as a forwarding miss.
     public bool Bypassed { get; set; }
@@ -79,6 +84,12 @@ internal sealed class FlowTable
     private int _nextToken;
     private int _refused;
 
+    // Every writer of a state's ageing takes this, and so does the sweep's expiry test together with its
+    // removal. Open revives the *same* object through GetOrAdd, so comparing identities at removal would
+    // still drop a flow that a packet or a repeated SYN had just refreshed: what changes is LastSeen, not
+    // the reference. The test and the removal therefore have to be one step against every writer.
+    private readonly object _gate = new();
+
     public FlowTable(Func<DateTime>? clock = null) => _clock = clock ?? (() => DateTime.UtcNow);
 
     // The two ways a packet's header fields name a connection, kept here so that which fields count is
@@ -99,16 +110,45 @@ internal sealed class FlowTable
     /// with the token the first one was given, so the two never become separate states.
     public FlowState Open(FlowKey key, bool intercept)
     {
-        var state = new FlowState { Key = key, LastSeen = _clock() };
-        var live = _flows.GetOrAdd(key, state);
-        if (!ReferenceEquals(live, state))
+        lock (_gate)
         {
-            live.LastSeen = _clock();
-            live.Closing = false;
+            var state = new FlowState { Key = key, LastSeen = _clock() };
+            var live = _flows.GetOrAdd(key, state);
+            if (!ReferenceEquals(live, state))
+            {
+                live.LastSeen = _clock();
+                live.Closing = false;
+                return live;
+            }
+            if (!intercept || !TryAllocate(live)) live.Bypassed = true;
             return live;
         }
-        if (!intercept || !TryAllocate(live)) live.Bypassed = true;
-        return live;
+    }
+
+    /// A packet of a known connection keeps it alive. The table owns the ageing so that this refresh and
+    /// the sweep's expiry test are one step, and so the offline judge drives it with the same clock.
+    public void Touch(FlowState state)
+    {
+        lock (_gate) state.LastSeen = _clock();
+    }
+
+    /// A FIN/RST seen on either leg. Only the flag: the closing clock runs from the last packet, which is
+    /// what the peer's outstanding ACKs are counted against.
+    public void MarkClosing(FlowState state)
+    {
+        lock (_gate) state.Closing = true;
+    }
+
+    /// A proxy session has taken the flow, so its own end rather than silence decides when it goes. Returns
+    /// the claim's generation: a reconnect that reuses the token takes the next one, and only a release
+    /// carrying that same number may end it.
+    public int ClaimSession(FlowState state)
+    {
+        lock (_gate)
+        {
+            state.Session = true;
+            return ++state.Generation;
+        }
     }
 
     /// The state a later packet of a known connection finds, or null when no SYN of that connection has
@@ -132,13 +172,18 @@ internal sealed class FlowTable
 
     /// Hand a finished session's flow to the closing clock. Not a deletion: the session's own FIN and its
     /// ACKs are still in flight behind it, and the rewrite has to translate those too. The token stays
-    /// claimed for that window, which is what the clock is sized for.
-    public void EndSession(ushort token)
+    /// claimed for that window, which is what the clock is sized for. A release whose generation is not the
+    /// current one belongs to a superseded claim - a reconnect already took the token - and ends nothing.
+    public void EndSession(ushort token, int generation)
     {
-        if (!_byToken.TryGetValue(token, out var state)) return;
-        state.Session = false;
-        state.Closing = true;
-        state.LastSeen = _clock();
+        lock (_gate)
+        {
+            if (!_byToken.TryGetValue(token, out var state)) return;
+            if (state.Generation != generation) return;
+            state.Session = false;
+            state.Closing = true;
+            state.LastSeen = _clock();
+        }
     }
 
     /// Drop the states nobody has used for a while, freeing their tokens. Returns what went, so the
@@ -149,15 +194,21 @@ internal sealed class FlowTable
         var dropped = new List<FlowState>();
         foreach (var state in _byToken.Values)
         {
-            var limit = state.Session ? SessionLimit : state.Closing ? ClosingLimit : IdleLimit;
-            if (now - state.LastSeen < limit) continue;
-            if (_byToken.TryRemove(state.Token, out _) && _flows.TryRemove(state.Key, out _)) dropped.Add(state);
+            lock (_gate)
+            {
+                var limit = state.Session ? SessionLimit : state.Closing ? ClosingLimit : IdleLimit;
+                if (now - state.LastSeen < limit) continue;
+                if (_byToken.TryRemove(state.Token, out _) && _flows.TryRemove(state.Key, out _)) dropped.Add(state);
+            }
         }
         foreach (var state in _flows.Values)
         {
-            // A bypassed state holds no token, so the pass above never reached it.
-            if (!state.Bypassed || now - state.LastSeen < IdleLimit) continue;
-            if (_flows.TryRemove(state.Key, out _)) dropped.Add(state);
+            lock (_gate)
+            {
+                // A bypassed state holds no token, so the pass above never reached it.
+                if (!state.Bypassed || now - state.LastSeen < IdleLimit) continue;
+                if (_flows.TryRemove(state.Key, out _)) dropped.Add(state);
+            }
         }
         return dropped;
     }

@@ -15,14 +15,27 @@ public class MitmProxy
     private readonly int _listenPort;
     private readonly EchDowngrade? _echDowngrade;
     private readonly FtpSessionRegistry _ftpSessions = new();
+    private readonly TimeSpan _setupBudget;
+    private readonly SemaphoreSlim _slots;
+    private readonly int _maxSessions;
+    // The FTPS data channel is opened from a synchronous callback on the control session, so it cannot be
+    // handed the accept loop's token as a parameter; it reads the program's own here.
+    private CancellationToken _lifetime;
+
+    /// <summary>No slot left for another session. The redirector reads this before it names a flow, so a
+    /// saturated proxy passes traffic through unintercepted instead of resetting a client's connection.</summary>
+    public bool Saturated => _slots.CurrentCount == 0;
 
     public MitmProxy(CertEngine certEngine, IRedirector redirector, int listenPort,
-        EchDowngrade? echDowngrade = null)
+        EchDowngrade? echDowngrade = null, TimeSpan? setupBudget = null, int maxSessions = 1024)
     {
         _certEngine = certEngine;
         _redirector = redirector;
         _listenPort = listenPort;
         _echDowngrade = echDowngrade;
+        _setupBudget = setupBudget ?? TimeSpan.FromSeconds(10);
+        _maxSessions = maxSessions;
+        _slots = new SemaphoreSlim(maxSessions, maxSessions);
         // The redirector rewrites an outbound flow into an inbound one addressed to the client's own
         // address, which for a v6 flow is a v6 address. A socket bound to 0.0.0.0 never sees those
         // SYNs, so the listener has to span both families.
@@ -32,8 +45,10 @@ public class MitmProxy
 
     public async Task StartAsync(CancellationToken ct)
     {
+        _lifetime = ct;
         _listener.Start();
-        Console.WriteLine($"[Proxy] Listening on [::]:{_listenPort} (dual-stack)");
+        Console.WriteLine($"[Proxy] Listening on [::]:{_listenPort} (dual-stack), " +
+            $"setup budget {_setupBudget.TotalSeconds:0.#}s per phase");
 
         while (!ct.IsCancellationRequested)
         {
@@ -42,15 +57,28 @@ public class MitmProxy
             // server the client asked for as the remote address, and the flow token in its port field.
             // The lookup below resolves both, so this line claims only what it knows.
             var remote = client.Client.RemoteEndPoint as IPEndPoint;
+            // The hard bound. The redirector already passes new flows through when this is full, so reaching
+            // here means a burst was named before any of it was accepted, or something dialled the relay
+            // port directly; either way the socket is closed rather than parked.
+            if (!await _slots.WaitAsync(0, ct))
+            {
+                Console.WriteLine($"[Proxy] Refused flow token {remote?.Port}: {_maxSessions} sessions already running");
+                client.Close();
+                continue;
+            }
             Console.WriteLine($"[Proxy] Accepted connection, flow token {remote?.Port}");
             _ = HandleClientAsync(client, ct);
         }
     }
 
-    private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+    private async Task HandleClientAsync(TcpClient client, CancellationToken lifetime)
     {
-        // Set once the lookup claims the flow: only this session may free the token it was given.
+        // Set once the lookup claims the flow: only this session may free the token it was given, and only
+        // the generation it was given - a reconnect may have taken the token since.
         int? claimed = null;
+        var claimedGeneration = 0;
+        using var setup = Setup(lifetime);
+        var ct = setup.Token;
         try
         {
             var remoteEp = client.Client.RemoteEndPoint as IPEndPoint;
@@ -67,7 +95,7 @@ public class MitmProxy
             // of the flow carries the addresses the packet had, so the mapped form is not needed here.
             var deliveredTo = Unmap(localEp.Address);
             var serverAddress = Unmap(remoteEp.Address);
-            var origDest = _redirector.LookupOriginalDest(deliveredTo, token, serverAddress);
+            var origDest = _redirector.LookupOriginalDest(deliveredTo, token, serverAddress, out var generation);
 
             if (origDest == null)
             {
@@ -78,6 +106,7 @@ public class MitmProxy
 
             var dest = origDest.Value;
             claimed = token;
+            claimedGeneration = generation;
             var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
             // The socket's own endpoints cannot name the client: a forwarded flow was delivered to this
             // host, and every flow's source port was replaced by the token. Both come back from the
@@ -115,30 +144,55 @@ public class MitmProxy
             // speaks first decide; a peek consumes nothing, so the session starts with a clean stream.
             var (fromClient, firstByte) = await FirstSpeakerAsync(client.Client, realServer.Socket, ct);
 
+            // A peek that ended on the budget has no first byte to classify: treating its zero as a
+            // plaintext protocol would start a relay for a session nobody spoke on.
+            if (setup.IsCancellationRequested && !lifetime.IsCancellationRequested)
+            {
+                Console.WriteLine($"[Proxy] Setup budget {_setupBudget.TotalSeconds:0.#}s exhausted waiting for " +
+                    $"the first byte from {clientAddress}:{clientPort} -> {origIp}:{origPort}");
+                return;
+            }
+
             if (fromClient && firstByte == 0x16)
             {
                 var hello = new byte[1];
                 if (await stream.ReadAsync(hello, ct) == 0) return;
-                await HandleTlsAsync(stream, serverStream, dest, hello[0], identity, ct);
+                await HandleTlsAsync(stream, serverStream, dest, hello[0], identity, setup);
             }
             else
             {
-                await HandlePlainAsync(client, realServer.Client, stream, serverStream, dest, identity, ct);
+                await HandlePlainAsync(client, realServer.Client, stream, serverStream, dest, identity, setup);
             }
         }
         catch (Exception ex)
         {
             // This catch only sees what the per-leg handlers did not: an unexpected failure whose
             // stack is the only thing that says where. Per-leg failures log their own message.
-            Console.WriteLine($"[Proxy] Error: {ex}");
+            if (setup.IsCancellationRequested && !lifetime.IsCancellationRequested)
+                Console.WriteLine($"[Proxy] Setup budget {_setupBudget.TotalSeconds:0.#}s exhausted for " +
+                    $"{client.Client.RemoteEndPoint}: {ex.GetType().Name}");
+            else
+                Console.WriteLine($"[Proxy] Error: {ex}");
         }
         finally
         {
             client.Close();
             // The connection is over here in every case the code can see, so this is where the flow stops
             // being a session's; the closing clock below it still has this connection's own FIN to carry.
-            if (claimed is { } t) _redirector.ReleaseFlow(t);
+            if (claimed is { } t) _redirector.ReleaseFlow(t, claimedGeneration);
+            _slots.Release();
         }
+    }
+
+    // One budget for every await that can park before the session exists: the first-byte peek, the
+    // ClientHello read and each handshake. It is disarmed at every relay boundary, because a quiet
+    // established connection is still a connection - a timer left running there would kill the long-lived
+    // sessions this tool exists to keep working. A STARTTLS upgrade arms it again for its own handshake.
+    private CancellationTokenSource Setup(CancellationToken lifetime)
+    {
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime);
+        cts.CancelAfter(_setupBudget);
+        return cts;
     }
 
     private static async Task<(bool FromClient, byte FirstByte)> FirstSpeakerAsync(
@@ -182,8 +236,9 @@ public class MitmProxy
 
     private async Task HandleTlsAsync(
         Stream stream, Stream serverStream, OriginalDest dest, byte firstByte, ClientIdentity identity,
-        CancellationToken ct)
+        CancellationTokenSource setup)
     {
+        var ct = setup.Token;
         var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         var (clientHello, rawBytes) = await ReadClientHelloAsync(stream, firstByte, ct);
         var host = ResolveTlsHost(clientHello, dest);
@@ -204,7 +259,7 @@ public class MitmProxy
 
         if (blind != null)
         {
-            await BlindRelayAsync(helloStream, serverStream, host, blind, dest, ct);
+            await BlindRelayAsync(helloStream, serverStream, host, blind, dest, setup);
             return;
         }
 
@@ -212,7 +267,7 @@ public class MitmProxy
         // kept using it, and a failed client leg is the §6.1.7 refusal. Neither is a timer, because a
         // GREASE-ECH connection (RFC 9849 §6.2.1) can finish the handshake and then sit idle.
         await MitmAsync(stream, rawBytes, serverStream, host, clientHello?.Alpn, dest,
-            ResolveTrust(identity, clientHello), identity.Pid, ct, echTerminate,
+            ResolveTrust(identity, clientHello), identity.Pid, setup, echTerminate,
             earlyData: clientHello?.EarlyData == true);
     }
 
@@ -242,8 +297,9 @@ public class MitmProxy
     private async Task MitmAsync(
         Stream rawClientStream, byte[] replayedHello, Stream serverStream, string host,
         IReadOnlyList<string>? offeredAlpn, OriginalDest dest, ClientTrust trust, int pid,
-        CancellationToken ct, bool echProbe = false, bool earlyData = false)
+        CancellationTokenSource setup, bool echProbe = false, bool earlyData = false)
     {
+        var ct = setup.Token;
         var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         // The probe's two proofs are read off this session: application bytes, reported after they
         // reached the server (a failed write proves nothing about the handshake), and a client leg that
@@ -282,7 +338,7 @@ public class MitmProxy
             if (!upstream.Ok)
             {
                 await BlindAfterRefusalAsync(rawClientStream, replayedHello, host, upstream.Error,
-                    dest, ct);
+                    dest, setup);
                 return;
             }
             serverProtocol = upstream.Protocol;
@@ -401,6 +457,8 @@ public class MitmProxy
             return active.Port;
         };
 
+        // The session exists from here: the relay runs on the program's own token, not on the budget.
+        setup.CancelAfter(Timeout.Infinite);
         try
         {
             await RelayAsync(sslClient, sslServer, host, clientIp, origIp, clientPort, serverPortUshort, pcap, ftp, ct, onClientData);
@@ -442,12 +500,16 @@ public class MitmProxy
 
     private async Task HandlePlainAsync(
         TcpClient client, TcpClient realServer, Stream clientStream, Stream serverStream,
-        OriginalDest dest, ClientIdentity identity, CancellationToken ct)
+        OriginalDest dest, ClientIdentity identity, CancellationTokenSource setup)
     {
+        var ct = setup.Token;
         var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         Console.WriteLine($"[Proxy] Non-TLS forward to {origIp}:{origPort}");
 
         var session = new StartTlsSession();
+        // A plaintext session is relayed from here, so the budget stops: an SMTP client that idles before
+        // its first command is a live connection, not a stalled handshake.
+        setup.CancelAfter(Timeout.Infinite);
         var toServer = PumpPlainAsync(clientStream, serverStream, session, isClient: true, ct);
         var toClient = PumpPlainAsync(serverStream, clientStream, session, isClient: false, ct);
 
@@ -470,7 +532,7 @@ public class MitmProxy
             return;
         }
 
-        await HandleStartTlsAsync(clientStream, serverStream, session, dest, identity, ct);
+        await HandleStartTlsAsync(clientStream, serverStream, session, dest, identity, setup);
     }
 
     private static async Task<bool> PumpPlainAsync(
@@ -530,10 +592,14 @@ public class MitmProxy
 
     private async Task HandleStartTlsAsync(
         Stream clientPlain, Stream serverPlain, StartTlsSession session,
-        OriginalDest dest, ClientIdentity identity, CancellationToken ct)
+        OriginalDest dest, ClientIdentity identity, CancellationTokenSource setup)
     {
+        var ct = setup.Token;
         var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         Console.WriteLine("[Proxy] STARTTLS accepted, upgrading connection");
+        // The upgrade is a setup phase of its own, so it gets the budget again after the plaintext relay
+        // disarmed it.
+        setup.CancelAfter(_setupBudget);
 
         var clientRaw = new PrefixedStream(session.ClientRemainder, clientPlain);
         var serverRaw = new PrefixedStream(session.ServerRemainder, serverPlain);
@@ -556,7 +622,7 @@ public class MitmProxy
         var blind = clientHello?.CannotTerminate();
         if (blind != null)
         {
-            await BlindRelayAsync(helloStream, serverRaw, host, blind, dest, ct);
+            await BlindRelayAsync(helloStream, serverRaw, host, blind, dest, setup);
             return;
         }
 
@@ -565,7 +631,7 @@ public class MitmProxy
         // server answer with only that identifier, and rules out the session if it does so incorrectly. A
         // hello that offered nothing leaves the client handshake first, as before.
         await MitmAsync(clientRaw, rawBytes, serverRaw, host, clientHello?.Alpn, dest,
-            ResolveTrust(identity, clientHello), identity.Pid, ct,
+            ResolveTrust(identity, clientHello), identity.Pid, setup,
             earlyData: clientHello?.EarlyData == true);
     }
 
@@ -748,7 +814,9 @@ public class MitmProxy
 
         Console.WriteLine($"[FTPS] active mode: {serverEp} connected, dialing the client at {real}");
 
-        using var clientSide = await ConnectExemptedAsync(real.Address, real.Port, CancellationToken.None);
+        using var setup = Setup(_lifetime);
+        var ct = setup.Token;
+        using var clientSide = await ConnectExemptedAsync(real.Address, real.Port, ct);
         if (clientSide == null)
         {
             Console.WriteLine($"[FTPS] active mode: nothing is listening on the client's {real}");
@@ -768,7 +836,7 @@ public class MitmProxy
                 // Same reason as the control channel: only libssl will send a chain the local stores
                 // cannot build, and the data channel is verified to the same anchor.
                 toClient = await OpenSslServerStream.AcceptAsync(clientSide.GetStream(),
-                    ReadOnlyMemory<byte>.Empty, issued.Leaf, issued.Chain, alpn: null, CancellationToken.None);
+                    ReadOnlyMemory<byte>.Empty, issued.Leaf, issued.Chain, alpn: null, ct);
             }
             else
             {
@@ -779,7 +847,7 @@ public class MitmProxy
                     ClientCertificateRequired = false,
                     EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
                     CertificateRevocationCheckMode = X509RevocationMode.NoCheck
-                });
+                }, ct);
                 toClient = streamSsl;
             }
         }
@@ -798,7 +866,7 @@ public class MitmProxy
             {
                 TargetHost = channel.Host,
                 EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13
-            });
+            }, ct);
         }
         catch (Exception ex)
         {
@@ -817,10 +885,11 @@ public class MitmProxy
         using var pcap = new PcapWriter(pcapPath);
         Console.WriteLine($"[FTPS] active-mode MITM established for {channel.Host}, saving to {pcapPath}");
 
+        setup.CancelAfter(Timeout.Infinite);
         try
         {
             await RelayAsync(toClient, toServer, channel.Host, real.Address, serverEp.Address,
-                (ushort)real.Port, (ushort)serverEp.Port, pcap, ftp: null, CancellationToken.None);
+                (ushort)real.Port, (ushort)serverEp.Port, pcap, ftp: null, ct);
         }
         catch (Exception ex)
         {
@@ -1143,8 +1212,9 @@ public class MitmProxy
     /// </summary>
     private async Task BlindAfterRefusalAsync(
         Stream rawClientStream, byte[] replayedHello, string host, string reason,
-        OriginalDest dest, CancellationToken ct)
+        OriginalDest dest, CancellationTokenSource setup)
     {
+        var ct = setup.Token;
         var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         using var retry = await ConnectExemptedAsync(origIp, origPort, ct);
         if (retry == null)
@@ -1154,7 +1224,7 @@ public class MitmProxy
         }
 
         await BlindRelayAsync(new PrefixedStream(replayedHello, rawClientStream), retry.GetStream(),
-            host, $"upstream refused the hello ({reason})", dest, ct);
+            host, $"upstream refused the hello ({reason})", dest, setup);
     }
 
     /// <summary>
@@ -1163,10 +1233,13 @@ public class MitmProxy
     /// </summary>
     private async Task BlindRelayAsync(
         Stream clientStream, Stream serverStream, string host, string reason,
-        OriginalDest dest, CancellationToken ct)
+        OriginalDest dest, CancellationTokenSource setup)
     {
+        var ct = setup.Token;
         var (origIp, origPort) = (dest.OrigAddr, dest.OrigPort);
         Console.WriteLine($"[Proxy] Blind relay to {origIp}:{origPort} for {host}: {reason}");
+        // A blind session is a relay from here, so it is not under the budget either.
+        setup.CancelAfter(Timeout.Infinite);
 
         var safeHost = string.Join("_", host.Split(Path.GetInvalidFileNameChars()));
         var pcapPath = $"captures/{safeHost}_blind_{DateTime.Now:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N")[..8]}.pcap";

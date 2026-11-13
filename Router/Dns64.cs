@@ -178,10 +178,11 @@ public static class Dns64
             var digit = Uri.FromHex(nibbles[i][0]);
             if (digit < 0) return null;
             // §2.5's order: "the low-order nibble is encoded first", so the first label is the last
-            // nibble of the address.
+            // nibble of the address. Nibble 0 is the most significant: an even nibble is its byte's high
+            // half, an odd nibble the low half.
             var nibble = Ip6ArpaNibbles - 1 - i;
-            if (nibble % 2 == 0) bytes[nibble / 2] |= (byte)digit;
-            else bytes[nibble / 2] |= (byte)(digit << 4);
+            if (nibble % 2 == 0) bytes[nibble / 2] |= (byte)(digit << 4);
+            else bytes[nibble / 2] |= (byte)digit;
         }
 
         if (Pref64.Extract(pref.Prefix, pref.PrefixLength, new IPAddress(bytes)) is not { } v4) return null;

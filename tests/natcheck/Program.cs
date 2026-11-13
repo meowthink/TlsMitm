@@ -775,6 +775,58 @@ Expect(movedErrTable.Translate(newQuote.AsSpan(), WanIfIdx, WanIfIdx).Action == 
        && Dst(newQuote) == client && QSrc(newQuote) == client,
     "the same notice about a datagram that left under the current address still reaches the client it is for");
 
+// --- Exhaustion is a refusal, not a fault ---------------------------------------------------------
+// The forward leg's catch tears the whole run down on an exception, so a full pool has to come back as a
+// dropped packet with a reason and a count - the same shape Nat64 already gives its own exhaustion.
+var allHeld = new HashSet<ushort>(Enumerable.Range(49152, 65535 - 49152 + 1).Select(p => (ushort)p));
+var fullTable = new NatTable(wan, lanAddr, lanMask, () => clock.Now, localPorts: _ => allHeld);
+var fullFlow = Frame(17, client, server, Udp(5100, 53));
+var fullOutcome = fullTable.Translate(fullFlow.AsSpan(), WanIfIdx, WanIfIdx);
+Expect(fullOutcome.Action == NatAction.Discard && fullOutcome.Reason == "NAT port pool exhausted",
+    $"a full pool refuses the packet with a reason, got {fullOutcome.Action} '{fullOutcome.Reason}'");
+Expect(fullTable.Exhausted == 1 && fullTable.FlowCount == 0,
+    $"the refusal is counted and names no flow, got exh={fullTable.Exhausted} flows={fullTable.FlowCount}");
+
+// --- The sweep and the packet path share one gate -------------------------------------------------
+// A mapping a packet just renewed is judged from that renewal. Pinned here rather than raced: from
+// outside the table a sweep may legitimately drop an expired mapping and a packet arriving afterwards
+// looks exactly the same, so a counted race on this writer would be timing noise (the same shape was
+// measured on TlsMitm's FlowTable, where the writer re-adds and the drop is therefore observable).
+var renewed = new NatTable(wan, lanAddr, lanMask, () => clock.Now);
+clock.Now = start;
+var renewFlow = Frame(17, client, server, Udp(6100, 53));
+renewed.Translate(renewFlow.AsSpan(), WanIfIdx, WanIfIdx);
+var renewPort = Sport(renewFlow);
+clock.Now = start + TimeSpan.FromSeconds(299);
+var again = Frame(17, client, server, Udp(6100, 53));
+renewed.Translate(again.AsSpan(), WanIfIdx, WanIfIdx);
+Expect(Sport(again) == renewPort, "a packet on an existing mapping keeps its port");
+renewed.Sweep();
+Expect(renewed.FlowCount == 1, "the sweep at the instant of the renewal keeps the mapping");
+clock.Now = start + TimeSpan.FromSeconds(600);
+renewed.Sweep();
+Expect(renewed.FlowCount == 0, "and 301 quiet seconds after the last packet it goes");
+
+// The announcement leaves the gate before it is made, so a slow subscriber cannot hold up the packet
+// path - and it still has to happen once per dropped mapping, with that mapping's own port and timer.
+var announced = new NatTable(wan, lanAddr, lanMask, () => clock.Now);
+var seen = new List<(ushort Port, TimeSpan Idle)>();
+announced.Expired += (_, port, idle) => seen.Add((port, idle));
+clock.Now = start;
+var firstFlow = Frame(17, client, server, Udp(6200, 53));
+announced.Translate(firstFlow.AsSpan(), WanIfIdx, WanIfIdx);
+var firstPort = Sport(firstFlow);
+var secondFlow = Frame(17, client, server2, Udp(6201, 53));
+announced.Translate(secondFlow.AsSpan(), WanIfIdx, WanIfIdx);
+var secondPort = Sport(secondFlow);
+clock.Now = start + TimeSpan.FromSeconds(301);
+announced.Sweep();
+Expect(seen.Count == 2 && seen.Any(e => e.Port == firstPort) && seen.Any(e => e.Port == secondPort),
+    $"every dropped mapping is announced once with its own port, got {seen.Count}");
+Expect(seen.All(e => e.Idle == TimeSpan.FromMinutes(5)), "and with the idle the sweep judged it by");
+announced.Sweep();
+Expect(seen.Count == 2, "a second sweep announces nothing again");
+
 foreach (var note in notes) Console.WriteLine($"[natcheck] {note}");
 if (failures.Count > 0)
 {

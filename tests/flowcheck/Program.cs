@@ -123,14 +123,14 @@ Expect(!dropped.Any(s => s.Token == live.Token), "a flow with no FIN/RST is not 
 var sessionNow = new DateTime(2026, 10, 30, 12, 0, 0, DateTimeKind.Utc);
 var sessions = new FlowTable(() => sessionNow);
 var quiet = sessions.Open(Key4(lanClient, 60000, server, 443), intercept: true);
-quiet.Session = true;
+var quietGeneration = sessions.ClaimSession(quiet);
 sessionNow += TimeSpan.FromMinutes(30);
 Expect(!sessions.Sweep().Any(s => s.Token == quiet.Token), "a session idle for half an hour keeps its token");
 Expect(sessions.ByToken(quiet.Token) != null, "and its reply leg still resolves after the silence");
 Expect(sessions.Follow(Key4(lanClient, 60000, server, 443)) != null, "and its own packets still find the state");
 
 var claimedToken = quiet.Token;
-sessions.EndSession(claimedToken);
+sessions.EndSession(claimedToken, quietGeneration);
 // A release is not an erasure: the FIN the proxy sends as its own session ends is still in flight behind
 // it, and answering that with a miss is what stops the client ever seeing our close.
 Expect(sessions.Count == 1, "the release leaves the flow held, for the packets that trail it");
@@ -158,6 +158,30 @@ Expect(!sessions.Sweep().Any(s => s.Token == reset.Token), "a session that saw a
 sessionNow += TimeSpan.FromHours(2) + TimeSpan.FromSeconds(1);
 Expect(sessions.Sweep().Any(s => s.Token == reset.Token), "two hours of silence does end a session's claim");
 
+// --- A reconnect's claim supersedes the old one ------------------------------------------------------
+// A fast reconnect reuses the four fields - and so the token - while the previous session is still
+// draining. Each claim takes a generation and a release only ends its own; without that, the old
+// session's release demotes the new connection to the ten-second closing clock and an idle reconnect
+// is swept out from under it.
+var genNow = new DateTime(2026, 10, 30, 12, 0, 0, DateTimeKind.Utc);
+var gens = new FlowTable(() => genNow);
+var conn1 = gens.Open(Key4(lanClient, 61000, server, 443), intercept: true);
+var gen1 = gens.ClaimSession(conn1);
+var conn2 = gens.Open(Key4(lanClient, 61000, server, 443), intercept: true);
+Expect(conn2.Token == conn1.Token, "a reconnect on the same four fields reuses the token");
+var gen2 = gens.ClaimSession(conn2);
+Expect(gen2 != gen1, "and takes a generation of its own");
+gens.EndSession(conn1.Token, gen1);
+Expect(gens.Follow(Key4(lanClient, 61000, server, 443))!.Session,
+    "the old session's release leaves the new claim's session standing");
+genNow += TimeSpan.FromSeconds(30);
+Expect(!gens.Sweep().Any(s => s.Token == conn2.Token),
+    "so an idle reconnect is judged by the session clock, not the ten-second closing clock");
+gens.EndSession(conn2.Token, gen2);
+genNow += TimeSpan.FromSeconds(11);
+Expect(gens.Sweep().Any(s => s.Token == conn2.Token),
+    "and the new session's own release is what hands it to the closing clock");
+
 // --- The pool gives up rather than sharing a token ---------------------------------------------------
 // Every state that cannot be named has to be passed through instead: a second flow on the same token
 // is the cross-talk this table exists to prevent.
@@ -173,6 +197,81 @@ var overflow = pool.Open(Key4(host, 30000, server, 443), intercept: true);
 Expect(overflow.Bypassed && pool.Refused == 1, $"the flow past the pool is refused once, got bypassed={overflow.Bypassed} refused={pool.Refused}");
 Expect(pool.Count == 65535 - 49152 + 1, $"a refusal consumes no slot, got {pool.Count}");
 
+// --- A sweep must not drop a flow a repeated SYN refreshed after the sweep read its clock -----------
+// Sweep runs on the redirector's cleanup thread while Open refreshes the same state, so the expiry test
+// and the removal have to be one step against it. The clock jumps six minutes per sweep, which leaves a
+// state expired against the sweep's own `now` unless Open refreshed it afterwards, and Open re-adds
+// through GetOrAdd - so a state it just handed back that is no longer reachable was dropped while fresh.
+// Three rendezvous per round keep the classification on this round's sweep clock, never the previous
+// round's. Measured with the gate removed: 2354 losses in 100000 rounds.
+static (long Race, long Legal, long Kept) RaceSweep(int rounds)
+{
+    var ticks = new DateTime(2026, 11, 5, 0, 0, 0, DateTimeKind.Utc).Ticks;
+    var sweepThread = -1;
+    var sweepNow = 0L;
+    var table = new FlowTable(() =>
+    {
+        var mine = Thread.CurrentThread.ManagedThreadId == Volatile.Read(ref sweepThread);
+        var t = mine ? Interlocked.Add(ref ticks, TimeSpan.FromMinutes(6).Ticks) : Volatile.Read(ref ticks);
+        if (mine) Volatile.Write(ref sweepNow, t);
+        return new DateTime(t, DateTimeKind.Utc);
+    });
+    var key = FlowTable.KeyV4(0x0A000001, 50000, 0xC0000201, 443);
+    var idle = TimeSpan.FromMinutes(5);
+    long race = 0, legal = 0, kept = 0;
+    using var gate = new Barrier(2);
+
+    var sweeper = Task.Run(() =>
+    {
+        Volatile.Write(ref sweepThread, Environment.CurrentManagedThreadId);
+        for (var i = 0; i < rounds; i++)
+        {
+            gate.SignalAndWait();
+            table.Sweep();
+            gate.SignalAndWait();
+            gate.SignalAndWait();
+        }
+    });
+
+    var opener = Task.Run(() =>
+    {
+        for (var i = 0; i < rounds; i++)
+        {
+            gate.SignalAndWait();
+            var s = table.Open(key, intercept: true);
+            var lastSeen = s.LastSeen.Ticks;
+            gate.SignalAndWait();
+            var fresh = new DateTime(Volatile.Read(ref sweepNow), DateTimeKind.Utc) -
+                        new DateTime(lastSeen, DateTimeKind.Utc) < idle;
+            var reachable = ReferenceEquals(table.Follow(key), s) && ReferenceEquals(table.ByToken(s.Token), s);
+            if (!reachable) { if (fresh) Interlocked.Increment(ref race); else Interlocked.Increment(ref legal); }
+            else if (fresh) Interlocked.Increment(ref kept);
+            gate.SignalAndWait();
+        }
+    });
+
+    Task.WaitAll(sweeper, opener);
+    return (race, legal, kept);
+}
+
+var (race, legal, kept) = RaceSweep(100_000);
+Expect(race == 0, $"a repeated SYN refreshed after the sweep's clock is never dropped, got {race} losses");
+notes.Add($"sweep race: {race} lost, {legal} aged out, {kept} kept");
+
+// The packet path refreshes through the same gate and the same clock. That writer is pinned here rather
+// than raced: a sweep may legitimately drop an expired state, and a Touch landing on that already-dead
+// state is indistinguishable from the race from outside the table, so a counted race on it would be
+// noise (measured: 403 with the gate against 159 without).
+var touched = new FlowTable(() => now);
+var packetFlow = touched.Open(Key4(host, 51000, server, 443), intercept: true);
+now = now.AddMinutes(6);
+touched.Touch(packetFlow);
+Expect(!touched.Sweep().Any(s => s.Token == packetFlow.Token) && ReferenceEquals(touched.Follow(packetFlow.Key), packetFlow),
+    "a packet refresh keeps an otherwise idle flow, on the table's own clock");
+now = now.AddMinutes(6);
+Expect(touched.Sweep().Any(s => s.Token == packetFlow.Token),
+    "and six quiet minutes after the last packet it goes");
+
 if (failures.Count > 0)
 {
     Console.WriteLine($"[flowcheck] FAIL ({failures.Count})");
@@ -181,7 +280,7 @@ if (failures.Count > 0)
 }
 notes.ForEach(n => Console.WriteLine($"[flowcheck] note: {n}"));
 Console.WriteLine("[flowcheck] PASS - two clients on one port, one client on two ports, retransmit, " +
-                  "bypass, family, ageing, session release and pool exhaustion");
+                  "bypass, family, ageing, session release, pool exhaustion and the sweep/refresh race");
 return 0;
 
 void Expect(bool condition, string what)

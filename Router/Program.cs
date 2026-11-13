@@ -1270,7 +1270,7 @@ using (divert)
                               $"fragmap={table.FragmentRewrites} " +
                               $"otherproto={table.UnmappedProtocol} icmperr={table.IcmpErrors} " +
                               $"icmpdrop={table.IcmpErrorsDropped} passthroughfail={passthroughFailed} " +
-                              $"rewritefail={rewriteFailed} heldskip={table.PortHeld}" +
+                              $"rewritefail={rewriteFailed} heldskip={table.PortHeld} exh={table.Exhausted}" +
                               // v6passthroughfail is the one that matters for the plain path: it counts a dual-stack
                               // flow this program took and could not put back, so a run with --nat64 that leaves it
                               // at zero is a run where widening the filter cost the IPv6 route nothing.

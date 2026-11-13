@@ -98,9 +98,12 @@ static int FreePort()
 
 sealed class FixedRedirector(IPAddress ip, int port) : IRedirector
 {
-    public OriginalDest? LookupOriginalDest(IPAddress deliveredTo, int token, IPAddress serverAddr)
-        => new OriginalDest(ip, port, deliveredTo, token);
-    public void ReleaseFlow(int token) { }
+    public OriginalDest? LookupOriginalDest(IPAddress deliveredTo, int token, IPAddress serverAddr, out int generation)
+    {
+        generation = 1;
+        return new OriginalDest(ip, port, deliveredTo, token);
+    }
+    public void ReleaseFlow(int token, int generation) { }
     public void RegisterExemption(int sourcePort) { }
     public void UnregisterExemption(int sourcePort) { }
     public void RegisterFlowExemption(int sourcePort, IPAddress destination, int destinationPort) { }

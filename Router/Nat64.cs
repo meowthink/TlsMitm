@@ -348,7 +348,7 @@ public sealed class Nat64
             if (_sessions.TryGetValue(steKey, out ste))
             {
                 if (!head.Fragmented) Advance(ste, flags, fromV6: true);
-                else ste.Expires = _now() + LifetimeFor(ste.State);
+                else Refresh(ste);
             }
         }
         else
@@ -380,7 +380,7 @@ public sealed class Nat64
 
         var flags = packet.Length >= head.Transport + 14 ? packet[head.Transport + 13] : (byte)0;
         if (!head.Fragmented) Advance(ste, flags, fromV6: false);
-        else ste.Expires = _now() + LifetimeFor(ste.State);
+        else Refresh(ste);
 
         var bytes = packet.ToArray();
         RewritePorts(bytes.AsSpan(head.Transport), TcpProto, null, ste.Key.SourcePort);
@@ -395,28 +395,41 @@ public sealed class Nat64
     // against a retransmitted SYN, BothFinRcv has no way back out because its only exit is the expiry, and a RST
     // moves ESTABLISHED to TRANS because the section says the NAT64 "is uncertain whether the peer will accept
     // the RST packet" and so gives it the short timer instead of the state machine's end.
+    // A fragmented packet has no transport header to read flags from, so it cannot be advanced, but it still
+    // keeps the session alive - under the same gate the sweep judges that expiry by.
+    private void Refresh(Ste ste)
+    {
+        lock (_alloc) ste.Expires = _now() + LifetimeFor(ste.State);
+    }
+
     private void Advance(Ste ste, byte flags, bool fromV6)
     {
-        var syn = (flags & Syn) != 0;
-        var fin = (flags & Fin) != 0;
-        var rst = (flags & Rst) != 0;
-
-        if (rst)
+        // The sweep holds this same gate while it judges Expires and State, so a packet's advance and that
+        // judgement cannot interleave: a session this packet just renewed must not be deleted by a sweep
+        // that read its expiry beforehand.
+        lock (_alloc)
         {
-            // Only ESTABLISHED has a RST row. In every other state the section's own words are "for any other
-            // packet ... the state remains unchanged", which a RST is where no row names it.
-            if (ste.State == TcpState.Established) ste.State = TcpState.Trans;
-        }
-        else if (syn && !fromV6 && ste.State == TcpState.V6Init) ste.State = TcpState.Established;
-        else if (fin && ste.State == TcpState.Established) ste.State = fromV6 ? TcpState.V6FinRcv : TcpState.V4FinRcv;
-        else if (fin && ste.State == (fromV6 ? TcpState.V4FinRcv : TcpState.V6FinRcv))
-            // The other leg's FIN is the only one that closes the second half: V4 FIN RCV names "a V6 FIN packet"
-            // and V6 FIN RCV names "a V4 FIN packet", and each state's next row is "any packet other than" that
-            // one, so a second FIN from the leg already closed leaves the state where it is.
-            ste.State = TcpState.BothFinRcv;
-        else if (!rst && ste.State == TcpState.Trans) ste.State = TcpState.Established;
+            var syn = (flags & Syn) != 0;
+            var fin = (flags & Fin) != 0;
+            var rst = (flags & Rst) != 0;
 
-        ste.Expires = _now() + LifetimeFor(ste.State);
+            if (rst)
+            {
+                // Only ESTABLISHED has a RST row. In every other state the section's own words are "for any other
+                // packet ... the state remains unchanged", which a RST is where no row names it.
+                if (ste.State == TcpState.Established) ste.State = TcpState.Trans;
+            }
+            else if (syn && !fromV6 && ste.State == TcpState.V6Init) ste.State = TcpState.Established;
+            else if (fin && ste.State == TcpState.Established) ste.State = fromV6 ? TcpState.V6FinRcv : TcpState.V4FinRcv;
+            else if (fin && ste.State == (fromV6 ? TcpState.V4FinRcv : TcpState.V6FinRcv))
+                // The other leg's FIN is the only one that closes the second half: V4 FIN RCV names "a V6 FIN packet"
+                // and V6 FIN RCV names "a V4 FIN packet", and each state's next row is "any packet other than" that
+                // one, so a second FIN from the leg already closed leaves the state where it is.
+                ste.State = TcpState.BothFinRcv;
+            else if (!rst && ste.State == TcpState.Trans) ste.State = TcpState.Established;
+
+            ste.Expires = _now() + LifetimeFor(ste.State);
+        }
     }
 
     private static TimeSpan LifetimeFor(TcpState state) => state switch
@@ -658,7 +671,7 @@ public sealed class Nat64
         var key = new FragKey(protocol, Address(packet, 8, AddressFamily.InterNetworkV6),
             Address(packet, 24, AddressFamily.InterNetworkV6), head.Identification);
         if (!_fragments.TryGetValue(key, out var record)) return NoFragmentRecord();
-        record.Expires = _now() + FragmentWindow;
+        lock (_alloc) record.Expires = _now() + FragmentWindow;
         Interlocked.Increment(ref FragmentReuses);
         return ToV4(packet.ToArray(), protocol, record.Binding, ste: null, path, hairpin: false);
     }
@@ -669,7 +682,7 @@ public sealed class Nat64
         var key = new FragKey(protocol, Address(packet, 12, AddressFamily.InterNetwork),
             Address(packet, 16, AddressFamily.InterNetwork), head.Identification);
         if (!_fragments.TryGetValue(key, out var record)) return NoFragmentRecord();
-        record.Expires = _now() + FragmentWindow;
+        lock (_alloc) record.Expires = _now() + FragmentWindow;
         Interlocked.Increment(ref FragmentReuses);
         return ToV6(packet.ToArray(), record.Binding, path, hairpin: false);
     }
@@ -686,18 +699,21 @@ public sealed class Nat64
         Bib binding)
     {
         var key = new FragKey(protocol, source, destination, identification);
-        if (_fragments.ContainsKey(key)) return;
-        // The ceiling is §3.4's first bullet: "The NAT64 MUST limit the amount of resources devoted to the
-        // storage of fragmented packets in order to protect from DoS attacks." A record past it is refused rather
-        // than evicting one still inside the window §3.4's second bullet asks for.
-        if (_fragments.Count >= FragmentCeiling)
+        lock (_alloc)
         {
-            Interlocked.Increment(ref FragmentRefused);
-            return;
+            if (_fragments.ContainsKey(key)) return;
+            // The ceiling is §3.4's first bullet: "The NAT64 MUST limit the amount of resources devoted to the
+            // storage of fragmented packets in order to protect from DoS attacks." A record past it is refused rather
+            // than evicting one still inside the window §3.4's second bullet asks for.
+            if (_fragments.Count >= FragmentCeiling)
+            {
+                Interlocked.Increment(ref FragmentRefused);
+                return;
+            }
+            var record = new FragMap(binding);
+            record.Expires = _now() + FragmentWindow;
+            _fragments[key] = record;
         }
-        var record = new FragMap(binding);
-        record.Expires = _now() + FragmentWindow;
-        _fragments[key] = record;
     }
 
     // --- §3.5.1.1's and §3.5.2.3's allocation ----------------------------------------------------------------------------
@@ -827,8 +843,16 @@ public sealed class Nat64
                 }
             }
         }
-        foreach (var (key, record) in _fragments)
-            if (now >= record.Expires) _fragments.TryRemove(key, out _);
+        lock (_alloc)
+        {
+            foreach (var (key, _) in _fragments)
+            {
+                // Read again under the gate: a later fragment of the same datagram may have renewed this
+                // record since the enumeration, and that one is not the record the sweep judged.
+                if (!_fragments.TryGetValue(key, out var live) || now < live.Expires) continue;
+                _fragments.TryRemove(key, out _);
+            }
+        }
     }
 
     // --- §3.6 and §3.7: the outgoing tuple, then the packet ---------------------------------------------------------------

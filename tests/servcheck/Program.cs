@@ -1585,12 +1585,15 @@ static byte[] HttpsRdata(ushort priority, string target, params (ushort Key, byt
 static string Ip6Arpa(string address)
 {
     var nibbles = new List<string>();
-    foreach (var octet in IPAddress.Parse(address).GetAddressBytes())
+    var bytes = IPAddress.Parse(address).GetAddressBytes();
+    // Bytes from the last to the first, and within each byte the low-order nibble first: §2.5's "the
+    // low-order nibble is encoded first". (The earlier forward-then-reverse form put the high nibble first
+    // within each byte, which only matched a translator that had the same inversion.)
+    for (var i = bytes.Length - 1; i >= 0; i--)
     {
-        nibbles.Add((octet & 0x0F).ToString("x"));
-        nibbles.Add((octet >> 4).ToString("x"));
+        nibbles.Add((bytes[i] & 0x0F).ToString("x"));
+        nibbles.Add((bytes[i] >> 4).ToString("x"));
     }
-    nibbles.Reverse();
     return string.Join('.', nibbles) + ".ip6.arpa";
 }
 

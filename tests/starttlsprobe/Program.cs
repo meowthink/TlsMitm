@@ -107,7 +107,7 @@ async Task<int> RunModeAsync(string mode)
         // legacy eMSign root before completing the handshake.
         var acceptCount = mode == "auto" ? 2
             : mode == "mtls-refused" ? 2
-            : mode is "grease" or "rootcheck" or "handshake-abort" or "filter" or "early-refuse" ? 0 : 1;
+            : mode is "grease" or "rootcheck" or "handshake-abort" or "filter" or "early-refuse" or "stall" ? 0 : 1;
         for (var i = 0; i < acceptCount; i++)
         {
         using var accepted = await listener.AcceptTcpClientAsync();
@@ -156,6 +156,7 @@ async Task<int> RunModeAsync(string mode)
             case "implicit":
             case "implicit-ip":
             case "ipv6":
+            case "saturated":
             // alpn-fallback: the upstream selects no ALPN, which is what a measured search edge does.
             case "alpn-fallback": await ServeImplicitAsync(stream, upstreamCert); break;
             case "emsign": await ServeOptionalImplicitAsync(stream, upstreamCert); break;
@@ -210,7 +211,7 @@ async Task<int> RunModeAsync(string mode)
     // The second and later connections are the FTP data channel. Nothing in this harness can name that
     // endpoint in advance, and live it is rewritten by the redirector instead, so send the upstream
     // connect somewhere closed rather than blocking a thread waiting for a target that never arrives.
-    var redirector = new FakeRedirector(index => index == 0 || mode == "auto"
+    var redirector = new FakeRedirector(index => index == 0 || mode == "auto" || mode is "stall" or "saturated"
         ? liveTarget ?? new IPEndPoint(loopbackIp, upstreamPort)
         : liveTarget != null
             ? new IPEndPoint(IPAddress.Loopback, 1)
@@ -219,7 +220,11 @@ async Task<int> RunModeAsync(string mode)
     // Only the terminate mode is given an ECH state machine; with none, the proxy relays the hello blind,
     // which is the other half of the pair.
     var proxy = new MitmProxy(certEngine, redirector, proxyPort,
-        mode == "ech-downgrade" ? new EchDowngrade() : null);
+        mode == "ech-downgrade" ? new EchDowngrade() : null,
+        // The stall mode judges a deadline, so it is given one short enough to wait for; every other mode
+        // keeps the product's default so a slow fixture is not mistaken for a stalled one.
+        setupBudget: mode == "stall" ? TimeSpan.FromMilliseconds(600) : null,
+        maxSessions: mode == "saturated" ? 1 : 1024);
     using var cts = new CancellationTokenSource();
     _ = proxy.StartAsync(cts.Token);
 
@@ -297,6 +302,19 @@ async Task<int> RunModeAsync(string mode)
             // rtmps:// session is judged from what the fake upstream ends up holding.
             await RunFfmpegMediaClientAsync(mode, proxyPort, ffmpegPath!, mediaSeen, notes, failures)
                 .WaitAsync(TimeSpan.FromSeconds(60));
+        }
+        else if (mode == "stall")
+        {
+            // Three ways a client can hold a session open without finishing it: say nothing, send a record
+            // header promising more than arrives, or send a whole hello and then stop. Each must end at the
+            // setup budget rather than park a task, two sockets and a flow token forever.
+            await RunStallClientAsync(proxyPort, notes, failures).WaitAsync(TimeSpan.FromSeconds(30));
+        }
+        else if (mode == "saturated")
+        {
+            // One slot, held by a session that completed. The next connection must be refused, and the
+            // holder must still work: a cap that tears down the session it is protecting is not a cap.
+            await RunSaturatedClientAsync(proxyPort, notes, failures).WaitAsync(TimeSpan.FromSeconds(30));
         }
         else if (isLive)
         {
@@ -1919,6 +1937,76 @@ async Task<int> RunModeAsync(string mode)
     // The client never sends a Finished, so what is read is the terminator's own first flight on the wire:
     // a ServerHello in it means the hello was accepted and the full handshake chosen, which is what refusing
     // 0-RTT would have to look like.
+    // A stalled session is judged by what the proxy does to the socket, not by a log line: the read must end
+    // (FIN or reset) inside a window generously above the 600ms budget this mode is given. The lower bound is
+    // what separates a kept deadline from an immediate refusal, which would satisfy the same read.
+    static async Task RunStallClientAsync(int proxyPort, List<string> notes, List<string> failures)
+    {
+        var hello = BuildEarlyDataHello(false, false);
+        foreach (var (label, send) in new[]
+                 { ("silent", 0), ("partial hello", 10), ("hello then silence", hello.Length) })
+        {
+            using var tcp = new TcpClient();
+            await tcp.ConnectAsync(IPAddress.Loopback, proxyPort);
+            var stream = tcp.GetStream();
+            if (send > 0) await stream.WriteAsync(hello.AsMemory(0, send));
+            var sw = Stopwatch.StartNew();
+            bool closed;
+            try
+            {
+                // Read to the end, not once: a complete hello is answered with a ServerHello before the
+                // handshake stalls, and that flight is not the session staying open.
+                closed = false;
+                var buf = new byte[512];
+                while (await stream.ReadAsync(buf).AsTask().WaitAsync(TimeSpan.FromSeconds(8)) > 0) { }
+                closed = true;
+            }
+            catch (TimeoutException) { closed = false; }
+            catch (IOException) { closed = true; }
+            catch (SocketException) { closed = true; }
+            sw.Stop();
+            notes.Add($"stall({label}): closed={closed} after {sw.ElapsedMilliseconds}ms");
+            if (!closed) failures.Add($"stall({label}): the proxy never closed the session");
+            // The lower bound only means something where the park has no other exit. A complete hello is
+            // answered with a flight, and the stack may fail the handshake on its own before the budget -
+            // that still releases the session, which is what this case is for.
+            else if (send < hello.Length && sw.ElapsedMilliseconds < 400)
+                failures.Add($"stall({label}): closed in {sw.ElapsedMilliseconds}ms, before the 600ms budget - " +
+                             "an immediate refusal is not the deadline being kept");
+        }
+    }
+
+    // The cap is judged from both sides: the connection past it is refused, and the session holding the slot
+    // still relays. The upstream waits for a request head, so a holder that completes TLS and then says
+    // nothing keeps its slot for as long as the judge needs.
+    static async Task RunSaturatedClientAsync(int proxyPort, List<string> notes, List<string> failures)
+    {
+        using var holder = new TcpClient();
+        await holder.ConnectAsync(IPAddress.Loopback, proxyPort);
+        using var holderSsl = new SslStream(holder.GetStream(), false, (_, _, _, _) => true);
+        await holderSsl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions { TargetHost = "probe.test" })
+            .WaitAsync(TimeSpan.FromSeconds(15));
+        notes.Add("saturated: the holding session established");
+
+        using var next = new TcpClient();
+        await next.ConnectAsync(IPAddress.Loopback, proxyPort);
+        bool closed;
+        try { closed = await next.GetStream().ReadAsync(new byte[1]).AsTask().WaitAsync(TimeSpan.FromSeconds(8)) == 0; }
+        catch (TimeoutException) { closed = false; }
+        catch (IOException) { closed = true; }
+        catch (SocketException) { closed = true; }
+        notes.Add($"saturated: the connection past the cap closed={closed}");
+        if (!closed) failures.Add("saturated: the connection past the cap was parked instead of refused");
+
+        await holderSsl.WriteAsync(Encoding.ASCII.GetBytes("GET / HTTP/1.1\r\nHost: probe.test\r\n\r\n"));
+        var answer = new byte[64];
+        var n = await holderSsl.ReadAsync(answer).AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+        var text = Encoding.ASCII.GetString(answer, 0, n);
+        notes.Add($"saturated: the holder's answer '{text.Split('\r')[0]}'");
+        if (!text.StartsWith("HTTP/1.1 200", StringComparison.Ordinal))
+            failures.Add($"saturated: the holding session no longer relays, got '{text}'");
+    }
+
     static async Task CheckEarlyRefuseAsync(X509Certificate2 cert, List<string> notes, List<string> failures)
     {
         var legs = new (string Label, byte[] Flight, bool Withhold)[]
@@ -3472,15 +3560,15 @@ sealed class FakeRedirector : IRedirector
     // Connections are handed their original destination in arrival order: control first, then the
     // data channel it opens later, which is the only way the harness can model an ephemeral port.
     // Nothing was rewritten here, so the socket's own endpoints are the client's and go back as such.
-    public OriginalDest? LookupOriginalDest(IPAddress deliveredTo, int token, IPAddress serverAddr)
+    public OriginalDest? LookupOriginalDest(IPAddress deliveredTo, int token, IPAddress serverAddr, out int generation)
     {
         var target = _targetFor(Interlocked.Increment(ref _lookupIndex) - 1);
-        Interlocked.Increment(ref _claims);
+        generation = Interlocked.Increment(ref _claims);
         return new OriginalDest(target.Address, target.Port, deliveredTo, token);
     }
 
     // No token pool here, so nothing is given back to; the count is what the run is judged on.
-    public void ReleaseFlow(int token) => Interlocked.Increment(ref _releases);
+    public void ReleaseFlow(int token, int generation) => Interlocked.Increment(ref _releases);
 
     public void RegisterExemption(int sourcePort) { }
 

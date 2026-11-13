@@ -97,7 +97,10 @@ public sealed class NatTable
     // carry: RFC 791 §3.2 makes (protocol, source, destination, id) the reassembly key, and a NAT that
     // rewrites only the fragment holding the transport header leaves the others addressed to the client.
     private readonly ConcurrentDictionary<FragKey, FragVal> _frag = new();
-    private readonly object _alloc = new();
+    // The table's one gate: port allocation, every refresh of a flow's ageing, and the sweep's expiry test
+    // together with its removal. The sweep runs on the router's cleanup task while the packet path refreshes
+    // the same flow, so a test and a removal that are two steps can drop a mapping a packet just renewed.
+    private readonly object _gate = new();
     private int _cursor;
     // What this host already holds, asked for at the moment a port is picked. Null means nothing is known
     // and every free port is a candidate, which is how the table behaved before the NAT had this to say.
@@ -114,6 +117,9 @@ public sealed class NatTable
     public long IcmpErrorsDropped;
     public long PortHeld;
     public long PortClaimed;
+    // A mapping the pool could not name. The packet is refused, not the run: the forward leg's catch tears
+    // the whole router down on an exception, so exhaustion must never reach it as one.
+    public long Exhausted;
 
     // Addresses are held as the four octets read big-endian, so 192.168.2.1 is 0xC0A80201. That is
     // the readable form and the form a filter string wants; it is NOT the form NativeIpv4Header
@@ -266,7 +272,12 @@ public sealed class NatTable
 
         var key = new MapKey(proto, src, srcPort);
         if (!_flows.TryGetValue(key, out var existing))
-            existing = Create(key, dst);
+        {
+            var created = Create(key, dst);
+            if (created == null)
+                return new NatOutcome(NatAction.Discard, "NAT port pool exhausted");
+            existing = created;
+        }
 
         if (moreFragments)
             RecordFragment(proto, src, dst, id, new FragVal(NatAction.Snat, 12, _wanAddr));
@@ -279,14 +290,15 @@ public sealed class NatTable
         return new NatOutcome(NatAction.Snat);
     }
 
-    private Flow Create(MapKey key, uint remote)
+    private Flow? Create(MapKey key, uint remote)
     {
-        lock (_alloc)
+        lock (_gate)
         {
             if (_flows.TryGetValue(key, out var raced))
                 return raced;
 
             var port = AllocatePortLocked(key.Proto, key.ClientPort);
+            if (port == 0) return null;
             var flow = new Flow(key, port, remote, _now());
             _flows[key] = flow;
             _rev[new RevKey(key.Proto, port)] = key;
@@ -326,7 +338,8 @@ public sealed class NatTable
             _cursor = slot;
             return candidate;
         }
-        throw new InvalidOperationException("NAT port pool exhausted");
+        Interlocked.Increment(ref Exhausted);
+        return 0;
     }
 
     private static bool IsIcmpError(ReadOnlySpan<byte> packet, int ihl)
@@ -469,8 +482,11 @@ public sealed class NatTable
     private void RecordFragment(byte proto, uint src, uint dst, ushort id, FragVal val)
     {
         var key = new FragKey(proto, src, dst, id);
-        if (_frag.ContainsKey(key) || _frag.Count < FragmentCeiling)
-            _frag[key] = val with { Expires = _now() };
+        lock (_gate)
+        {
+            if (_frag.ContainsKey(key) || _frag.Count < FragmentCeiling)
+                _frag[key] = val with { Expires = _now() };
+        }
     }
 
     // RFC 1624 §2: HC' = ~(C + (-m) + m') with C the sum the old HC is the complement of. It is the only
@@ -536,13 +552,16 @@ public sealed class NatTable
 
     private void Touch(Flow flow, byte proto, ReadOnlySpan<byte> packet, int ihl, uint remote)
     {
-        flow.LastSeen = _now();
-        flow.LastRemote = remote;
-        flow.Packets++;
-        if (proto == TcpProto && packet.Length >= ihl + 14)
+        lock (_gate)
         {
-            var flags = packet[ihl + 13];
-            if ((flags & 0x05) != 0) flow.Closing = true;
+            flow.LastSeen = _now();
+            flow.LastRemote = remote;
+            flow.Packets++;
+            if (proto == TcpProto && packet.Length >= ihl + 14)
+            {
+                var flags = packet[ihl + 13];
+                if ((flags & 0x05) != 0) flow.Closing = true;
+            }
         }
     }
 
@@ -617,21 +636,33 @@ public sealed class NatTable
     public void Sweep()
     {
         var now = _now();
+        var expired = new List<(MapKey Key, ushort Port, TimeSpan Idle)>();
         foreach (var (key, flow) in _flows)
         {
-            var idle = TimeoutFor(key.Proto, flow.Closing);
-            if (now - flow.LastSeen < idle) continue;
-            if (!_flows.TryRemove(key, out _)) continue;
-            _rev.TryRemove(new RevKey(key.Proto, flow.NatPort), out _);
-            Expired?.Invoke(key, flow.NatPort, idle);
+            lock (_gate)
+            {
+                var idle = TimeoutFor(key.Proto, flow.Closing);
+                if (now - flow.LastSeen < idle) continue;
+                if (!_flows.TryRemove(key, out _)) continue;
+                _rev.TryRemove(new RevKey(key.Proto, flow.NatPort), out _);
+                expired.Add((key, flow.NatPort, idle));
+            }
         }
+        // Reported outside the gate: the subscriber writes to the console, and a slow console must not hold
+        // up the packet path's refresh.
+        foreach (var (key, port, idle) in expired) Expired?.Invoke(key, port, idle);
         // A record is only ever asked for by a fragment of the same datagram, and a datagram whose
         // remaining fragments have not arrived inside the reassembly window is not going to be reassembled
         // by anyone, so the record has nothing left to answer for.
-        foreach (var (key, val) in _frag)
+        foreach (var (key, _) in _frag)
         {
-            if (now - val.Expires < FragmentWindow) continue;
-            _frag.TryRemove(key, out _);
+            lock (_gate)
+            {
+                // Read again under the gate: a first fragment that arrived since the enumeration replaced
+                // this record with a later expiry, and that one is not the record the sweep judged.
+                if (!_frag.TryGetValue(key, out var live) || now - live.Expires < FragmentWindow) continue;
+                _frag.TryRemove(key, out _);
+            }
         }
     }
 
