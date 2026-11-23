@@ -348,7 +348,11 @@ if (!noDhcp)
         Console.WriteLine($"[Router] --pool wants <ipv4>/<count>, got '{poolText}'.");
         return 1;
     }
-    var poolStart = NatTable.ParseAddress(poolParts[0]);
+    if (!NatTable.TryParseAddress(poolParts[0], out var poolStart))
+    {
+        Console.WriteLine($"[Router] --pool '{poolText}': '{poolParts[0]}' is not a dotted IPv4 address (each octet 0-255).");
+        return 1;
+    }
     if (!DhcpConfig.PoolFitsSubnet(poolStart, poolCount, lan.Addr, lan.Mask))
     {
         Console.WriteLine($"[Router] pool {poolText} is outside the LAN side {lan.AddrText}/{lan.Prefix}.");
@@ -398,9 +402,20 @@ if (!noDhcp)
 
 // --no-dns still skips the resolver lookup: the PowerShell call behind it is not free, and asking
 // what the WAN interface's DNS server is would be pointless when nothing is going to forward to it.
-var upstream = dnsArg is not null ? NatTable.ParseAddress(dnsArg)
-    : noDns ? null
-    : Host.QueryDnsServer(wan.IfIdx);
+uint? upstream;
+if (dnsArg is not null)
+{
+    if (!NatTable.TryParseAddress(dnsArg, out var parsedDns))
+    {
+        Console.WriteLine($"[Router] --dns '{dnsArg}' is not a dotted IPv4 address (each octet 0-255).");
+        return 1;
+    }
+    upstream = parsedDns;
+}
+else
+{
+    upstream = noDns ? null : Host.QueryDnsServer(wan.IfIdx);
+}
 if (upstream is null && !noDns)
 {
     Console.WriteLine($"[Router] No DNS server configured on {wan.Name}, so there is nothing to forward to.");
@@ -964,6 +979,8 @@ unsafe void ReplyLoopV6(WinDivertHandle leg)
     var packetBuf = Marshal.AllocHGlobal(MTU_MAX);
     var addrBuf = Marshal.AllocHGlobal(ADDR_SIZE);
     var budget = 20;
+    // Named apart from the v4 reply leg's own counter: the two loops run on separate threads.
+    var v6RecvFailures = 0;
     try
     {
         while (!cts.IsCancellationRequested)
@@ -972,8 +989,18 @@ unsafe void ReplyLoopV6(WinDivertHandle leg)
             if (!leg.Recv((void*)packetBuf, MTU_MAX, &recvLen, (Address*)addrBuf))
             {
                 if (cts.IsCancellationRequested) break;
+                // The v6 reply leg is diagnostic - it neutralises ech parameters in this host's own
+                // resolver answers - so a handle that has stopped delivering ends this leg rather than
+                // the run; the v4 answer above it still works.
+                if (++v6RecvFailures == RecvFailureLimit)
+                {
+                    Console.WriteLine($"[Router] IPv6 reply leg Recv failed {v6RecvFailures} times in a row, " +
+                        $"error {Marshal.GetLastWin32Error()}; leaving this host's IPv6 answers as they are");
+                    break;
+                }
                 continue;
             }
+            v6RecvFailures = 0;
 
             var addr = (Address*)addrBuf;
             var packet = new Span<byte>((void*)packetBuf, recvLen);
@@ -1024,10 +1051,15 @@ unsafe void ReplyLoop()
 {
     var packetBuf = Marshal.AllocHGlobal(MTU_MAX);
     var addrBuf = Marshal.AllocHGlobal(ADDR_SIZE);
-    var budget = 20;
-    var leg = reply;
-    try
-    {
+        var budget = 20;
+        var leg = reply;
+        // The same guard the forward leg carries: a Recv that fails without cancellation behind it is an
+        // error return, and one that fails every time is a leg that has stopped answering without saying
+        // why. This handle queues the WAN's replies to every mapped flow, so ending silently here is a
+        // blackout - the failure is printed and the whole run is stopped instead.
+        var recvFailures = 0;
+        try
+        {
         while (!cts.IsCancellationRequested)
         {
             // The sweep puts a handle opened on the address the WAN has taken here and shuts the old one, so
@@ -1045,8 +1077,16 @@ unsafe void ReplyLoop()
             if (!leg.Recv((void*)packetBuf, MTU_MAX, &recvLen, (Address*)addrBuf))
             {
                 if (cts.IsCancellationRequested) break;
+                if (++recvFailures == RecvFailureLimit)
+                {
+                    Console.WriteLine($"[Router] reply leg Recv failed {recvFailures} times in a row, " +
+                        $"error {Marshal.GetLastWin32Error()}; stopping the run rather than dropping every reply");
+                    Abort();
+                    break;
+                }
                 continue;
             }
+            recvFailures = 0;
             Interlocked.Increment(ref replyReceived);
 
             var addr = (Address*)addrBuf;
@@ -1296,13 +1336,26 @@ using (divert)
     {
         unsafe
         {
+            // A Recv that keeps coming back false while the token is unset is a handle in a failing
+            // state, not a quiet one: the driver returns immediately on an error, so the loop below
+            // without this bound spins at full CPU, forwards nothing, and prints nothing. The failure
+            // count is answered with the Win32 error and an abort - the run ends rather than sit dead.
+            var recvFailures = 0;
             while (!cts.IsCancellationRequested)
             {
                 if (!divert.Recv((void*)packetBuf, MTU_MAX, (int*)lenBuf, (Address*)addrBuf))
                 {
                     if (cts.IsCancellationRequested) break;
+                    if (++recvFailures == RecvFailureLimit)
+                    {
+                        Console.WriteLine($"[Router] forward leg Recv failed {recvFailures} times in a row, " +
+                            $"error {Marshal.GetLastWin32Error()}; the handle is not delivering packets, stopping");
+                        Abort();
+                        break;
+                    }
                     continue;
                 }
+                recvFailures = 0;
                 var recvLen = *(int*)lenBuf;
                 received++;
 
@@ -1350,7 +1403,11 @@ using (divert)
                     var v6After = Host.Describe(new Span<byte>((void*)packetBuf, out64.Length));
                     var v6Sent = divert.Send((void*)packetBuf, out64.Length, null, addr);
                     if (!v6Sent && ++v6RewriteFailed == 1)
-                        Console.WriteLine($"[Router] NAT64 64 reinjection failed, error {Marshal.GetLastWin32Error()}");
+                        // The packet is named here for the same reason the passthrough branch names it: an
+                        // error code alone cannot say which of the two translation shapes (64 or hairpin)
+                        // the driver refused, and the same line in the log below carries both.
+                        Console.WriteLine($"[Router] NAT64 64 reinjection failed, error {Marshal.GetLastWin32Error()}: " +
+                            $"{v6Before} => {v6After} ifIdx={addr->IfIdx}");
                     if (logBudget-- > 0)
                         Console.WriteLine($"[Router] NAT64 64 {v6Before} => {v6After} ifIdx={addr->IfIdx} sent={v6Sent}");
                     continue;
@@ -1417,6 +1474,12 @@ using (divert)
     }
     finally
     {
+        // Cancelled first, so every loop that is about to see a Recv come back false - which Shutdown and
+        // Dispose both cause - reads a token that is already set and breaks, instead of re-calling Recv on
+        // a closed handle in a tight loop. The same order Abort() uses. It also runs before the listeners
+        // below are stopped, so a DNS task still holding a client socket is told to stop before the socket
+        // it could be writing to is taken away.
+        cts.Cancel();
         divert.Shutdown();
         reply.Shutdown(ShutdownMode.Recv);
         reply.Dispose();
@@ -1431,11 +1494,11 @@ using (divert)
         dnsSocket?.Dispose();
         dnsTcp?.Stop();
         upstreamSocket?.Dispose();
-        // Before the summary line, so "stopped" is only printed once the Release has gone out and the LAN
-        // address the delegation installed has been taken back. Cancelling here rather than relying on the
-        // interrupt handler covers every other way this block can end.
-        cts.Cancel();
-        v6Task?.Wait(TimeSpan.FromSeconds(10));
+        // Printed here rather than passing the Wait's verdict silently: a v6 leg that did not stop in
+        // 10 s is one whose synchronous PowerShell shutdown may leave the LAN's delegated address behind,
+        // and the run's own "stopped" line would otherwise claim it took everything back.
+        if (v6Task is { } leg && !leg.Wait(TimeSpan.FromSeconds(10)))
+            Console.WriteLine("[Router] the IPv6 leg did not stop within 10 s; its address removal may still be running");
     }
 }
 

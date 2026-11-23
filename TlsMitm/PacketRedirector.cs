@@ -225,24 +225,48 @@ public class PacketRedirector : IRedirector, IDisposable
 
     private void Run(Capture capture, CancellationToken ct)
     {
+        // A Recv that keeps failing without cancellation behind it is an error return, and the driver
+        // returns immediately on one, so the loop without this bound spins at full CPU capturing nothing.
+        // RunOnce reports whether it took a packet, so the count lives here where the loop is.
+        var recvFailures = 0;
         while (!ct.IsCancellationRequested)
         {
+            var received = false;
             try
             {
-                unsafe { RunOnce(capture, ct); }
+                unsafe { received = RunOnce(capture, ct); }
             }
             catch (OperationCanceledException) { break; }
-            catch (Exception ex) { Console.WriteLine($"[Redirector] Error: {ex.Message}"); }
+            // The whole exception, not just its message: this catch is the only place a faulting leg can
+            // speak, and a bare Message cannot say which frame of the pipeline it left. The leg stops after
+            // the failures below, so a persistent fault does not print this forever.
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Redirector] Error: {ex}");
+                break;
+            }
+            if (received)
+            {
+                recvFailures = 0;
+                continue;
+            }
+            if (ct.IsCancellationRequested) break;
+            if (++recvFailures == RecvFailureLimit)
+            {
+                Console.WriteLine($"[Redirector] Recv failed {recvFailures} times in a row, " +
+                    $"error {Marshal.GetLastWin32Error()}; this capture leg is not delivering packets, stopping it");
+                break;
+            }
         }
     }
 
-    private unsafe void RunOnce(Capture capture, CancellationToken ct)
+    private unsafe bool RunOnce(Capture capture, CancellationToken ct)
     {
-        if (ct.IsCancellationRequested) return;
+        if (ct.IsCancellationRequested) return false;
 
         int recvLen;
         if (!capture.Handle.Recv((void*)capture.Packet, MTU_MAX, &recvLen, (Address*)capture.Addr))
-            return;
+            return false;
 
         var version = (*(byte*)capture.Packet >> 4) & 0x0F;
 
@@ -262,7 +286,7 @@ public class PacketRedirector : IRedirector, IDisposable
                                       $" off={NetToHost(ip4->FlagsAndFragOff) & 0x1FFF}" +
                                       $" {new IPAddress(ip4->SrcAddr)}->{new IPAddress(ip4->DstAddr)}");
                 capture.Handle.Send((void*)capture.Packet, recvLen, null, (Address*)capture.Addr);
-                return;
+                return true;
             }
             if (ip4->Protocol == 6 && recvLen >= ip4->HeaderLength + sizeof(NativeTcpHeader))
             {
@@ -308,6 +332,7 @@ public class PacketRedirector : IRedirector, IDisposable
         {
             capture.Handle.Send((void*)capture.Packet, recvLen, null, (Address*)capture.Addr);
         }
+        return true;
     }
 
     private unsafe bool IsV6FlowExempt(int srcPort, NativeIpv6Header* ip6, int dstPort)

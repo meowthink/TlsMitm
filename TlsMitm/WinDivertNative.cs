@@ -12,6 +12,13 @@ public static unsafe class WinDivertPInvoke
     public const int MTU_MAX = 40 + 0xFFFF;
     public const int ADDR_SIZE = 80;
 
+    // How many Recv failures in a row, with the run's token still unset, a receive loop tolerates before
+    // it concludes the handle is not delivering packets and says so. Recv is a blocking call, so a false
+    // with no cancellation behind it is an error return - and a driver in a failing state returns it
+    // immediately, every time, which without this bound is a tight loop that produces no packets and no
+    // diagnostics. The count is high enough that a Shutdown on another thread lands long before it.
+    public const int RecvFailureLimit = 32;
+
     // Header multi-byte fields are network byte order on the wire. The raw structs
     // expose them without conversion, so every read/write must go through these.
     public static ushort NetToHost(ushort value) => System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(value);
@@ -246,7 +253,6 @@ public static unsafe class WinDivertPInvoke
     public class WinDivertHandle : IDisposable
     {
         private IntPtr _handle;
-        private bool _disposed;
 
         public IntPtr Handle => _handle;
 
@@ -351,12 +357,14 @@ public static unsafe class WinDivertPInvoke
 
         public void Dispose()
         {
-            if (!_disposed && _handle != IntPtr.Zero)
-            {
-                WinDivertClose(_handle);
-                _handle = IntPtr.Zero;
-                _disposed = true;
-            }
+            // The router's reply leg is disposed from two places that can overlap: the forward loop's
+            // finally and the reply loop's own leg swap, and a plain test-and-set here would let both
+            // close the same handle. Interlocked takes the handle exactly once, so a second caller closes
+            // nothing; a loop still inside Recv on the zeroed handle gets false back, which is what its
+            // cancellation check answers.
+            var handle = Interlocked.Exchange(ref _handle, IntPtr.Zero);
+            if (handle != IntPtr.Zero)
+                WinDivertClose(handle);
         }
 
         private static string CompileFilter(string filter, Layer layer)
@@ -376,7 +384,15 @@ public static unsafe class WinDivertPInvoke
     // path, so neither a PATH entry nor the usual DLL search order is involved.
     static WinDivertPInvoke()
     {
-        try { LoadDriver(); } catch { }
+        // Swallowed silently this used to point every later failure in the wrong direction: an unpack or
+        // LoadLibrary that fails here makes the first WinDivertOpen fail with a "needs elevation"-shaped
+        // error, which is a diagnosis of the wrong problem. The load is still not fatal - the class is
+        // shared with offline tests that never open a handle - but it is no longer quiet.
+        try { LoadDriver(); }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[WinDivert] driver load skipped: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     private static void LoadDriver()

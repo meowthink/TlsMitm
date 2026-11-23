@@ -74,6 +74,14 @@ public static class Services
                     continue;
                 }
             }
+            catch (DhcpPoolExhaustedException ex)
+            {
+                // A full pool is a state the client's own retransmission will keep asking about, so it is
+                // one line here rather than the request-failure shape the general catch gives it: RFC
+                // 2131's answer to a DISCOVER a server cannot serve is no reply, and this says why.
+                Console.WriteLine($"[Router] dhcp {ex.Message}; the DISCOVER is not answered");
+                continue;
+            }
             catch (Exception ex)
             {
                 Console.WriteLine($"[Router] dhcp request failed: {ex.GetType().Name}: {ex.Message}");
@@ -203,6 +211,13 @@ public static class Services
     {
         Console.WriteLine($"[Router] DNS on {bound}:{DnsPorts.ServerPort} over TCP too, " +
                           "for the retry a truncated UDP answer calls for");
+        // One task per accepted connection, but not unbounded: each one holds a task, a socket, and a
+        // length-prefixed read the prefix alone can size at 64 KB, so a client that opens connections
+        // faster than they time out grows all three without this. Past the bound the connection is
+        // closed rather than queued, because a retry queued that far back has already timed out at its
+        // own end.
+        const int maxConcurrent = 32;
+        using var serving = new SemaphoreSlim(maxConcurrent, maxConcurrent);
         while (!token.IsCancellationRequested)
         {
             TcpClient client;
@@ -222,7 +237,27 @@ public static class Services
 
             // One connection is one client's retry, and a retry can be as slow as the UDP question that
             // sent it there. Serving it on the accept loop would queue every other client behind it.
-            _ = Task.Run(() => ServeDnsClient(client, server));
+            _ = Task.Run(async () =>
+            {
+                if (!await serving.WaitAsync(0).ConfigureAwait(false))
+                {
+                    var peer = client.Client.RemoteEndPoint as IPEndPoint;
+                    Console.WriteLine($"[Router] DNS over TCP from {peer?.Address} arrived past " +
+                        $"{maxConcurrent} concurrent retries; closed");
+                    client.Close();
+                    return;
+                }
+                try
+                {
+                    ServeDnsClient(client, server);
+                }
+                finally
+                {
+                    // The listener's own exit disposes the semaphore; a retry still in flight then reaches
+                    // here, and the run is over anyway.
+                    try { serving.Release(); } catch (ObjectDisposedException) { }
+                }
+            });
         }
     }
 

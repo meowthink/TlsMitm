@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Globalization;
 
 namespace Router;
 
@@ -320,17 +321,22 @@ public sealed class NatTable
     private ushort AllocatePortLocked(byte proto, ushort internalPort)
     {
         var parity = internalPort & 1;
+        // Both readers are taken once, before the candidate loop, for the same reason as Nat64's allocator:
+        // OtherMapped enumerates the NAT64 table's whole reverse view on every call, and the loop tries up
+        // to PortSlots candidates under _gate, which the packet path also needs.
+        var localHeld = _localPorts is { } held ? new HashSet<ushort>(held(proto)) : null;
+        var otherHeld = OtherMapped is { } claimed ? new HashSet<ushort>(claimed(proto)) : null;
         for (var step = 0; step < PortSlots; step++)
         {
             var slot = (_cursor + step) % PortSlots;
             var candidate = (ushort)(PortFirst + slot * 2 + parity);
             if (_rev.ContainsKey(new RevKey(proto, candidate))) continue;
-            if (_localPorts is { } held && held(proto).Contains(candidate))
+            if (localHeld is { } localSet && localSet.Contains(candidate))
             {
                 Interlocked.Increment(ref PortHeld);
                 continue;
             }
-            if (OtherMapped is { } otherTable && otherTable(proto).Contains(candidate))
+            if (otherHeld is { } otherSet && otherSet.Contains(candidate))
             {
                 Interlocked.Increment(ref PortClaimed);
                 continue;
@@ -614,14 +620,31 @@ public sealed class NatTable
     public static string FormatAddress(uint addr)
         => $"{addr >> 24}.{(addr >> 16) & 0xFF}.{(addr >> 8) & 0xFF}.{addr & 0xFF}";
 
-    public static uint ParseAddress(string dotted)
+    public static uint ParseAddress(string dotted) =>
+        TryParseAddress(dotted, out var value)
+            ? value
+            : throw new FormatException($"not a dotted IPv4 address: {dotted}");
+
+    // The whole parser answers through one bool, so every caller gets the same verdict. byte.Parse used
+    // to turn an octet like "300" into an OverflowException - a different type than the FormatException
+    // the catch sites around it were written for, so "--pool 10.0.0.300/50" ended the run with a stack
+    // trace instead of a usage line. NumberStyles.None refuses the sign and the whitespace a plain
+    // TryParse would let through, which is what a dotted quad on a command line means.
+    public static bool TryParseAddress(string? dotted, out uint value)
     {
+        value = 0;
+        if (dotted is null) return false;
         var parts = dotted.Split('.');
-        if (parts.Length != 4) throw new FormatException($"not a dotted IPv4 address: {dotted}");
-        uint value = 0;
+        if (parts.Length != 4) return false;
+        uint parsed = 0;
         foreach (var part in parts)
-            value = (value << 8) | byte.Parse(part);
-        return value;
+        {
+            if (!byte.TryParse(part, NumberStyles.None, CultureInfo.InvariantCulture, out var octet))
+                return false;
+            parsed = (parsed << 8) | octet;
+        }
+        value = parsed;
+        return true;
     }
 
     // An operator writes a prefix length; this project carries the four octets read big-endian, so /24

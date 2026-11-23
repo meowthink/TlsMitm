@@ -66,25 +66,47 @@ public class QuicBlocker : IDisposable
 
     private Task RunAsync(Leg leg, CancellationToken ct)
     {
+        // The same bound the redirector's legs carry: a Recv that fails every time without cancellation
+        // behind it is a handle in a failing state, and spinning on it blocks nothing and reports nothing.
+        var recvFailures = 0;
         while (!ct.IsCancellationRequested)
         {
+            var received = false;
             try
             {
-                unsafe { RunOnce(leg); }
+                unsafe { received = RunOnce(leg); }
             }
             catch (OperationCanceledException) { break; }
-            catch (Exception ex) { Console.WriteLine($"[QuicBlocker] Error: {ex.Message}"); }
+            // The whole exception: this is the only place a faulting leg can speak, and the leg stops
+            // after the failure bound below rather than printing forever.
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[QuicBlocker] Error: {ex}");
+                break;
+            }
+            if (received)
+            {
+                recvFailures = 0;
+                continue;
+            }
+            if (ct.IsCancellationRequested) break;
+            if (++recvFailures == RecvFailureLimit)
+            {
+                Console.WriteLine($"[QuicBlocker] Recv failed {recvFailures} times in a row on the {leg.Name} leg, " +
+                    $"error {Marshal.GetLastWin32Error()}; stopping it");
+                break;
+            }
         }
         return Task.CompletedTask;
     }
 
-    private unsafe void RunOnce(Leg leg)
+    private unsafe bool RunOnce(Leg leg)
     {
-        if (_cts.IsCancellationRequested) return;
+        if (_cts.IsCancellationRequested) return false;
 
         int recvLen;
         if (!leg.Handle.Recv((void*)leg.Packet, MTU_MAX, &recvLen, (Address*)leg.Addr))
-            return;
+            return false;
 
         Interlocked.Increment(ref leg.Seen);
         if (QuicSignature.IsQuicDatagram((byte*)leg.Packet, recvLen, out var dstPort))
@@ -92,10 +114,11 @@ public class QuicBlocker : IDisposable
             var count = Interlocked.Increment(ref leg.Blocked);
             if (count <= 10 || count % 100 == 0)
                 Console.WriteLine($"[QuicBlocker] Blocked {leg.Name} QUIC packet to port {dstPort} (total: {count})");
-            return;
+            return true;
         }
 
         leg.Handle.Send((void*)leg.Packet, recvLen, null, (Address*)leg.Addr);
+        return true;
     }
 
     public void Dispose()

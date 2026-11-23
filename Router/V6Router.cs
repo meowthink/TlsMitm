@@ -56,8 +56,15 @@ public sealed class V6Router
     private readonly PdClient _pd;
 
     private RaSchedule? _ra;
-    private DateTime? _answerAt;
-    private IPAddress? _answerTo;
+    // The solicitations waiting for their answer. One slot used to be enough for the single host a home
+    // LAN usually has, but two hosts that solicit inside the same 50 ms tick each had their answer
+    // scheduled - and the second overwrite left the first waiting for the next periodic advertisement.
+    // RFC 4861 §6.2.6 allows one answer per solicitation; the queue is what keeps them distinct, and a
+    // multicast answer is collapsed into the pending one rather than enqueued again because a single
+    // advertisement answers every solicitor. The bound is the overflow answer to a host that spams
+    // solicitations: dropped here, retried by its own §6.2.6 retransmission.
+    private readonly Queue<(DateTime At, IPAddress? To)> _answers = new();
+    private const int MaxPendingAnswers = 64;
     private Dhcp6Prefix? _installed;
     private IPAddress? _installedAddress;
     private DateTime _preferredUntil;
@@ -293,8 +300,19 @@ public sealed class V6Router
 
             var source = ((IPEndPoint)from).Address;
             var unicast = !source.Equals(IPAddress.IPv6Any) && !source.IsIPv6Multicast;
-            _answerAt = _ra.Solicit(now, !unicast);
-            _answerTo = unicast ? WithScope(source, _lanIfIdx) : null;
+            var due = _ra.Solicit(now, !unicast);
+            if (unicast)
+            {
+                if (_answers.Count < MaxPendingAnswers)
+                    _answers.Enqueue((due, WithScope(source, _lanIfIdx)));
+            }
+            else if (!_answers.Any(answer => answer.To is null) && _answers.Count < MaxPendingAnswers)
+            {
+                // The earliest pending multicast answer serves this one too, so it is only enqueued when
+                // none is pending; a later multicast RA this close to the last would also break the
+                // MIN_DELAY_BETWEEN_RAS bound the schedule holds.
+                _answers.Enqueue((due, null));
+            }
             Console.WriteLine($"[Router] Router Solicitation from {source}: answering " +
                               $"{(unicast ? "it directly" : "to all nodes")}");
         }
@@ -405,8 +423,7 @@ public sealed class V6Router
         WithdrawRouters(now);
         RemoveAddress();
         _ra = null;
-        _answerAt = null;
-        _answerTo = null;
+        _answers.Clear();
         _installed = null;
         _installedAddress = null;
         _dns = Array.Empty<byte[]>();
@@ -435,14 +452,13 @@ public sealed class V6Router
     private void Timer(DateTime now)
     {
         if (_ra is not { } schedule) return;
-        if (_answerAt is { } at && now >= at)
+        // Every due answer goes out in its own turn: a unicast answer is not part of the interface's
+        // multicast clock (§6.2.6), and only the multicast one resets it.
+        while (_answers.Count > 0 && now >= _answers.Peek().At)
         {
-            var multicast = _answerTo is null;
-            Advertise(now, _answerTo);
-            _answerAt = null;
-            _answerTo = null;
-            // §6.2.6: a multicast answer resets the interface's timer as if an unsolicited advertisement
-            // had just been sent; a unicast one is not part of that timer's schedule.
+            var (_, to) = _answers.Dequeue();
+            var multicast = to is null;
+            Advertise(now, to);
             if (multicast) schedule.Sent(now);
         }
         if (schedule.Due(now))

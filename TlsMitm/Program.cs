@@ -60,6 +60,15 @@ Console.CancelKeyPress += (_, e) =>
     e.Cancel = true;
     Console.WriteLine("\n[Main] Shutting down...");
     cts.Cancel();
+    // Router's own watchdog, for the same reason it has one: a console write left blocked - a selection
+    // in the window is enough - stops this program's loops just as completely as Router's, and a run
+    // must not keep diverting traffic it has stopped serving. Three seconds is Router's figure too.
+    _ = Task.Run(async () =>
+    {
+        await Task.Delay(TimeSpan.FromSeconds(3));
+        Console.WriteLine("[Main] shutdown did not complete in 3 s; exiting to release the diverted traffic.");
+        Environment.Exit(2);
+    });
 };
 
 Console.WriteLine("[Main] TlsMitm - WinDivert + MITM Proxy (Transparent)");
@@ -178,6 +187,11 @@ var relayRulesReleased = 0;
 if (!ConsoleClose.Register(() => ReleaseRelayRule(quiet: true)))
     Console.WriteLine("[Main] no console control handler could be registered (no console attached); " +
                       "closing this window leaves the rule in the store for the next run to report");
+// The watchdog above ends through Environment.Exit, which runs this and skips every `using` - the same
+// coverage Router's own ProcessExit gives its watchdog, and measured on this host an Environment.Exit
+// does run a ProcessExit handler while a console close runs none (which is what the Win32 handler
+// above is for). Registered before the rule is added, like the handler above it.
+AppDomain.CurrentDomain.ProcessExit += (_, _) => ReleaseRelayRule(quiet: true);
 
 if (lan != null)
 {

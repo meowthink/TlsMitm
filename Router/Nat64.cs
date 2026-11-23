@@ -748,14 +748,22 @@ public sealed class Nat64
         // UDP keep to the range the reply leg can see.
         var floor = proto == IcmpProto ? (ushort)0 : PortFirst;
         var span = 0x10000 - floor;
-        if (clientPort >= floor && Available(proto, clientPort)) return clientPort;
+        // Both readers are taken once, before the candidate loop. _otherMapped enumerates the IPv4 NAT's
+        // whole reverse table on every call and builds a list per call, and the loop below can try tens of
+        // thousands of candidates - one new binding used to be O(candidates x table size) under _alloc,
+        // which is the lock the single forwarding thread needs for every packet. One snapshot is also the
+        // more consistent read: a binding is picked against the ports as they stood when the allocation
+        // began, not as they drift mid-way through it.
+        var localHeld = _localPorts is { } held ? new HashSet<ushort>(held(proto)) : null;
+        var otherHeld = _otherMapped is { } claimed ? new HashSet<ushort>(claimed(proto)) : null;
+        if (clientPort >= floor && Available(proto, clientPort, localHeld, otherHeld)) return clientPort;
         var start = _cursor >= floor ? _cursor - floor : 0;
         for (var attempt = 0; attempt < 2; attempt++)
         for (var step = 0; step < span; step++)
         {
             var candidate = (ushort)(floor + (start + step) % span);
             if (attempt == 0 && (candidate & 1) != (clientPort & 1)) continue;
-            if (Available(proto, candidate))
+            if (Available(proto, candidate, localHeld, otherHeld))
             {
                 _cursor = candidate;
                 return candidate;
@@ -764,10 +772,10 @@ public sealed class Nat64
         return null;
     }
 
-    private bool Available(byte proto, ushort port) =>
+    private bool Available(byte proto, ushort port, HashSet<ushort>? localHeld, HashSet<ushort>? otherHeld) =>
         port != 0 && !_reverse.ContainsKey(new ReverseKey(proto, port)) &&
-        (_localPorts is null || !_localPorts(proto).Contains(port)) &&
-        (_otherMapped is null || !_otherMapped(proto).Contains(port));
+        (localHeld is null || !localHeld.Contains(port)) &&
+        (otherHeld is null || !otherHeld.Contains(port));
 
     private Nat64Outcome NoAllocation()
     {

@@ -6,6 +6,13 @@ namespace Router;
 // The values are the ones RFC 2132 §9.6 lists for the message type option.
 public enum DhcpKind { Discover = 1, Offer = 2, Request = 3, Decline = 4, Ack = 5, Nak = 6, Release = 7, Inform = 8 }
 
+// A pool with no free address is a state, not a fault: RFC 2131's answer to a DISCOVER a server cannot
+// serve is silence, and the client's own retransmission and fallback take over. Its own type - derived
+// so the throwing contract servcheck pins ("fails loudly instead of leasing the same address twice")
+// keeps holding - lets the listener say it in one line rather than as a stack-trace-shaped "request
+// failed", which reads as a bug in the server rather than a full pool.
+public sealed class DhcpPoolExhaustedException(string message) : InvalidOperationException(message);
+
 public static class DhcpPorts
 {
     // RFC 2131 §4.1: "DHCP messages from a client to a server are sent to the 'DHCP server' port (67),
@@ -133,19 +140,8 @@ public sealed record DhcpScope
         return true;
     }
 
-    private static bool TryAddress(string text, out uint address)
-    {
-        try
-        {
-            address = NatTable.ParseAddress(text);
-            return true;
-        }
-        catch (Exception ex) when (ex is FormatException or ArgumentNullException)
-        {
-            address = 0;
-            return false;
-        }
-    }
+    private static bool TryAddress(string text, out uint address) =>
+        NatTable.TryParseAddress(text, out address);
 }
 
 public sealed record DhcpConfig
@@ -619,7 +615,7 @@ public sealed class DhcpServer
             if (!Free(candidate)) continue;
             return candidate;
         }
-        throw new InvalidOperationException(
+        throw new DhcpPoolExhaustedException(
             $"DHCP pool {NatTable.FormatAddress(scope.PoolStart)}+{scope.PoolCount} has no free address");
     }
 

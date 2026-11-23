@@ -133,7 +133,7 @@ Expect(nakToCi!.Kind == DhcpKind.Nak && nakToCi.DestinationIp == LimitedBroadcas
 // --- the server's own address is never leasable ---------------------------------------------------
 // The two NAKs above cover "outside the pool" and "somebody else's lease". The address this host answers
 // on is a third case, and option 50 reaches it whenever the pool begins below the server - the live
-// configuration is exactly that shape, 192.168.0.24 serving a pool that starts at .1.
+// configuration has that shape: the server is inside the subnet and the pool starts below it.
 var ownPool = NewPool(50, poolStart: Server);
 ownPool.TryReply(Request(DhcpKind.Discover, Mac(0x44), requested: Server), out var ownOffer);
 Expect(YiAddr(ownOffer!.Bytes) != Server,
@@ -1040,7 +1040,7 @@ Expect(upstreamCalls.Count == 0 && cachedEch is not null && !Contains(cachedEch,
 // --- the same rewrite, on an answer that never reaches that resolver --------------------------------
 // The host's own resolver answer is local delivery, so Router's reply leg is the only place it can be
 // read. What the helper answers to is the bytes: IPv4, a whole datagram, and a source port of 53.
-const uint HostAddress = 0xC0A8017D;                              // 192.168.1.125, the WAN side
+const uint HostAddress = 0xC000027D;                              // 192.0.2.125, a documentation-only address
 byte[] FreshEch() => Message("host.example.com", DnsFormat.TypeHttps,
     [(DnsFormat.TypeHttps, 60, HttpsRdata(1, ".", (DnsFormat.SvcParamEch, echConfig)))]);
 

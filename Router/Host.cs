@@ -107,13 +107,8 @@ public static class Host
         return null;
     }
 
-    private static bool TryParseDotted(string text, out uint address)
-    {
-        address = 0;
-        try { address = NatTable.ParseAddress(text); }
-        catch (Exception ex) when (ex is FormatException or OverflowException) { return false; }
-        return true;
-    }
+    private static bool TryParseDotted(string text, out uint address) =>
+        NatTable.TryParseAddress(text, out address);
 
     public static void SetForwarding(int ifIdx, string family = "IPv4")
     {
@@ -506,6 +501,9 @@ public static class Host
         var remaining = budget;
         var seen = 0;
         var network = lanAddr & lanMask;
+        // A trace leg is diagnostic, so a handle that has stopped delivering ends this leg rather than
+        // the run; without the bound a failing Recv here is the same silent tight loop any other leg has.
+        var recvFailures = 0;
         try
         {
             while (!ct.IsCancellationRequested && remaining > 0)
@@ -514,8 +512,15 @@ public static class Host
                 if (!sniffer.Recv((void*)packetBuf, MTU_MAX, &recvLen, (Address*)addrBuf))
                 {
                     if (ct.IsCancellationRequested) break;
+                    if (++recvFailures == RecvFailureLimit)
+                    {
+                        Console.WriteLine($"[Trace {tag}] Recv failed {recvFailures} times in a row, " +
+                            $"error {Marshal.GetLastWin32Error()}; ending this trace leg");
+                        break;
+                    }
                     continue;
                 }
+                recvFailures = 0;
                 seen++;
                 var packet = new ReadOnlySpan<byte>((void*)packetBuf, recvLen);
                 var addr = (Address*)addrBuf;

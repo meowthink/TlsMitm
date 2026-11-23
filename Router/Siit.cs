@@ -655,13 +655,19 @@ public static class Siit
             BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(field, 2), 0);
             var sum = Fold(Add(0, Pseudo4(source, destination, head.Protocol, bytes.Length)) +
                             Add(0, bytes[..field]) + Add(0, bytes[field..]));
-            BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(field, 2), (ushort)~sum);
+            var value = (ushort)~sum;
+            // RFC 768: "If the computed checksum is zero, it is transmitted as all-ones (the equivalent in
+            // one's complement arithmetic)". A plain zero would read on the IPv4 side as "not used", which
+            // is a different packet than the one the checksum was computed for.
+            if (head.Protocol == ProtocolUdp && value == 0) value = 0xFFFF;
+            BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(field, 2), value);
             return bytes;
         }
         var stored = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(field, 2));
-        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(field, 2),
-            Update(stored, Pseudo6(source6, destination6, head.Protocol, bytes.Length),
-                Pseudo4(source, destination, head.Protocol, bytes.Length)));
+        var moved64 = Update(stored, Pseudo6(source6, destination6, head.Protocol, bytes.Length),
+            Pseudo4(source, destination, head.Protocol, bytes.Length));
+        if (head.Protocol == ProtocolUdp && moved64 == 0) moved64 = 0xFFFF;
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(field, 2), moved64);
         return bytes;
     }
 
@@ -918,9 +924,13 @@ public static class Siit
             return bytes;
         }
         var stored = BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(field, 2));
-        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(field, 2),
-            Update(stored, Pseudo4(source4, destination4, head.Protocol, bytes.Length),
-                Pseudo6(source, destination, head.Protocol, bytes.Length)));
+        var moved46 = Update(stored, Pseudo4(source4, destination4, head.Protocol, bytes.Length),
+            Pseudo6(source, destination, head.Protocol, bytes.Length));
+        // RFC 8200 §8.1, for the one's complement of the sum landing on zero: "it must be changed to hex
+        // FFFF for placement in the UDP header". On the IPv6 side a zero is "no checksum", which a packet
+        // whose v4 checksum was valid cannot become.
+        if (head.Protocol == ProtocolUdp && moved46 == 0) moved46 = 0xFFFF;
+        BinaryPrimitives.WriteUInt16BigEndian(bytes.AsSpan(field, 2), moved46);
         return bytes;
     }
 

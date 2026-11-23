@@ -181,6 +181,28 @@ public static class DnsFormat
         return copy;
     }
 
+    // A cache hit is a reply whose bytes answered the question the first client asked, and the question
+    // section those bytes carry is that client's - casing and all. RFC 1035 §5.1.1 name comparisons are
+    // case-insensitive, but a reply echoes the query it answers, and a client that mixes case into its
+    // labels (0x20) checks that echo to tell its own answer from a forged one. The stored question is
+    // therefore replaced with the asking client's before the id is written, which is what a fresh
+    // upstream round already gives it: BuildQuery writes the question with the casing that was parsed.
+    // Null, for a stored message whose question section will not walk, is the caller's cue to fall back
+    // to a plain id rewrite - the answer still answers the question, which is what the cache is for.
+    public static byte[]? RebuildForClient(ReadOnlySpan<byte> stored, ushort id,
+        ReadOnlySpan<byte> clientRequest, int clientQuestionEnd)
+    {
+        if (clientQuestionEnd < HeaderLength || clientQuestionEnd > clientRequest.Length) return null;
+        if (!TryReadSections(stored, out var storedQuestionEnd, out _)) return null;
+        var reply = new byte[clientQuestionEnd + stored.Length - storedQuestionEnd];
+        stored.Slice(0, HeaderLength).CopyTo(reply);
+        clientRequest.Slice(HeaderLength, clientQuestionEnd - HeaderLength)
+            .CopyTo(reply.AsSpan(HeaderLength));
+        stored.Slice(storedQuestionEnd).CopyTo(reply.AsSpan(clientQuestionEnd));
+        BinaryPrimitives.WriteUInt16BigEndian(reply.AsSpan(0, 2), id);
+        return reply;
+    }
+
     // RFC 1035 §3.2.1 defines TTL per resource record: "specifies the time interval that the resource
     // record may be cached before the source of the information should again be consulted". A stored
     // response cannot therefore outlive the shortest TTL among the records it carries.
@@ -496,7 +518,8 @@ public sealed class DnsServer
         {
             if (_cache.TryGetValue(key, out var cached) && cached.UsableUntil > now)
             {
-                reply = DnsFormat.RewriteId(cached.Message, query.Id);
+                reply = DnsFormat.RebuildForClient(cached.Message, query.Id, request, query.QuestionEnd)
+                        ?? DnsFormat.RewriteId(cached.Message, query.Id);
                 return true;
             }
         }
